@@ -226,6 +226,10 @@ def ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
         "class_name": "GaussianDistribution",
         "init_std": 1.0,
         "std_type": "scalar",
+        # 兜底上界，正常训练不该碰到（实测收敛在 0.32）。留着是因为这条路踩过坑：
+        # 见下面 entropy_coef 的注释。取 1.1 是为了让 init_std 严格落在区间内——
+        # clamp 在区间外梯度为零，std_param 会被永久钉住、再也不会退火。
+        "std_range": (0.05, 1.1),
       },
     ),
     critic=RslRlModelCfg(
@@ -237,7 +241,22 @@ def ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       value_loss_coef=1.0,
       use_clipped_value_loss=True,
       clip_param=0.2,
-      entropy_coef=0.01,
+      # 0.01 -> 0.002。对角高斯的熵是各维求和，∂H/∂log σ 恒为 1，所以熵项对 log σ 的
+      # 梯度是个不随 σ 衰减的常数——它会一直把探索噪声往上顶。0.01 时实测 σ 从第 400
+      # 迭代的 0.75 单调涨到 4600 的 1.08（4200 迭代没回过头），同期 Mean entropy loss
+      # 贡献 0.217 而 surrogate loss 只有 -0.0058，相差 37 倍。
+      #
+      # 后果不只是慢。σ=1.05 时膝目标角每拍被注入 ±16°、踝 ±30°，精度类奖励被直接吃掉
+      # （track_base_height -32%、track_linear_velocity -48%），而步态类持平——策略于是
+      # 转去做噪声打不烂的事，**站立能力被系统性侵蚀**。A/B 实测（同从 model_4400 出发
+      # 各跑 600 迭代，判据事先定死）：
+      #
+      #   保持 0.01：三个站立场景全部 100% 摔（连起点最稳的蹲站也摔），走路仍正常
+      #   改成 0.002：站立摔倒率 0%，晃动 0.128->0.082、双手前伸 0.144->0.065、
+      #               蹲站 0.013->0.002，走路 0.95（护栏 0.93）；σ 退火到 0.32
+      #
+      # 改完 track_linear_velocity 和 track_base_height 都超过了原训练史上的峰值。
+      entropy_coef=0.002,
       num_learning_epochs=5,
       num_mini_batches=4,
       learning_rate=1.0e-3,
