@@ -1,0 +1,18 @@
+<mujoco model="scene_g1_with_dual_gloria_m">
+  <include file="g1_with_dual_gloria_m.xml"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="120" elevation="-20"/>
+  </visual>
+
+  <worldbody>
+    <light pos="0 0 2" dir="0 0 -1" directional="true"/>
+    <geom name="ground" type="plane" size="10 10 0.1" material="ground"/>
+  </worldbody>
+
+  <asset>
+    <material name="ground" rgba="0.18 0.22 0.20 1" specular="0.1" shininess="0.2"/>
+  </asset>
+</mujoco>

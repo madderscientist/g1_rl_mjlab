@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "g1_lower_rl"
+version = "0.1.0"
+description = "Unitree G1 + dual Gloria-M lower-body locomotion task for mjlab."
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  "mjlab>=1.5.3",
+  # Direct third-party imports used by scripts/.
+  "imageio[ffmpeg]",
+  "onnxruntime",
+  "Pillow",
+  "tyro",
+]
+
+[tool.setuptools.packages.find]
+include = ["g1_lower_rl*"]
+
+[tool.setuptools.package-data]
+"g1_lower_rl.assets" = ["**/*.xml", "**/*.stl", "**/*.STL", "**/*.urdf"]
+
+[tool.ruff]
+line-length = 128
+indent-width = 2
+
+[tool.ruff.format]
+indent-style = "space"

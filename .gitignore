@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+logs/
+outputs/
+videos/
+wandb/
+.venv/
+run_logs/
+export/
+.vscode/
+motions/
