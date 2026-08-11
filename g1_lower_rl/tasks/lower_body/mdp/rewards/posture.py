@@ -17,9 +17,14 @@ if TYPE_CHECKING:
 
 
 def body_orientation_l2(
-  env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = ROBOT
+  env: ManagerBasedRlEnv,
+  lateral_scale: float = 1.0,
+  asset_cfg: SceneEntityCfg = ROBOT,
 ) -> torch.Tensor:
   """惩罚指定刚体偏离竖直，罚的是重力在体系里 xy 分量的平方和（= sin²(倾角)）。
+
+  ``lateral_scale`` 单独放大左右分量 ``g_b[1]``。两个方向必须分开调：前后分量
+  另有 ``backward_lean`` 单边管着，而左右除了这一项没人管。
 
   ``asset_cfg.body_ids`` 为空时退化成根刚体。mjlab 1.5.x 把自带的同名项换成了
   ``upright`` 类，语义不同，这里保留原实现。
@@ -27,9 +32,10 @@ def body_orientation_l2(
   asset: Entity = env.scene[asset_cfg.name]
   if asset_cfg.body_ids:
     body_quat_w = asset.data.body_link_quat_w[:, asset_cfg.body_ids, :].squeeze(1)
-    projected_gravity_b = quat_apply_inverse(body_quat_w, asset.data.gravity_vec_w)
-    return torch.sum(torch.square(projected_gravity_b[:, :2]), dim=1)
-  return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+    g_b = quat_apply_inverse(body_quat_w, asset.data.gravity_vec_w)
+  else:
+    g_b = asset.data.projected_gravity_b
+  return torch.square(g_b[:, 0]) + lateral_scale * torch.square(g_b[:, 1])
 
 
 def backward_lean(

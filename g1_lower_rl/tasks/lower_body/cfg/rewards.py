@@ -124,10 +124,18 @@ def _posture_rewards() -> dict[str, RewardTermCfg]:
     # 翻倍会把正常步态需要的那点躯干俯仰也一并压掉——它罚的是 sin²(倾角)，前后对称，
     # 实测走起来之后姿态正常的策略在这一项上反而付 1.5~4 倍（因为它前倾 6°）。
     # 要治后仰请用下面那个单边项。
+    #
+    # ``lateral_scale=2.0``：前后分量有 ``pelvis_backward_lean`` 单边管着，左右却只有
+    # 这一项。实测策略把精度全放在前后、把代价推给了左右：站立时前后只偏 0.13°
+    # 而左右歪 11.4°（iter 9000）。放大 2 倍后站立单拍代价 0.039 -> 0.078，约为同期
+    # 扭腰惩罚的一半；而走路时左右本来就只有 1.7°（代价 0.0022），几乎不受影响。
     "body_orientation_l2": RewardTermCfg(
       func=mdp.body_orientation_l2,
       weight=-1.0,
-      params={"asset_cfg": SceneEntityCfg("robot", body_names=())},
+      params={
+        "lateral_scale": 2.0,
+        "asset_cfg": SceneEntityCfg("robot", body_names=()),
+      },
     ),
     # 只罚骨盆后仰、且留 3° 死区。补的是姿态类里的一个真空：没有任何项约束骨盆俯仰，
     # 骨盆整体后坐时腰关节会把偏差吸收掉，``body_orientation_l2``（量 torso_link）看不见。
@@ -152,6 +160,19 @@ def _posture_rewards() -> dict[str, RewardTermCfg]:
       params={
         "asset_cfg": joints("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"),
         "weights": (0.4, 0.85, 1.0),  # 顺序同上：扭腰 / 左右 / 前后
+      },
+    ),
+    # 叠在上面那项之上，只在站立时生效。上面给 waist_yaw 的 0.4 是**走路专用**的折扣：
+    # 它要与摆动腿反向旋转抵消角动量，压死会把 20 s 直行累计航向推到 99.8°。站立没有
+    # 摆动腿，那个理由不成立，这个自由度就成了几乎免费的。
+    "waist_deviation_still": RewardTermCfg(
+      func=mdp.joint_deviation_l2,
+      weight=-1.0,
+      params={
+        "asset_cfg": joints("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"),
+        "weights": (0.6, 0.35, 0.0),
+        "command_name": "twist",
+        "command_threshold": 0.1,
       },
     ),
     # 站住时把大腿旋转拉回 0，防内外八字
