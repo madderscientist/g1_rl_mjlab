@@ -6,6 +6,9 @@
 
 from mjlab.tasks.tracking.mdp import *  # noqa: F401,F403
 
+from g1_lower_rl.tasks.motion_tracking.mdp.actions import (
+  GravityCompensatedJointPositionActionCfg as GravityCompensatedJointPositionActionCfg,
+)
 from g1_lower_rl.tasks.motion_tracking.mdp.commands import (
   GeneralMotionCommand as GeneralMotionCommand,
 )
