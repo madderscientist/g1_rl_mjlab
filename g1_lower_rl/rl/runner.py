@@ -15,13 +15,28 @@ mjlab 的 ``MjlabOnPolicyRunner`` 只把 ``common_step_counter`` 存进 checkpoi
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
+import torch
+from mjlab.rl import MjlabOnPolicyRunner, RslRlPpoAlgorithmCfg, RslRlVecEnvWrapper
 from mjlab.rl.exporter_utils import attach_metadata_to_onnx
 from mjlab.tasks.registry import load_runner_cls
 from mjlab.tasks.velocity.rl.runner import VelocityOnPolicyRunner
+
+
+@dataclass
+class ScheduledPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
+  """PPO 配置，多一个 ``entropy_coef`` 课程。
+
+  ``entropy_stages`` 形如 ``((迭代数, entropy_coef, σ 上限), ...)``，空则不做课程。
+  σ 上限取 ``math.inf`` 表示这一档不动 σ，且它只下压不上抬。
+
+  这个字段会被 ``GloriaOnPolicyRunner`` 在构造时摘走：rsl_rl 最后把
+  ``cfg["algorithm"]`` 整个 splat 进 PPO 的构造函数，多一个键就 TypeError。
+  """
+
+  entropy_stages: tuple[tuple[int, float, float], ...] = ()
 
 
 def action_joint_names(env) -> list[str]:
@@ -75,13 +90,25 @@ def load_trained_runner(task_id: str, env, agent_cfg, checkpoint: Path, device: 
 
 
 class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
-  """保存课程状态，并将基类每次导出的 ONNX 固定命名为 policy.onnx。
+  """保存课程状态
 
   与任务无关：无课程的任务存空字典，关节名单从环境里读。所有任务都该用它，
   否则落回基类就只存 .pt、没有 ONNX 和部署元数据。
   """
 
   env: RslRlVecEnvWrapper
+
+  def __init__(
+    self,
+    env,
+    train_cfg: dict,
+    log_dir: str | None = None,
+    device: str = "cpu",
+  ) -> None:
+    # 必须赶在基类把 algorithm 字典 splat 进 PPO 之前摘走。存档写在 runner 创建之前，yaml 不受影响。
+    stages = train_cfg.get("algorithm", {}).pop("entropy_stages", ()) or ()
+    self._entropy_stages = tuple(tuple(stage) for stage in stages)
+    super().__init__(env, train_cfg, log_dir, device)
 
   @staticmethod
   def _get_export_paths(checkpoint_path: str) -> tuple[Path, str, Path]:
@@ -96,6 +123,58 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
       func = manager.get_term_cfg(name).func
       if hasattr(func, "state_dict") and hasattr(func, "load_state_dict"):
         yield name, func
+
+  def _entropy_stage_index(self) -> int:
+    it = self.current_learning_iteration
+    return max(i for i, stage in enumerate(self._entropy_stages) if stage[0] <= it)
+
+  def _advance_entropy_stage(self) -> None:
+    """跨档时换 ``entropy_coef``，并把 σ 压到该档上限以下。
+
+    **σ 必须跟着一起压。** 只改系数退火太慢（实测 0.01->0.002 只把漂移改变
+    -3.2e-4/iter，σ 从 1.05 到 0.35 要约 3200 迭代），而站立在 σ>1.0 时 300 迭代就崩了。
+    Adam 动量也要清：``std_param`` 之前累积的是“往上推”的历史，不清就会立刻顶回来。
+    """
+    stage = self._entropy_stage_index()
+    if stage == self._entropy_stage:
+      return
+    self._entropy_stage = stage
+    _, coef, cap = self._entropy_stages[stage]
+    self.alg.entropy_coef = coef
+    print(f"[INFO]: entropy_coef -> {coef}（迭代 {self.current_learning_iteration}）")
+
+    distribution = self.alg.get_policy().distribution
+    assert distribution is not None
+    std = distribution.std_param
+    assert isinstance(std, torch.Tensor)
+    before = float(std.mean().item())
+    if before <= cap:
+      return
+    with torch.no_grad():
+      std.clamp_(max=cap)
+    state = self.alg.optimizer.state.get(std)
+    if state is not None:
+      state["exp_avg"].zero_()
+      state["exp_avg_sq"].zero_()
+    print(f"[INFO]: 探索噪声 σ {before:.3f} -> {cap:.3f}，已清零其 Adam 动量")
+
+  def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
+    if self._entropy_stages:
+      # 先按当前迭代数落档，于是续训不会重复触发 σ 手术——checkpoint 里的 σ
+      # 已经是上次压过的值了。
+      self._entropy_stage = self._entropy_stage_index()
+      self.alg.entropy_coef = self._entropy_stages[self._entropy_stage][1]
+      print(f"[INFO]: entropy 课程第 {self._entropy_stage} 档，entropy_coef={self.alg.entropy_coef}")
+      # rsl_rl 的 learn 循环没有逐迭代钩子，包一层 update 是侵入最小的接法。
+      # update 在 rollout 之后调用，所以档位比阈值晚一拍生效，无所谓。
+      inner_update = self.alg.update
+
+      def update():
+        self._advance_entropy_stage()
+        return inner_update()
+
+      self.alg.update = update
+    super().learn(num_learning_iterations, init_at_random_ep_len)
 
   def save(self, path: str, infos=None):
     curriculum_state = {
