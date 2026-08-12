@@ -3,13 +3,13 @@
 from mjlab.tasks.registry import register_mjlab_task
 
 from g1_lower_rl.rl import GloriaOnPolicyRunner
-from g1_lower_rl.tasks.lower_body.cfg.constants import ITER
-from g1_lower_rl.tasks.lower_body.robots import (
-  g1_gloria_flat_env_cfg,
-  g1_gloria_flat_env_cfg_gru,
-  g1_gloria_ppo_runner_cfg,
-  g1_gloria_ppo_runner_cfg_gru,
+from g1_lower_rl.tasks.lower_body import (
+  flat_env_cfg,
+  flat_env_cfg_gru,
+  ppo_runner_cfg,
+  ppo_runner_cfg_gru,
 )
+from g1_lower_rl.tasks.lower_body.cfg.constants import ITER
 from g1_lower_rl.tasks.motion_tracking import (
   motion_tracking_env_cfg,
   motion_tracking_ppo_runner_cfg,
@@ -20,24 +20,24 @@ from g1_lower_rl.tasks.standing import standing_env_cfg, standing_ppo_runner_cfg
 DEFAULT_TASK = "G1-Gloria-LowerBody-Flat"
 
 # 课程档位是按 ITER 步/迭代换算成环境步数的，对不上的话课程会整体提前或推迟，且不报错。
-assert g1_gloria_ppo_runner_cfg().num_steps_per_env == ITER, (
+assert ppo_runner_cfg().num_steps_per_env == ITER, (
   "改了 num_steps_per_env 就必须同步改 ITER，或者像 GRU 版那样缩放课程 step"
 )
 
 register_mjlab_task(
   task_id="G1-Gloria-LowerBody-Flat",
-  env_cfg=g1_gloria_flat_env_cfg(),
-  play_env_cfg=g1_gloria_flat_env_cfg(play=True),
-  rl_cfg=g1_gloria_ppo_runner_cfg(),
+  env_cfg=flat_env_cfg(),
+  play_env_cfg=flat_env_cfg(play=True),
+  rl_cfg=ppo_runner_cfg(),
   runner_cls=GloriaOnPolicyRunner,
 )
 
 # 与上面同一个环境，只把 actor 换成 GRU，并去掉 actor 观测里的上一拍动作。
 register_mjlab_task(
   task_id="G1-Gloria-LowerBody-Flat-GRU",
-  env_cfg=g1_gloria_flat_env_cfg_gru(),
-  play_env_cfg=g1_gloria_flat_env_cfg_gru(play=True),
-  rl_cfg=g1_gloria_ppo_runner_cfg_gru(),
+  env_cfg=flat_env_cfg_gru(),
+  play_env_cfg=flat_env_cfg_gru(play=True),
+  rl_cfg=ppo_runner_cfg_gru(),
   runner_cls=GloriaOnPolicyRunner,
 )
 

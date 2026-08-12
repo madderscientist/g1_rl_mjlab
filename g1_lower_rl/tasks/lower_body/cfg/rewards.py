@@ -15,9 +15,11 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from g1_lower_rl.assets import LOWER_BODY_EFFORT_LIMIT, WAIST_JOINTS
 from g1_lower_rl.tasks.lower_body import mdp
 from g1_lower_rl.tasks.lower_body.cfg.constants import (
+  FOOT_SITES,
   HEIGHT_STD_STAGES,
   LATERAL_JOINT_EXPR,
   LOWER_BODY_JOINT_EXPR,
+  SELF_COLLISION_SENSOR,
   joints,
 )
 
@@ -108,7 +110,7 @@ def _tracking_rewards() -> dict[str, RewardTermCfg]:
         "command_name": "height",
         # 【由 height_std 课程接管】这里只是第一档的初值。
         "std": HEIGHT_STD_STAGES[0][1],
-        "asset_cfg": SceneEntityCfg("robot", site_names=()),  # 按机器人设置。
+        "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITES),
       },
     ),
   }
@@ -144,7 +146,7 @@ def _posture_rewards() -> dict[str, RewardTermCfg]:
       weight=-1.0,
       params={
         "lateral_scale": 2.0,
-        "asset_cfg": SceneEntityCfg("robot", body_names=()),
+        "asset_cfg": SceneEntityCfg("robot", body_names=("torso_link",)),
       },
     ),
     # 只罚骨盆后仰、且留 3° 死区。补的是姿态类里的一个真空：没有任何项约束骨盆俯仰，
@@ -160,7 +162,7 @@ def _posture_rewards() -> dict[str, RewardTermCfg]:
         "deadband_deg": 3.0,
         "forward_scale": 0.2,
         "forward_deadband_deg": 6.0,
-        "asset_cfg": SceneEntityCfg("robot", body_names=()),
+        "asset_cfg": SceneEntityCfg("robot", body_names=("pelvis",)),
       },
     ),
     # 腰关节绝对角约束。必须有：防止撅屁股
@@ -245,7 +247,16 @@ def _posture_rewards() -> dict[str, RewardTermCfg]:
     "body_ang_vel": RewardTermCfg(
       func=mdp.body_angular_velocity_penalty,
       weight=-0.05,
-      params={"asset_cfg": SceneEntityCfg("robot", body_names=())},
+      params={"asset_cfg": SceneEntityCfg("robot", body_names=("torso_link",))},
+    ),
+    # 传感器已排掉手臂（见 env_cfg 里的传感器定义），好行为的代价恰好是 0，所以不再需要“压轻
+    # 以免淹掉速度跟随”——从 -0.5 提到 -2.0。算一下量级：原始值是一个控制拍内接触力超
+    # 10 N 的子步数（0~4），所以满接触的一拍要罚 2.0 × 4 × dt = 0.16，是同一拍
+    # 线速度跟随满分（2.5 × dt = 0.05）的 3.2 倍——足够威慑，但远没到一撞就完。
+    "self_collisions": RewardTermCfg(
+      func=mdp.self_collision_cost,
+      weight=-2.0,
+      params={"sensor_name": SELF_COLLISION_SENSOR, "force_threshold": 10.0},
     ),
   }
 
@@ -309,7 +320,7 @@ def _gait_rewards() -> dict[str, RewardTermCfg]:
         "target_height": 0.11,
         "command_name": "twist",
         "command_threshold": 0.1,
-        "asset_cfg": SceneEntityCfg("robot", site_names=()),
+        "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITES),
       },
     ),
     # 权重给得很重：拖着脚滑是策略替代“真的走”的主要选项。它同样能满足速度指令，却避开了
@@ -321,7 +332,7 @@ def _gait_rewards() -> dict[str, RewardTermCfg]:
         "sensor_name": "feet_ground_contact",
         "command_name": "twist",
         "command_threshold": 0.1,
-        "asset_cfg": SceneEntityCfg("robot", site_names=()),  # 按机器人设置。
+        "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITES),
       },
     ),
     "soft_landing": RewardTermCfg(

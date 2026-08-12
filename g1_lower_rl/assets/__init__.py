@@ -17,9 +17,6 @@ from g1_lower_rl.assets.g1_gloria import (
   LOWER_BODY_JOINTS as LOWER_BODY_JOINTS,
 )
 from g1_lower_rl.assets.g1_gloria import (
-  get_robot_cfg as get_robot_cfg,
-)
-from g1_lower_rl.assets.g1_gloria import (
   WAIST_JOINTS as WAIST_JOINTS,
 )
 from g1_lower_rl.assets.g1_gloria import (
@@ -30,4 +27,7 @@ from g1_lower_rl.assets.g1_gloria import (
 )
 from g1_lower_rl.assets.g1_gloria import (
   WHOLE_BODY_JOINTS as WHOLE_BODY_JOINTS,
+)
+from g1_lower_rl.assets.g1_gloria import (
+  get_robot_cfg as get_robot_cfg,
 )

@@ -1,8 +1,8 @@
 # 下肢行走任务配置说明
 
 本文档描述任务 `G1-Gloria-LowerBody-Flat` 的**当前生效配置**。基础配置按 manager 拆在
-[cfg/](cfg/) 下（`cfg/env_cfg.py` 负责组装），G1 + 双 Gloria-M 的机器人专属覆盖在
-[robots/g1_gloria.py](robots/g1_gloria.py)。奖励和事件的具体实现见 [mdp/](mdp/)，
+[cfg/](cfg/) 下（`cfg/env_cfg.py` 负责组装，G1 + 双 Gloria-M 的机器人专属覆盖也在那里），
+PPO 配置在 [rl_cfg.py](rl_cfg.py)。奖励和事件的具体实现见 [mdp/](mdp/)，
 课程档位表在 [cfg/constants.py](cfg/constants.py)。
 
 策略控制 12 个腿关节和 3 个腰关节，跟随四个上层指令
@@ -100,9 +100,7 @@ Critic 先包含同一组观测，再追加 `base_lin_vel`、`base_height`、14 
 | hip roll / knee | 0.350661 |
 | ankle pitch / ankle roll | 0.438577 |
 | waist yaw | 0.547546 |
-| waist roll / waist pitch | 0.219289 |
-
-腰 roll/pitch 在机器人专属配置中额外乘 `WAIST_SCALE_FACTOR=0.5`；腰 yaw 保留完整权限。
+| waist roll / waist pitch | 0.438577 |
 
 ## 2. 指令
 

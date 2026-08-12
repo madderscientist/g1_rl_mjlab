@@ -91,7 +91,16 @@ class GravityCompensatedJointPositionAction(JointPositionAction):
       model.opt.gravity, device=self.device, dtype=torch.float32
     )
     self._model = env.sim.model
-    # 每个环境一个补偿系数，模拟真机补偿器的模型误差/负载估计误差。
+
+    # 补偿器误差在同一条臂内是**相关**的：共用一套动力学模型参数和一个负载估计器，
+    # 不会每个关节各犯各的错。按臂共享一个系数，而不是 14 个独立采样——后者会让误差
+    # 在合力上互相抵消，把训练难度调得比真机低。
+    groups = sorted({n.split("_", 1)[0] for n in names})
+    self._gain_group = torch.tensor(
+      [groups.index(n.split("_", 1)[0]) for n in names], device=self.device
+    )
+    self._num_groups = len(groups)
+    # 每个环境一个系数，代表补偿器的模型误差与负载估计误差。
     self._gain = torch.ones(self.num_envs, len(names), device=self.device)
     self._resample_gain(slice(None))
 
@@ -100,9 +109,10 @@ class GravityCompensatedJointPositionAction(JointPositionAction):
     if lo == hi == 1.0:
       return
     n = self.num_envs if isinstance(env_ids, slice) else len(env_ids)
-    self._gain[env_ids] = sample_uniform(
-      lo, hi, (n, self._gain.shape[1]), device=self.device
+    per_group = sample_uniform(
+      lo, hi, (n, self._num_groups), device=self.device
     )
+    self._gain[env_ids] = per_group[:, self._gain_group]
 
   def reset(self, env_ids=None) -> None:
     super().reset(env_ids)
@@ -160,7 +170,7 @@ class GravityCompensatedJointPositionActionCfg(JointPositionActionCfg):
   """开启重力补偿的关节，必须是动作关节的子集。"""
 
   gain_range: tuple[float, float] = (1.0, 1.0)
-  """补偿系数的采样区间。取 (1,1) 是理想补偿器；真机建议留出误差，如 (0.8, 1.0)。"""
+  """补偿系数的采样区间，**按臂共享**。取 (1,1) 是理想补偿器，不该单独用。"""
 
   def build(self, env: "ManagerBasedRlEnv") -> GravityCompensatedJointPositionAction:
     return GravityCompensatedJointPositionAction(self, env)

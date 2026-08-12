@@ -103,8 +103,8 @@ g1_lower_rl/
 │       │   ├── constants.py   关节集合 / 课程档位表 / 闸门 / 场景占比
 │       │   ├── observations.py  actions.py  events.py
 │       │   ├── rewards.py     terminations.py  curriculum.py
-│       │   └── env_cfg.py     组装
-│       └── robots/g1_gloria.py  机器人特化 + PPO 配置
+│       │   └── env_cfg.py     组装（含机器人特化）
+│       └── rl_cfg.py          PPO 配置
 │   ├── motion_tracking/       全身 29 轴动作跟踪（GMT），见该目录 README
 │   │   ├── mdp/commands.py    GeneralMotionCommand：多动作 + 自适应采样 + 前瞻观测
 │   │   ├── mdp/motion_corpus.py  多片段语料加载

@@ -12,6 +12,9 @@ from g1_lower_rl.tasks.motion_tracking.mdp.actions import (
 from g1_lower_rl.tasks.motion_tracking.mdp.commands import (
   GeneralMotionCommand as GeneralMotionCommand,
 )
+from g1_lower_rl.tasks.motion_tracking.mdp.events import (
+  payload_mass as payload_mass,
+)
 from g1_lower_rl.tasks.motion_tracking.mdp.commands import (
   GeneralMotionCommandCfg as GeneralMotionCommandCfg,
 )

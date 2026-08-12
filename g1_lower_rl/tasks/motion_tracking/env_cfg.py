@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 from mjlab.envs import ManagerBasedRlEnvCfg
-from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.command_manager import CommandTermCfg
 from mjlab.managers.event_manager import EventTermCfg
@@ -33,6 +32,7 @@ from g1_lower_rl.assets import (
 from g1_lower_rl.tasks.motion_tracking.mdp import (
   GeneralMotionCommandCfg,
   GravityCompensatedJointPositionActionCfg,
+  payload_mass,
 )
 
 DEFAULT_MOTION_DIR = "motions/lafan1"
@@ -69,17 +69,19 @@ END_EFFECTORS: tuple[str, ...] = (
 )
 
 # 真机手臂带重力补偿：补偿器算出力矩后按 kp 折算成位置偏移叠加到目标上。这里同样建模，
-# 系数按环境随机，代表补偿器的模型误差与负载估计误差——1.0 是理想补偿器，不该单独用。
-ARM_GRAVCOMP_GAIN_RANGE: tuple[float, float] = (0.85, 1.0)
+# 系数**按臂共享**（同一条臂共用一套模型参数和一个负载估计器，误差是相关的）。
+# 上界略超 1.0：补偿器也会过补，不只会欠补。
+ARM_GRAVCOMP_GAIN_RANGE: tuple[float, float] = (0.9, 1.01)
 
-# 手上拿东西：质量与惯量按 e^(2*alpha) 一致缩放。0.6 对应夹爪总质量约 3.3 倍（≈+1.0 kg）。
+# 手上拿东西：负载质量在该区间上**均匀**采样，负值视作空载。
 #
-# 上限是量出来的，不是拍的：取语料 1941 帧真实臂姿，算重力 + M*qddot 的总需求。
-# 瓶颈不是肩关节而是 **腕关节**：wrist_pitch/yaw 用 4010 电机，上限只有 5 N·m（肩的
-# 五分之一）。负载 1.0 kg 时腕的 P95 需求已到上限的 72%，2.0 kg 时直接 106% —— 而同时
-# 肩关节还剩 28% 余量。再往上加学不会，只会逆选择出“拿重物就放弃手臂跟踪”。
-PAYLOAD_ALPHA_RANGE: tuple[float, float] = (-0.1, 0.6)
-PAYLOAD_COM_SHIFT: tuple[float, float] = (-0.03, 0.03)
+# 下界取负是为了让「空手」占一块有限概率（这里约 1/3），而不是概率为零的边界点。
+# 上界 1.0 kg 是量出来的：取语料 1941 帧真实臂姿算重力 + M*qddot，瓶颈不是肩而是腕
+# （wrist_pitch/yaw 用 4010 电机，上限仅 5 N·m）。1.0 kg 时腕的 P95 需求已达上限 72%，
+# 2.0 kg 时 106%，而同期肩关节还剩 28% 余量。再往上加只会逆选择出“拿重物就放弃手臂跟踪”。
+#
+# 左右独立采样（单手拿东西比双手对称更常见，也更难：重心横向偏移，腿要补偿）。
+PAYLOAD_MASS_RANGE: tuple[float, float] = (-0.5, 1.0)
 
 
 def _self_collision_sensor() -> ContactSensorCfg:
@@ -98,7 +100,7 @@ def motion_tracking_env_cfg(
   motion_dir: str = DEFAULT_MOTION_DIR,
   has_state_estimation: bool = False,
   arm_gravcomp_gain_range: tuple[float, float] = ARM_GRAVCOMP_GAIN_RANGE,
-  payload_alpha_range: tuple[float, float] = PAYLOAD_ALPHA_RANGE,
+  payload_mass_range: tuple[float, float] = PAYLOAD_MASS_RANGE,
   play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """构造全身动作跟踪配置（平地）。
@@ -160,15 +162,16 @@ def motion_tracking_env_cfg(
   ].geom_names = r"^(left|right)_foot[1-7]_collision$"
   cfg.events["base_com"].params["asset_cfg"].body_names = ("torso_link",)
 
-  # 手上拿东西。用 pseudo_inertia 而不是 body_mass：后者只改质量不改惯量，只适合
-  # 建模质心处的质点。负载的惯量变化恰恰是重力补偿器兜不住、必须靠策略适应的部分。
+  # 手上拿东西。负载建模成夹爪质心处的质点：绕肩/胘的 m*d^2 由质量自动带出，
+  # 而负载绕自身质心的转动惯量对紧凑物体而言比手臂惯量小两个数量级，可忽略。
   cfg.events["payload"] = EventTermCfg(
-    func=dr.pseudo_inertia,
+    func=payload_mass,
     mode="startup",
     params={
-      "asset_cfg": SceneEntityCfg("robot", body_names=(r"^(left|right)_gripper_base$",)),
-      "alpha_range": payload_alpha_range,
-      "t_range": PAYLOAD_COM_SHIFT,
+      "asset_cfg": SceneEntityCfg(
+        "robot", body_names=(r"^(left|right)_gripper_base$",)
+      ),
+      "mass_range": payload_mass_range,
     },
   )
   cfg.terminations["ee_body_pos"].params["body_names"] = END_EFFECTORS

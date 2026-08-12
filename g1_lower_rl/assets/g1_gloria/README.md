@@ -62,9 +62,11 @@ joint-limit penalty, e.g.:
 
 ```python
 joint_pos_limits = RewardTermCfg(
-    func=mdp.joint_pos_limits,
-    weight=-1.0,
-    params={"asset_cfg": SceneEntityCfg("robot", joint_names=[r"^(?!.*_eccentric_joint$).*"])},
+  func=mdp.joint_pos_limits,
+  weight=-1.0,
+  params={
+    "asset_cfg": SceneEntityCfg("robot", joint_names=[r"^(?!.*_eccentric_joint$).*"])
+  },
 )
 ```
 

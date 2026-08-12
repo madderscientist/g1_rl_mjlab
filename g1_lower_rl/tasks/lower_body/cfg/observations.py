@@ -17,6 +17,7 @@ from mjlab.utils.noise import NoiseModelWithAdditiveBiasCfg
 from g1_lower_rl.tasks.lower_body import mdp
 from g1_lower_rl.tasks.lower_body.cfg.constants import (
   ARM_JOINT_EXPR,
+  FOOT_SITES,
   LOWER_BODY_JOINT_EXPR,
   joints,
 )
@@ -90,7 +91,7 @@ def make_observations() -> dict[str, ObservationGroupCfg]:
       ),
       "base_height": ObservationTermCfg(
         func=mdp.base_height,
-        params={"asset_cfg": SceneEntityCfg("robot", site_names=())},  # 按机器人设置。
+        params={"asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITES)},
       ),
       "arm_joint_pos": ObservationTermCfg(
         func=mdp.joint_pos_rel,
@@ -102,7 +103,7 @@ def make_observations() -> dict[str, ObservationGroupCfg]:
       ),
       "foot_height": ObservationTermCfg(
         func=mdp.foot_height,
-        params={"asset_cfg": SceneEntityCfg("robot", site_names=())},  # 按机器人设置。
+        params={"asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITES)},  # 足底
       ),
       "foot_air_time": ObservationTermCfg(
         func=mdp.foot_air_time,

@@ -30,6 +30,20 @@ ARM_JOINT_EXPR = (
   r".*_wrist_(roll|pitch|yaw)_joint",
 )
 
+# 足底 site：高度、离地间隙、打滑、塌陷判定都以它为基准，比世界 z 在斜坡上更可靠。
+FOOT_SITES = ("left_foot", "right_foot")
+FOOT_GEOMS = tuple(
+  f"{side}_foot{i}_collision" for side in ("left", "right") for i in range(1, 8)
+)
+# 外部推力作用在哪里：夹爪（手臂碰到或拿着的东西）和躯干（有人推机器人）。
+IMPULSE_BODIES = (r".*_gripper_base", "torso_link")
+
+FEET_SENSOR = "feet_ground_contact"
+SELF_COLLISION_SENSOR = "self_collision"
+
+# GRU 的 BPTT 截断窗口。环境配置也要用它去缩放课程时间表，所以提到模块级。
+GRU_NUM_STEPS_PER_ENV = 48
+
 
 def joints(*expr: str) -> SceneEntityCfg:
   """每个项都新建一份实体配置。管理器会就地解析它们，多个项共用同一个实例会让第二次
@@ -40,7 +54,7 @@ def joints(*expr: str) -> SceneEntityCfg:
 # 课程档位写成「迭代数 x ITER」换算成环境步数，因为课程的判据是 ``common_step_counter``，
 # 而它每调一次 ``env.step()`` 加一。所以 ITER 必须等于该任务的 ``num_steps_per_env``：
 # 调大了步长却不改这里，整条课程会按比例提前触发，而且不会报错。GRU 版用了别的步长，
-# 靠 ``g1_gloria._rescale_curriculum_steps`` 把 step 缩回去；``tasks/__init__`` 里有断言兜底。
+# 靠 ``env_cfg._rescale_curriculum_steps`` 把 step 缩回去；``tasks/__init__`` 里有断言兜底。
 ITER = 24
 
 ##

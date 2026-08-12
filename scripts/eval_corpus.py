@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import glob
 from pathlib import Path
 
 import torch

@@ -8,6 +8,7 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 
 from g1_lower_rl.tasks.lower_body import mdp
+from g1_lower_rl.tasks.lower_body.cfg.constants import FOOT_SITES
 
 
 def make_terminations() -> dict[str, TerminationTermCfg]:
@@ -22,7 +23,7 @@ def make_terminations() -> dict[str, TerminationTermCfg]:
       func=mdp.base_height_below_minimum,
       params={
         "minimum_height": 0.35,
-        "asset_cfg": SceneEntityCfg("robot", site_names=()),  # 按机器人设置。
+        "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITES),
       },
     ),
   }

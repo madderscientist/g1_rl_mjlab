@@ -10,12 +10,15 @@ from mjlab.envs.mdp import dr
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
+from g1_lower_rl.assets import ARM_TARGET_RANGES
 from g1_lower_rl.tasks.lower_body import mdp
 from g1_lower_rl.tasks.lower_body.cfg.constants import (
   ARM_DRIFT_LEVELS,
   ARM_JOINT_EXPR,
   ARM_TORQUE_LEVELS,
   BODY_IMPULSE_LEVELS,
+  FOOT_GEOMS,
+  IMPULSE_BODIES,
   LOWER_BODY_JOINT_EXPR,
   RESET_LEVELS,
   joints,
@@ -76,7 +79,7 @@ def make_events() -> dict[str, EventTermCfg]:
       mode="reset",
       params={
         "asset_cfg": joints(*ARM_JOINT_EXPR),
-        "ranges": {},  # 按机器人设置。
+        "ranges": ARM_TARGET_RANGES,
         "write_state": True,
       },
     ),
@@ -87,7 +90,7 @@ def make_events() -> dict[str, EventTermCfg]:
       interval_range_s=(1.0, 4.0),
       params={
         "asset_cfg": joints(*ARM_JOINT_EXPR),
-        "ranges": {},  # 按机器人设置。
+        "ranges": ARM_TARGET_RANGES,
         "write_state": False,
         "blend": ARM_DRIFT_LEVELS[0][1],  # 由课程逐档抬高。
         "scale_by_level": True,
@@ -110,7 +113,7 @@ def make_events() -> dict[str, EventTermCfg]:
       func=mdp.scaled_body_impulse,
       mode="step",
       params={
-        "asset_cfg": SceneEntityCfg("robot", body_names=()),  # 按机器人设置。
+        "asset_cfg": SceneEntityCfg("robot", body_names=IMPULSE_BODIES),
         "force_range": (-BODY_IMPULSE_LEVELS[0][1], BODY_IMPULSE_LEVELS[0][1]),
         "torque_range": (-2.0, 2.0),
         "duration_s": (0.1, 0.4),
@@ -137,7 +140,7 @@ def make_events() -> dict[str, EventTermCfg]:
       mode="startup",
       func=dr.body_mass,
       params={
-        "asset_cfg": SceneEntityCfg("robot", body_names=()),  # 按机器人设置。
+        "asset_cfg": SceneEntityCfg("robot", body_names=(r".*_gripper_base",)),
         "operation": "add",
         "ranges": (0.0, 2.0),
       },
@@ -148,7 +151,9 @@ def make_events() -> dict[str, EventTermCfg]:
       mode="startup",
       func=dr.geom_friction,
       params={
-        "asset_cfg": SceneEntityCfg("robot", geom_names=()),  # 按机器人设置。
+        "asset_cfg": SceneEntityCfg(
+          "robot", geom_names=tuple(g for g in FOOT_GEOMS if g.startswith("left"))
+        ),
         "operation": "abs",
         "ranges": (0.3, 1.6),
         "shared_random": True,
@@ -158,7 +163,9 @@ def make_events() -> dict[str, EventTermCfg]:
       mode="startup",
       func=dr.geom_friction,
       params={
-        "asset_cfg": SceneEntityCfg("robot", geom_names=()),  # 按机器人设置。
+        "asset_cfg": SceneEntityCfg(
+          "robot", geom_names=tuple(g for g in FOOT_GEOMS if g.startswith("right"))
+        ),
         "operation": "abs",
         "ranges": (0.3, 1.6),
         "shared_random": True,
@@ -176,7 +183,7 @@ def make_events() -> dict[str, EventTermCfg]:
       mode="startup",
       func=dr.body_com_offset,
       params={
-        "asset_cfg": SceneEntityCfg("robot", body_names=()),  # 按机器人设置。
+        "asset_cfg": SceneEntityCfg("robot", body_names=("torso_link",)),
         "operation": "add",
         "ranges": {0: (-0.05, 0.05), 1: (-0.05, 0.05), 2: (-0.05, 0.05)},
       },

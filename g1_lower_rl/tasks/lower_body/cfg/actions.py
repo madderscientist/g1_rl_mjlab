@@ -12,10 +12,11 @@ from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.action_manager import ActionTermCfg
 from mjlab.managers.command_manager import CommandTermCfg
 
+from g1_lower_rl.assets import LOWER_BODY_ACTION_SCALE, LOWER_BODY_ACTUATOR_EXPR
 from g1_lower_rl.tasks.lower_body import mdp
 from g1_lower_rl.tasks.lower_body.cfg.constants import (
+  FOOT_SITES,
   HEIGHT_STAGES,
-  LOWER_BODY_JOINT_EXPR,
   STANDING_RATIO,
   STRAIGHT_RATIO,
   TURNING_RATIO,
@@ -27,8 +28,8 @@ def make_actions() -> dict[str, ActionTermCfg]:
   return {
     "joint_pos": JointPositionActionCfg(
       entity_name="robot",
-      actuator_names=LOWER_BODY_JOINT_EXPR,  # 按机器人覆盖。
-      scale=0.25,  # 按机器人覆盖。
+      actuator_names=LOWER_BODY_ACTUATOR_EXPR,
+      scale=dict(LOWER_BODY_ACTION_SCALE),
       use_default_offset=True,
     )
   }
@@ -53,6 +54,7 @@ def make_commands() -> dict[str, CommandTermCfg]:
       # “累计航向漂移惩罚”——不需要额外的项。
       rel_straight_envs=STRAIGHT_RATIO,
       debug_vis=True,
+      viz=mdp.ScenarioVelocityCommandCfg.VizCfg(z_offset=1.15),
       # 量程由 command_vel 课程逐档放开，这里是第一档。
       ranges=mdp.ScenarioVelocityCommandCfg.Ranges(
         **VELOCITY_STAGES[0][1],
@@ -62,7 +64,7 @@ def make_commands() -> dict[str, CommandTermCfg]:
     "height": mdp.BaseHeightCommandCfg(
       entity_name="robot",
       resampling_time_range=(3.0, 8.0),
-      site_names=(),  # 按机器人设置。
+      site_names=FOOT_SITES,
       # 在编译出来的模型上量过：足底 site 就在鞋底，所以这个指令就是卷尺量的骨盆离地高度。
       # 下界对应膝关节弯 115 度，是关节行程能给到的最深。
       #
