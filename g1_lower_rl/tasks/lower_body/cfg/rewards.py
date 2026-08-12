@@ -7,11 +7,12 @@
 from __future__ import annotations
 
 import math
+import re
 
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
-from g1_lower_rl.assets import LOWER_BODY_EFFORT_LIMIT
+from g1_lower_rl.assets import LOWER_BODY_EFFORT_LIMIT, WAIST_JOINTS
 from g1_lower_rl.tasks.lower_body import mdp
 from g1_lower_rl.tasks.lower_body.cfg.constants import (
   HEIGHT_STD_STAGES,
@@ -19,6 +20,14 @@ from g1_lower_rl.tasks.lower_body.cfg.constants import (
   LOWER_BODY_JOINT_EXPR,
   joints,
 )
+
+# 力矩上限按执行器模式索引、覆盖全部 15 个下肢关节，整份喂给只含腰三轴的项会让
+# resolve_matching_names_values 因为腿的模式一个也匹配不上而报错。
+WAIST_EFFORT_LIMIT: dict[str, float] = {
+  _expr: _limit
+  for _expr, _limit in LOWER_BODY_EFFORT_LIMIT.items()
+  if any(re.fullmatch(_expr, _name) for _name in WAIST_JOINTS)
+}
 
 
 def _tracking_rewards() -> dict[str, RewardTermCfg]:
@@ -159,7 +168,7 @@ def _posture_rewards() -> dict[str, RewardTermCfg]:
       func=mdp.joint_deviation_l2,
       weight=-1.0,
       params={
-        "asset_cfg": joints("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"),
+        "asset_cfg": joints(*WAIST_JOINTS),
         "weights": (0.4, 0.85, 1.0),  # 顺序同上：扭腰 / 左右 / 前后
       },
     ),
@@ -172,7 +181,7 @@ def _posture_rewards() -> dict[str, RewardTermCfg]:
       # 11.4° roll 偏差处的代价近似不变，但更用力消除小残差。
       weight=-0.3,
       params={
-        "asset_cfg": joints("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"),
+        "asset_cfg": joints(*WAIST_JOINTS),
         "weights": (1.0, 1.0, 0.5),
         "command_name": "twist",
         "command_threshold": 0.1,
@@ -185,8 +194,8 @@ def _posture_rewards() -> dict[str, RewardTermCfg]:
       func=mdp.normalized_joint_effort_l2,
       weight=-1.0,
       params={
-        "asset_cfg": joints("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"),
-        "effort_limits": LOWER_BODY_EFFORT_LIMIT,
+        "asset_cfg": joints(*WAIST_JOINTS),
+        "effort_limits": WAIST_EFFORT_LIMIT,
         "command_name": "twist",
         "command_threshold": 0.1,
       },

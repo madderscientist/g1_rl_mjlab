@@ -20,6 +20,9 @@ from g1_lower_rl.assets.g1_gloria import (
   get_robot_cfg as get_robot_cfg,
 )
 from g1_lower_rl.assets.g1_gloria import (
+  WAIST_JOINTS as WAIST_JOINTS,
+)
+from g1_lower_rl.assets.g1_gloria import (
   WHOLE_BODY_ACTION_SCALE as WHOLE_BODY_ACTION_SCALE,
 )
 from g1_lower_rl.assets.g1_gloria import (

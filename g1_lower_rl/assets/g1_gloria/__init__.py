@@ -70,11 +70,20 @@ def get_robot_cfg() -> EntityCfg:
 # 用 `joint_ids_map: [0..14]` 即可，不需要重映射。
 ##
 
-LOWER_BODY_JOINTS: tuple[str, ...] = tuple(
-  f"{_side}_{_j}_joint"
-  for _side in ("left", "right")
-  for _j in ("hip_pitch", "hip_roll", "hip_yaw", "knee", "ankle_pitch", "ankle_roll")
-) + ("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint")
+WAIST_JOINTS: tuple[str, ...] = (
+  "waist_yaw_joint",
+  "waist_roll_joint",
+  "waist_pitch_joint",
+)
+
+LOWER_BODY_JOINTS: tuple[str, ...] = (
+  tuple(
+    f"{_side}_{_j}_joint"
+    for _side in ("left", "right")
+    for _j in ("hip_pitch", "hip_roll", "hip_yaw", "knee", "ankle_pitch", "ankle_roll")
+  )
+  + WAIST_JOINTS
+)
 
 ARM_JOINTS: tuple[str, ...] = tuple(
   f"{_side}_{_j}_joint"
