@@ -11,6 +11,7 @@ import math
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
+from g1_lower_rl.assets import LOWER_BODY_EFFORT_LIMIT
 from g1_lower_rl.tasks.lower_body import mdp
 from g1_lower_rl.tasks.lower_body.cfg.constants import (
   HEIGHT_STD_STAGES,
@@ -166,11 +167,26 @@ def _posture_rewards() -> dict[str, RewardTermCfg]:
     # 它要与摆动腿反向旋转抵消角动量，压死会把 20 s 直行累计航向推到 99.8°。站立没有
     # 摆动腿，那个理由不成立，这个自由度就成了几乎免费的。
     "waist_deviation_still": RewardTermCfg(
-      func=mdp.joint_deviation_l2,
+      func=mdp.joint_deviation_l1,
+      # L1 与 L2 量纲不同。有效系数为 yaw/roll/pitch = 0.30/0.30/0.15：
+      # 11.4° roll 偏差处的代价近似不变，但更用力消除小残差。
+      weight=-0.3,
+      params={
+        "asset_cfg": joints("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"),
+        "weights": (1.0, 1.0, 0.5),
+        "command_name": "twist",
+        "command_threshold": 0.1,
+      },
+    ),
+    # 电机发热主要随持续电流平方增长，而位置偏差不能直接量到控制器为了维持姿态用了多少力。
+    # 这里对三个腰电机的实际力矩按各自额定值归一化后平方求和；角度 L1 仍保留，避免策略
+    # 单纯靠侧歪把上身质心挪到关节轴线上来卸力。只在无运动指令时收费，不压正常步态和转向。
+    "waist_effort_still": RewardTermCfg(
+      func=mdp.normalized_joint_effort_l2,
       weight=-1.0,
       params={
         "asset_cfg": joints("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"),
-        "weights": (0.6, 0.35, 0.0),
+        "effort_limits": LOWER_BODY_EFFORT_LIMIT,
         "command_name": "twist",
         "command_threshold": 0.1,
       },

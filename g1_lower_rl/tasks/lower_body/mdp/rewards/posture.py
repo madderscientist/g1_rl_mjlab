@@ -9,11 +9,13 @@ import torch
 from mjlab.entity import Entity
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.utils.lab_api.math import quat_apply_inverse
+from mjlab.utils.lab_api.string import resolve_matching_names_values
 
 from g1_lower_rl.tasks.lower_body.mdp.rewards._common import ROBOT, moving
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
+  from mjlab.managers.reward_manager import RewardTermCfg
 
 
 def body_orientation_l2(
@@ -161,3 +163,56 @@ def joint_deviation_l2(
   if command_name is not None:
     cost = cost * (1.0 - moving(env, command_name, command_threshold))
   return cost
+
+
+def joint_deviation_l1(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = ROBOT,
+  weights: Sequence[float] | None = None,
+  command_name: str | None = None,
+  command_threshold: float = 0.1,
+) -> torch.Tensor:
+  """惩罚关节偏离默认位姿的绝对值，参数与 :func:`joint_deviation_l2` 相同。"""
+  asset: Entity = env.scene[asset_cfg.name]
+  default_joint_pos = asset.data.default_joint_pos
+  assert default_joint_pos is not None
+  cost = torch.abs(
+    asset.data.joint_pos[:, asset_cfg.joint_ids]
+    - default_joint_pos[:, asset_cfg.joint_ids]
+  )
+  if weights is not None:
+    cost = cost * torch.as_tensor(weights, device=cost.device, dtype=cost.dtype)
+  cost = torch.sum(cost, dim=1)
+  if command_name is not None:
+    cost = cost * (1.0 - moving(env, command_name, command_threshold))
+  return cost
+
+
+class normalized_joint_effort_l2:
+  """各关节实际力矩占额定力矩比例的平方和，可按运动指令门控。"""
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    asset: Entity = env.scene[cfg.params["asset_cfg"].name]
+    _, joint_names = asset.find_joints(cfg.params["asset_cfg"].joint_names)
+    _, _, limits = resolve_matching_names_values(
+      data=cfg.params["effort_limits"], list_of_strings=joint_names
+    )
+    self.inv_limit = 1.0 / torch.tensor(
+      limits, device=env.device, dtype=torch.float32
+    ).clamp(min=1e-3)
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg,
+    effort_limits: dict[str, float],
+    command_name: str | None = None,
+    command_threshold: float = 0.1,
+  ) -> torch.Tensor:
+    del effort_limits  # 只在构造时用于解析各轴额定力矩。
+    asset: Entity = env.scene[asset_cfg.name]
+    effort_frac = asset.data.actuator_force[:, asset_cfg.joint_ids] * self.inv_limit
+    cost = torch.sum(torch.square(effort_frac), dim=1)
+    if command_name is not None:
+      cost = cost * (1.0 - moving(env, command_name, command_threshold))
+    return cost

@@ -36,7 +36,13 @@ from g1_lower_rl.tasks.lower_body.mdp.rewards.posture import (
   body_orientation_l2 as body_orientation_l2,
 )
 from g1_lower_rl.tasks.lower_body.mdp.rewards.posture import (
+  joint_deviation_l1 as joint_deviation_l1,
+)
+from g1_lower_rl.tasks.lower_body.mdp.rewards.posture import (
   joint_deviation_l2 as joint_deviation_l2,
+)
+from g1_lower_rl.tasks.lower_body.mdp.rewards.posture import (
+  normalized_joint_effort_l2 as normalized_joint_effort_l2,
 )
 from g1_lower_rl.tasks.lower_body.mdp.rewards.posture import (
   straight_knee as straight_knee,
