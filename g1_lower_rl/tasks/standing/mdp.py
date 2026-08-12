@@ -41,6 +41,20 @@ class gated_event_params(lower_body_mdp.gated_event_params):
     return (tilt < gate["max_tilt"]).sum(), tilt.new_tensor(tilt.numel())
 
 
+def com_over_feet(
+  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg, std: float
+) -> torch.Tensor:
+  """重心水平投影落在两脚中点附近的程度，exp 形。是奖励，如果没有奖励会让模型直接选择终止训练
+
+  用两脚中点而不是严格的支撑多边形：多边形内的点都「合法」，但只有靠近中心才对左右两侧的扰动都有余量。
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  com_xy = asset.data.root_com_pos_w[:, :2]
+  feet_xy = asset.data.site_pos_w[:, asset_cfg.site_ids, :2]
+  offset = torch.norm(com_xy - feet_xy.mean(dim=1), dim=-1)
+  return torch.exp(-torch.square(offset / std))
+
+
 def com_inside_feet_margin(
   env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg
 ) -> torch.Tensor:

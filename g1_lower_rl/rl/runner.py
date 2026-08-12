@@ -108,6 +108,7 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
     # 必须赶在基类把 algorithm 字典 splat 进 PPO 之前摘走。存档写在 runner 创建之前，yaml 不受影响。
     stages = train_cfg.get("algorithm", {}).pop("entropy_stages", ()) or ()
     self._entropy_stages = tuple(tuple(stage) for stage in stages)
+    self._entropy_stage = -1
     super().__init__(env, train_cfg, log_dir, device)
 
   @staticmethod
@@ -134,6 +135,11 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
     **σ 必须跟着一起压。** 只改系数退火太慢（实测 0.01->0.002 只把漂移改变
     -3.2e-4/iter，σ 从 1.05 到 0.35 要约 3200 迭代），而站立在 σ>1.0 时 300 迭代就崩了。
     Adam 动量也要清：``std_param`` 之前累积的是“往上推”的历史，不清就会立刻顶回来。
+
+    σ 上限是档位的**不变量**，不是一次性事件：续训进来也要重新压一遍。曾经在这里
+    信过“存档里的 σ 已经压过了”，结果档位阈值设在 4000、训练只跑到 3436 就中断，
+    续训时直接落到第 1 档却不动 σ，1.02 的噪声原样带进新 run。σ 本来就低于上限时
+    ``before <= cap`` 会提前返回，重复执行没有副作用。
     """
     stage = self._entropy_stage_index()
     if stage == self._entropy_stage:
@@ -141,7 +147,10 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
     self._entropy_stage = stage
     _, coef, cap = self._entropy_stages[stage]
     self.alg.entropy_coef = coef
-    print(f"[INFO]: entropy_coef -> {coef}（迭代 {self.current_learning_iteration}）")
+    print(
+      f"[INFO]: entropy 课程第 {stage} 档，entropy_coef -> {coef}"
+      f"（迭代 {self.current_learning_iteration}）"
+    )
 
     distribution = self.alg.get_policy().distribution
     assert distribution is not None
@@ -160,11 +169,7 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
 
   def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
     if self._entropy_stages:
-      # 先按当前迭代数落档，于是续训不会重复触发 σ 手术——checkpoint 里的 σ
-      # 已经是上次压过的值了。
-      self._entropy_stage = self._entropy_stage_index()
-      self.alg.entropy_coef = self._entropy_stages[self._entropy_stage][1]
-      print(f"[INFO]: entropy 课程第 {self._entropy_stage} 档，entropy_coef={self.alg.entropy_coef}")
+      self._advance_entropy_stage()
       # rsl_rl 的 learn 循环没有逐迭代钩子，包一层 update 是侵入最小的接法。
       # update 在 rollout 之后调用，所以档位比阈值晚一拍生效，无所谓。
       inner_update = self.alg.update

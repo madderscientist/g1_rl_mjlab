@@ -157,11 +157,17 @@ def _rewards() -> dict[str, RewardTermCfg]:
       weight=-20.0,
       params={"asset_cfg": _lower_body(), "effort_limits": LOWER_BODY_EFFORT_LIMIT},
     ),
-    # 唯一的正向项。没它的话全是罚项，提前摔倒反而是止损。
+    # 正向项之一。没它的话全是罚项，提前摔倒反而是止损。
     "feet_grounded": RewardTermCfg(
       func=mdp.feet_both_grounded,
       weight=1.0,
       params={"sensor_name": FEET_SENSOR},
+    ),
+    # 主力正向项：重心越靠近两脚中点给分越多。**它是把单步净回报抬到正的那一项。**
+    "com_centered": RewardTermCfg(
+      func=mdp.com_over_feet,
+      weight=4.0,
+      params={"asset_cfg": _lower_body(sites=True), "std": 0.08},
     ),
     # 单边下限，站高不罚。L1 而非平方：平方在刚跌破下限处梯度为零，拦不住缓慢下沉。
     "height_floor": RewardTermCfg(

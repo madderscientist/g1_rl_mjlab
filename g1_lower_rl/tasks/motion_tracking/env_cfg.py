@@ -59,13 +59,22 @@ TRACKED_BODIES: tuple[str, ...] = (
   "right_wrist_yaw_link",
 )
 
-# 判「跟丢」的末端（只比高度，阈值 0.25m）。手腕在列是有代价的：Gloria-M 夹爪让手臂
-# 惯量增加 70%，而手臂电机仍是原厂 5020，快速臂部动作会先在这里被判死。
+# 判「跟丢」的末端（只比高度，阈值 0.25m）。**只留双脚，不含手腕**——这是相对上游
+# 官方配置的有意偏离。
+#
+# 官方（原厂 G1）用双踝 + 双腕。我们换了 Gloria-M 夹爪后，肩 pitch 惯量 ×2.25、带宽从
+# 1.64 Hz 掉到 1.10 Hz，而电机仍是原厂 5020，手臂的跟踪能力本来就低了三分之一，阈值却
+# 没动，等于在要求手臂做它做不到的事。
+#
+# 实测（model_43800，关掉该终止后统计）：手腕触发次数是脚踝的 3 倍（357 vs 114），
+# 且 65% 的终止是「脚跟得好好的、光手腕超了」；超阈持续时间中位 5~10 拍、最长 77 拍，
+# 是持续状态而非抖动，说明策略无法改善——终止只是把腿部本可继续学习的样本一起销毁。
+#
+# 摔倒本身由 anchor_pos（躯干高度偏 0.25m）和 anchor_ori（0.8 rad）覆盖，去掉手腕不会
+# 漏掉真正的失败；手臂精度仍由 motion_body_pos / motion_body_ori 奖励项驱动。
 END_EFFECTORS: tuple[str, ...] = (
   "left_ankle_roll_link",
   "right_ankle_roll_link",
-  "left_wrist_yaw_link",
-  "right_wrist_yaw_link",
 )
 
 # 真机手臂带重力补偿：补偿器算出力矩后按 kp 折算成位置偏移叠加到目标上。这里同样建模，
@@ -73,7 +82,12 @@ END_EFFECTORS: tuple[str, ...] = (
 # 上界略超 1.0：补偿器也会过补，不只会欠补。
 ARM_GRAVCOMP_GAIN_RANGE: tuple[float, float] = (0.9, 1.01)
 
-# 手上拿东西：负载质量在该区间上**均匀**采样，负值视作空载。
+# 参考动作的播放倍率，每回合采样一个。
+#
+# 原速 LAFAN1 里很多动作在这台机器上物理不可达：肩关节幅值 1 rad 的正弦摆臂在
+# 1.5 Hz 就需要 26.6 N·m，超过 25 N·m 上限。早期对照：整体放慢 1.5 倍后 iter 12000 的
+# 回合长度从 12.91 涨到 50.44（×3.9）。
+MOTION_SPEED_RANGE: tuple[float, float] = (0.8, 1.0)
 #
 # 下界取负是为了让「空手」占一块有限概率（这里约 1/3），而不是概率为零的边界点。
 # 上界 1.0 kg 是量出来的：取语料 1941 帧真实臂姿算重力 + M*qddot，瓶颈不是肩而是腕
@@ -101,6 +115,7 @@ def motion_tracking_env_cfg(
   has_state_estimation: bool = False,
   arm_gravcomp_gain_range: tuple[float, float] = ARM_GRAVCOMP_GAIN_RANGE,
   payload_mass_range: tuple[float, float] = PAYLOAD_MASS_RANGE,
+  motion_speed_range: tuple[float, float] = MOTION_SPEED_RANGE,
   play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """构造全身动作跟踪配置（平地）。
@@ -129,6 +144,7 @@ def motion_tracking_env_cfg(
       anchor_body_name="torso_link",
       body_names=TRACKED_BODIES,
       policy_joint_names=WHOLE_BODY_JOINTS,
+      speed_range=motion_speed_range,
     )
   }
   cfg.commands = commands
@@ -205,6 +221,7 @@ def motion_tracking_env_cfg(
     motion_cmd.velocity_range = {}
     motion_cmd.joint_position_range = (0.0, 0.0)
     motion_cmd.sampling_mode = "start"
+    motion_cmd.speed_range = (1.0, 1.0)  # 回放时固定原速，便于与参考动作对照
     motion_cmd.debug_vis = True  # 参考动作画成 ghost，便于肉眼对照
 
   return cfg

@@ -76,7 +76,9 @@ class GeneralMotionCommand(CommandTerm):
     print(f"[GMT] 载入语料: {self.motion.describe()}")
 
     self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-    self.phase = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+    # 相位用浮点：每拍推进 self.speed 帧，取参考帧时再取整。
+    self.phase = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+    self.speed = torch.ones(self.num_envs, dtype=torch.float, device=self.device)
 
     self.lookahead = torch.tensor(
       cfg.lookahead_steps, dtype=torch.long, device=self.device
@@ -116,14 +118,17 @@ class GeneralMotionCommand(CommandTerm):
   @property
   def time_steps(self) -> torch.Tensor:
     """当前参考帧在拼接语料里的全局下标。"""
-    return self.motion.start_idx[self.motion_ids] + self.phase
+    return self.motion.start_idx[self.motion_ids] + self.phase.long()
 
   def _lookahead_indexes(self) -> torch.Tensor:
-    """(num_envs, K) 前瞻帧的全局下标，超出本条动作末尾的部分钳到末帧。"""
-    phase = self.phase.unsqueeze(1) + self.lookahead.unsqueeze(0)
-    last = (self.motion.num_frames[self.motion_ids] - 1).unsqueeze(1)
+    """(num_envs, K) 前瞻帧的全局下标，超出本条动作末尾的部分钳到末帧。
+
+    前瞻步长也乘速度：放慢时该看到的是同一段「未来多少秒」的动作，而不是同样帧数。
+    """
+    phase = self.phase.unsqueeze(1) + self.lookahead.unsqueeze(0) * self.speed.unsqueeze(1)
+    last = (self.motion.num_frames[self.motion_ids] - 1).unsqueeze(1).float()
     phase = torch.minimum(phase, last)
-    return self.motion.start_idx[self.motion_ids].unsqueeze(1) + phase
+    return self.motion.start_idx[self.motion_ids].unsqueeze(1) + phase.long()
 
   ##
   # 参考量（属性名与 mjlab MotionCommand 对齐，奖励/终止项可直接复用）
@@ -142,6 +147,11 @@ class GeneralMotionCommand(CommandTerm):
     proj_gravity = quat_rotate_inverse(root_quat, gravity)
     lin_vel = quat_rotate_inverse(root_quat, self.motion.body_lin_vel_w[idx, 0])
     ang_vel = quat_rotate_inverse(root_quat, self.motion.body_ang_vel_w[idx, 0])
+    # 参考速度要跟着播放倍率缩放：放慢后位置推进变慢，速度也必须变慢，
+    # 否则“该到哪”和“该多快”互相矛盾，策略无法同时满足。
+    scale = self.speed[:, None, None]
+    lin_vel = lin_vel * scale
+    ang_vel = ang_vel * scale
     joint_pos = self.motion.joint_pos[idx][:, :, self.policy_joint_indexes]
 
     return torch.cat(
@@ -154,7 +164,7 @@ class GeneralMotionCommand(CommandTerm):
 
   @property
   def joint_vel(self) -> torch.Tensor:
-    return self.motion.joint_vel[self.time_steps]
+    return self.motion.joint_vel[self.time_steps] * self.speed[:, None]
 
   @property
   def body_pos_w(self) -> torch.Tensor:
@@ -168,11 +178,11 @@ class GeneralMotionCommand(CommandTerm):
 
   @property
   def body_lin_vel_w(self) -> torch.Tensor:
-    return self.motion.body_lin_vel_w[self.time_steps]
+    return self.motion.body_lin_vel_w[self.time_steps] * self.speed[:, None, None]
 
   @property
   def body_ang_vel_w(self) -> torch.Tensor:
-    return self.motion.body_ang_vel_w[self.time_steps]
+    return self.motion.body_ang_vel_w[self.time_steps] * self.speed[:, None, None]
 
   @property
   def anchor_pos_w(self) -> torch.Tensor:
@@ -268,15 +278,17 @@ class GeneralMotionCommand(CommandTerm):
       ).float()
 
     self.motion_ids[env_ids] = self._sample_motions(env_ids)
+    lo, hi = self.cfg.speed_range
+    self.speed[env_ids] = sample_uniform(lo, hi, (len(env_ids),), device=self.device)
 
     if self.cfg.sampling_mode == "start":
-      self.phase[env_ids] = 0
+      self.phase[env_ids] = 0.0
     else:
       # 从动作中间任意位置起步：只从头开始的话，后半段几乎见不到。
       frac = sample_uniform(0.0, 1.0, (len(env_ids),), device=self.device)
-      self.phase[env_ids] = (
-        frac * (self.motion.num_frames[self.motion_ids[env_ids]] - 1).float()
-      ).long()
+      self.phase[env_ids] = frac * (
+        self.motion.num_frames[self.motion_ids[env_ids]] - 1
+      ).float()
 
     self._write_state_from_motion(env_ids)
 
@@ -345,7 +357,7 @@ class GeneralMotionCommand(CommandTerm):
     self.robot.clear_state(env_ids=env_ids)
 
   def _update_command(self) -> None:
-    self.phase += 1
+    self.phase += self.speed
     done = torch.where(self.phase >= self.motion.num_frames[self.motion_ids])[0]
     if done.numel() > 0:
       self._resample_command(done)
@@ -420,6 +432,14 @@ class GeneralMotionCommandCfg(CommandTermCfg):
   adaptive_uniform_ratio: float = 0.1
   adaptive_alpha: float = 0.01
   sampling_mode: Literal["adaptive", "uniform", "start"] = "adaptive"
+
+  speed_range: tuple[float, float] = (1.0, 1.0)
+  """播放倍率的采样区间，每回合一个。<1 即放慢。
+
+  原速的 LAFAN1 里有大量动作在这台机器上物理不可达（肩关节 1.4 Hz 以上就力矩饱和）。
+  早期对照：整体放慢 1.5 倍后，iter 12000 的回合长度从 12.91 涨到 50.44。
+  这里改成每回合随机，让同一段动作能以不同速度反复练到，而不用把语料扩容好几倍。
+  """
 
   def build(self, env: "ManagerBasedRlEnv") -> GeneralMotionCommand:
     return GeneralMotionCommand(self, env)
