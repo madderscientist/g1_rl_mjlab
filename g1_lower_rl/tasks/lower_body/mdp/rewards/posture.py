@@ -197,9 +197,10 @@ class normalized_joint_effort_l2:
     _, _, limits = resolve_matching_names_values(
       data=cfg.params["effort_limits"], list_of_strings=joint_names
     )
-    self.inv_limit = 1.0 / torch.tensor(
-      limits, device=env.device, dtype=torch.float32
-    ).clamp(min=1e-3)
+    # actuator_force 是 actuation 空间(nu)、按 spec.actuators 排，**不能用 joint_ids 索引**。
+    # 踩过：腰三轴 joint_ids=[12,13,14] 读到的是 right_hip_pitch/right_hip_yaw/waist_yaw。
+    self.actuator_ids = [asset.actuator_names.index(name) for name in joint_names]
+    self.inv_limit = 1.0 / torch.tensor(limits, device=env.device)
 
   def __call__(
     self,
@@ -211,7 +212,7 @@ class normalized_joint_effort_l2:
   ) -> torch.Tensor:
     del effort_limits  # 只在构造时用于解析各轴额定力矩。
     asset: Entity = env.scene[asset_cfg.name]
-    effort_frac = asset.data.actuator_force[:, asset_cfg.joint_ids] * self.inv_limit
+    effort_frac = asset.data.actuator_force[:, self.actuator_ids] * self.inv_limit
     cost = torch.sum(torch.square(effort_frac), dim=1)
     if command_name is not None:
       cost = cost * (1.0 - moving(env, command_name, command_threshold))

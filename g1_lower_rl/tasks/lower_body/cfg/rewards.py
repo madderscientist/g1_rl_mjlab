@@ -179,8 +179,6 @@ def _posture_rewards() -> dict[str, RewardTermCfg]:
     # 摆动腿，那个理由不成立，这个自由度就成了几乎免费的。
     "waist_deviation_still": RewardTermCfg(
       func=mdp.joint_deviation_l1,
-      # L1 与 L2 量纲不同。有效系数为 yaw/roll/pitch = 0.30/0.30/0.15：
-      # 11.4° roll 偏差处的代价近似不变，但更用力消除小残差。
       weight=-0.3,
       params={
         "asset_cfg": joints(*WAIST_JOINTS),
