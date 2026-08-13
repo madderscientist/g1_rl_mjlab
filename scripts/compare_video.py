@@ -106,7 +106,7 @@ def simulate(model, policy_path: str, tag: str):
   """只跑物理，返回每个场景的 qpos 轨迹（已按 STRIDE 抽到 25 Hz）。"""
   data = mujoco.MjData(model)
   policy = load_policy(policy_path)
-  index = Index(model, policy.action_joint_names)
+  index = Index(model, policy)
   tracks = []
   for scenario in SCENARIOS:
     reset(model, data, policy.joint_names, policy.default_pos)

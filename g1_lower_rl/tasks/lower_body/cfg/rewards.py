@@ -323,6 +323,7 @@ def _gait_rewards() -> dict[str, RewardTermCfg]:
     ),
     # 权重给得很重：拖着脚滑是策略替代“真的走”的主要选项。它同样能满足速度指令，却避开了
     # 真迈一步要付的所有代价，所以按 velocity 任务的权重它会完胜。
+    # 只管有运动指令的情形；静止时的蹭地由下面的 feet_slip_still 接管。
     "foot_slip": RewardTermCfg(
       func=mdp.feet_slip,
       weight=-2.0,
@@ -351,6 +352,23 @@ def _gait_rewards() -> dict[str, RewardTermCfg]:
         "sensor_name": "feet_ground_contact",
         "command_name": "twist",
         "command_threshold": 0.1,
+      },
+    ),
+    # 变宽本身是好策略，但不允许蹭着地变宽。上游 foot_slip 只在有运动指令时生效，
+    # 静止时蹭地免费，实测 16 s 内两脚间距棘轮式漂移 +10 cm（非双支撑帧仅 1%）。
+    #
+    # 权重按“蹭地必须比迈步贵”反推。L1 的时间积分就是路径长度：蹭出 10 cm 间距等于
+    # 两脚各走 5 cm，代价 = 权重 × 0.10；抬脚一步（stand_still_feet，单脚腾空 0.3 s）
+    # 约 0.15。所以 -1.5 只是打平，取 -4.0 留出 2.7 倍差价。
+    # 代价是 L1 在残余抖动处不归零：站定后 Σ|v| 约 0.01，单拍还剩 8e-4。
+    "feet_slip_still": RewardTermCfg(
+      func=mdp.feet_slip_still,
+      weight=-4.0,
+      params={
+        "sensor_name": "feet_ground_contact",
+        "command_name": "twist",
+        "command_threshold": 0.1,
+        "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITES),
       },
     ),
   }

@@ -111,3 +111,31 @@ def feet_stationary(
   sensor: ContactSensor = env.scene[sensor_name]
   airborne = (~(sensor.data.current_contact_time > 0)).float().sum(dim=1)
   return airborne * (1.0 - moving(env, command_name, command_threshold))
+
+
+def feet_slip_still(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  command_name: str,
+  command_threshold: float = 0.1,
+  asset_cfg: SceneEntityCfg = ROBOT,
+) -> torch.Tensor:
+  """指令要求站住时，惩罚脚在触地状态下的水平滑移速度。L1，不是平方。
+
+  上游 ``feet_slip`` 只在有运动指令时生效，于是静止时蹭地精确免费，站姿被"棘轮"式
+  撑开：实测 16 s 内两脚间距漂移 +10 cm，其间非双支撑帧只有 1%——全程贴地蹭出去的。
+
+  不能直接把 ``feet_slip`` 的门控去掉：它罚 v²，而这里的漂移速度只有 0.013 m/s，
+  二阶小量。按 -2.0 算蹭出 10 cm 只值 0.005，而抬脚迈一步（``stand_still_feet``）
+  约 0.15，蹭地反而便宜 28 倍。L1 的时间积分就是路径长度，与蹭得多慢无关——目标不是
+  禁止变宽，是禁止蹭着变宽。
+  """
+  sensor: ContactSensor = env.scene[sensor_name]
+  asset: Entity = env.scene[asset_cfg.name]
+  assert sensor.data.found is not None
+  in_contact = (sensor.data.found > 0).float()
+  speed = torch.norm(
+    asset.data.site_lin_vel_w[:, asset_cfg.site_ids, :2], dim=-1
+  )
+  cost = torch.sum(speed * in_contact, dim=1)
+  return cost * (1.0 - moving(env, command_name, command_threshold))

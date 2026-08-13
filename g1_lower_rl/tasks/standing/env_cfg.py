@@ -49,8 +49,14 @@ from g1_lower_rl.tasks.lower_body.cfg.constants import (
 from g1_lower_rl.tasks.lower_body.cfg.events import make_events
 from g1_lower_rl.tasks.standing import mdp
 
-# 扰动课程只在这里抓闸：骨盆倾角小于约 14 度才算「这一档站住了」。
-STAND_GATE = {"max_tilt": 0.25, "min_fraction": 0.6, "ema": 0.02}
+# 扰动课程只在这里抓闸：骨盆倾角小于约 27 度才算「这一档站住了」。
+#
+# 0.25 -> 0.45。本任务没有任何一项要求骨盆摆正（`upright` 已删，见 README 3.3），
+# 而 `reset_arm_pose` 会把手臂摆到全可达范围、质心随之偏移，策略就歪着站来代偿。
+# 实测 512 环境稳态 tilt 分布 p10=0.174 p50=0.292 p90=0.432，0.25 只有 33% 达标，
+# 闸门永远开不了，整套扰动全程停在第 0 档（也就是全关）。摔倒判据是 0.8 rad（对应 0.717），
+# 0.45 仍留足余量，含义从「站得笔直」改成「还明显站着」。
+STAND_GATE = {"max_tilt": 0.45, "min_fraction": 0.6, "ema": 0.02}
 
 # 高度**下限**，不是目标。实测自然站姿 0.78，留 10 cm 给抗扰动的屈膝缓冲。
 STAND_HEIGHT_MIN = 0.68
@@ -152,9 +158,15 @@ def _rewards() -> dict[str, RewardTermCfg]:
     # sum (tau/额定)^2，只算策略驱动的 15 轴。平方而非 L1：站着不动时 tau*omega ≈ 0，
     # 电耗几乎全是铜损 I²R，而 tau = n·kt·I，所以功率正比于 tau²。求和而非均值：总功率
     # 是各关节相加。手臂不计：实测它占 90% 以上且主要由事件采到的位姿决定，策略控制不了。
+    #
+    # -20 -> -5。原值按修复前的读数标的——那时这一项实际量的是手臂（见 commit e0f8b48）。
+    # 按真实下肢读数，训练分布下 power ≈ 0.128，-20 吃掉非 power 逐拍净收益（0.069）
+    # 的 74%：站满一局只值 +13.9而摔一次才罚 -4，实测两次重训回合长度都卡在 ~200/1000。
+    # -5 时占 18.5%、站满一局值 +52.4；而顶膝限位那条退化解（power=1.77）单拍仍要付
+    # 0.177，是全部净收益的 3.1 倍，照样被封死。
     "power": RewardTermCfg(
       func=lower_body_mdp.normalized_joint_effort_l2,
-      weight=-20.0,
+      weight=-5.0,
       params={"asset_cfg": _lower_body(), "effort_limits": LOWER_BODY_EFFORT_LIMIT},
     ),
     # 正向项之一。没它的话全是罚项，提前摔倒反而是止损。

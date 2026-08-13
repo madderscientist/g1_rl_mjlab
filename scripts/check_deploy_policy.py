@@ -66,7 +66,7 @@ def main() -> int:
   model = build_model()
   data = mujoco.MjData(model)
   policy = load_policy(args.policy)
-  index = Index(model, policy.action_joint_names)
+  index = Index(model, policy)
   set_arm_mode(model, args.arms)
   video = open_video(model, args.video)
 

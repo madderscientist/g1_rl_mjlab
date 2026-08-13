@@ -87,8 +87,8 @@ class Policy(NamedTuple):
   """ONNX 会话加从元数据解出来的部署契约。
 
   ``joint_names`` 是模型全部关节（包括策略不驱动的手臂、夹爪），``action_*`` 三项只覆盖
-  策略驱动的那些。**两者长度不同**，拆成不同字段就是为了不再出现 ``defaults[:15]``
-  这种靠截断去猜的写法。
+  策略驱动的那些，``obs_*`` 三项只覆盖观测里出现的那些。**三者长度可以互不相同**：
+  站立任务观测全身 29 轴、只驱动下肢 15 轴，用动作关节去拼观测会短 14 维。
   """
 
   session: onnxruntime.InferenceSession
@@ -97,6 +97,9 @@ class Policy(NamedTuple):
   action_joint_names: list[str]
   action_default_pos: np.ndarray
   action_scale: np.ndarray
+  obs_pos_joint_names: list[str]
+  obs_pos_default: np.ndarray
+  obs_vel_joint_names: list[str]
 
 
 def load_policy(path: str) -> Policy:
@@ -112,35 +115,68 @@ def load_policy(path: str) -> Policy:
     action_names = names[: len(scale)]
     print(f"[WARN] {path} 缺 action_joint_names，退回按前 {len(scale)} 个关节截断")
   slot = {name: i for i, name in enumerate(names)}
-  missing = [name for name in action_names if name not in slot]
-  if missing:
-    raise ValueError(f"动作关节 {missing} 不在元数据的 joint_names 里")
-  action_defaults = np.array([defaults[slot[name]] for name in action_names])
-  return Policy(session, names, defaults, action_names, action_defaults, scale)
+
+  def defaults_of(subset: list[str], what: str) -> np.ndarray:
+    missing = [name for name in subset if name not in slot]
+    if missing:
+      raise ValueError(f"{what} {missing} 不在元数据的 joint_names 里")
+    return np.array([defaults[slot[name]] for name in subset])
+
+  def obs_subset(term: str) -> list[str]:
+    key = f"obs_{term}_joint_names"
+    if key in meta:
+      return meta[key].split(",")
+    # 早期导出没写这两项，那时观测关节恰好等于动作关节。
+    print(f"[WARN] {path} 缺 {key}，退回按动作关节装配观测")
+    return list(action_names)
+
+  obs_pos_names = obs_subset("joint_pos")
+  obs_vel_names = obs_subset("joint_vel")
+  return Policy(
+    session,
+    names,
+    defaults,
+    action_names,
+    defaults_of(action_names, "动作关节"),
+    scale,
+    obs_pos_names,
+    defaults_of(obs_pos_names, "joint_pos 观测关节"),
+    obs_vel_names,
+  )
 
 
 class Index:
   """策略关节在 qpos / qvel / ctrl 里的下标，以及测高用的足底 site。
 
-  ``joint_names`` 要传 ONNX 元数据里的动作关节名单，不要写死——不同任务驱动的关节不一样。
+  动作关节和观测关节分开索引：站立任务观测全身 29 轴、只驱动下肢 15 轴，混用会错位。
   """
 
-  def __init__(self, model: mujoco.MjModel, joint_names: Sequence[str]):
-    joints = [
-      mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
-      for name in joint_names
-    ]
+  def __init__(self, model: mujoco.MjModel, policy: Policy):
+    def joints_of(names: Sequence[str], what: str) -> list[int]:
+      # mj_name2id 找不到返回 -1，直接当下标用会静默地索到最后一个关节。
+      ids = [
+        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name) for name in names
+      ]
+      unknown = [n for n, i in zip(names, ids) if i < 0]
+      if unknown:
+        raise ValueError(f"模型里没有这些{what}关节: {unknown}")
+      return ids
+
+    joint_names = policy.action_joint_names
+    joints = joints_of(joint_names, "动作")
     actuators = [
       mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
       for name in joint_names
     ]
-    # mj_name2id 找不到返回 -1，直接当下标用会静默地索到最后一个关节。
-    unknown = [n for n, j, a in zip(joint_names, joints, actuators) if j < 0 or a < 0]
+    unknown = [n for n, a in zip(joint_names, actuators) if a < 0]
     if unknown:
-      raise ValueError(f"模型里没有这些关节或它们的执行器: {unknown}")
+      raise ValueError(f"模型里没有这些关节的执行器: {unknown}")
     self.qpos = model.jnt_qposadr[joints]
     self.qvel = model.jnt_dofadr[joints]
     self.actuator = actuators
+    self.obs_qpos = model.jnt_qposadr[joints_of(policy.obs_pos_joint_names, "观测")]
+    self.obs_qvel = model.jnt_dofadr[joints_of(policy.obs_vel_joint_names, "观测")]
+    self.obs_default_pos = policy.obs_pos_default
     self.arm_actuator = [
       mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
       for name in ARM_JOINTS
@@ -243,8 +279,8 @@ def rollout(model, data, session, index, default_pos, scale, command, seconds, v
       "command_twist": command[:3],
       "command_height": command[3:4],
       "phase": phase,
-      "joint_pos": data.qpos[index.qpos] - default_pos,
-      "joint_vel": data.qvel[index.qvel],
+      "joint_pos": data.qpos[index.obs_qpos] - index.obs_default_pos,
+      "joint_vel": data.qvel[index.obs_qvel],
       "actions": last_action,
     }
     obs[0] = np.concatenate([parts[name] for name in obs_names])

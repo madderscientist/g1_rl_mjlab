@@ -21,6 +21,9 @@ from g1_lower_rl.tasks.lower_body.mdp.rewards.gait import (
   feet_clearance_relative as feet_clearance_relative,
 )
 from g1_lower_rl.tasks.lower_body.mdp.rewards.gait import (
+  feet_slip_still as feet_slip_still,
+)
+from g1_lower_rl.tasks.lower_body.mdp.rewards.gait import (
   feet_stationary as feet_stationary,
 )
 from g1_lower_rl.tasks.lower_body.mdp.rewards.gait import (
