@@ -70,13 +70,14 @@ SCENARIOS = (
     arm_kp=30.0,
     arm_kd=2.0,
   ),
+  Scenario("stand still", (0.0, 0.0, 0.0, 0.8), 4.0),
+  Scenario("squat in place  h=0.4", (0.0, 0.0, 0.0, 0.4), 6.0),
   Scenario("forward -0.5 m/s", (-0.5, 0.0, 0.0, 0.74), 6.0),
   Scenario("forward 1.0 m/s", (1.0, 0.0, 0.0, 0.7), 6.0, arm_kp=5.0, arm_kd=1.0),
   Scenario("strafe 0.3 m/s", (0.0, 0.3, 0.0, 0.8), 6.0, arm_kp=10.0, arm_kd=4.0),
   Scenario("squat-walk 0.3 m/s  h=0.62", (0.3, 0.0, 0.0, 0.62), 6.0),
-  Scenario("squat in place  h=0.6", (0.0, 0.0, 0.0, 0.4), 6.0),
-  Scenario("turn 1.5 rad/s", (0.0, 0.0, 1.5, 0.52), 6.0),
-  Scenario("turn -1.5 rad/s", (0.0, 0.0, -1.5, 0.52), 6.0),
+  Scenario("turn 1.5 rad/s", (0.0, 0.0, 1.5, 0.52), 4.0),
+  Scenario("turn -1.5 rad/s", (0.0, 0.0, -1.5, 0.52), 4.0),
   Scenario("turn 0.5 rad/s", (0.0, 0.0, 0.5, 0.8), 6.0),
 )
 
