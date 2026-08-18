@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING
 
 import mujoco
 import torch
-
 from mjlab.envs.mdp.actions.actions import JointPositionAction, JointPositionActionCfg
 from mjlab.utils.lab_api.math import quat_apply, sample_uniform
 
@@ -104,6 +103,28 @@ class GravityCompensatedJointPositionAction(JointPositionAction):
     self._gain = torch.ones(self.num_envs, len(names), device=self.device)
     self._resample_gain(slice(None))
 
+    # 命令项在动作项之后构造，这里只记名字，首次用到时再解析。
+    self._reference_name = cfg.reference_command_name
+    self._reference_term = None
+
+  def _reference_pose(self) -> torch.Tensor:
+    """当前控制步的参考关节角，按动作向量的关节顺序排。"""
+    if self._reference_term is None:
+      self._reference_term = self._env.command_manager.get_term(self._reference_name)
+    # 命令项的 joint_pos 与 robot.data.joint_pos 同序，可直接用关节 id 取子集。
+    return self._reference_term.joint_pos[:, self._target_ids]
+
+  def process_actions(self, actions: torch.Tensor) -> None:
+    if self._reference_name is None:
+      super().process_actions(actions)
+      return
+    self._raw_actions[:] = actions
+    self._processed_actions = self._raw_actions * self._scale + self._reference_pose()
+    if self.cfg.clip is not None:
+      self._processed_actions = torch.clamp(
+        self._processed_actions, min=self._clip[:, :, 0], max=self._clip[:, :, 1]
+      )
+
   def _resample_gain(self, env_ids) -> None:
     lo, hi = self.cfg.gain_range
     if lo == hi == 1.0:
@@ -171,6 +192,24 @@ class GravityCompensatedJointPositionActionCfg(JointPositionActionCfg):
 
   gain_range: tuple[float, float] = (1.0, 1.0)
   """补偿系数的采样区间，**按臂共享**。取 (1,1) 是理想补偿器，不该单独用。"""
+
+  reference_command_name: str | None = None
+  """设为命令项名字则改用残差动作：``q_target = q_ref(t) + scale * a``。
+
+  默认的 ``use_default_offset`` 是相对**默认站姿**取偏移，网络每一拍都要输出从站姿到
+  目标姿态的完整偏移量，于是大幅度动作 = 大 ``a`` + 大 ``Δa``；而 ``action_rate_l2``
+  正是罚 ``‖Δa‖²``，**惩罚强度和参考动作的动态强度正相关**，等于系统性地给快动作加税。
+  换成相对参考姿态后，大幅度由 ``q_ref`` 自己扛，``a`` 只是修正量，翻跟头时 action rate
+  也几乎不涨。Extreme-RGMT 式 (3) 用的就是这个形式。
+  """
+
+  def __post_init__(self):
+    super().__post_init__()
+    if self.reference_command_name is not None and self.use_default_offset:
+      raise ValueError(
+        "残差动作与 use_default_offset 互斥：基准只能有一个，"
+        "要么默认站姿要么参考姿态。"
+      )
 
   def build(self, env: "ManagerBasedRlEnv") -> GravityCompensatedJointPositionAction:
     return GravityCompensatedJointPositionAction(self, env)

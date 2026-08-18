@@ -86,9 +86,7 @@ def main(
   for name in wanted:
     idx = names.index(name)
     # 固定到这一条，绕开自适应采样。
-    cmd._sample_motions = lambda env_ids, _i=idx: torch.full(  # noqa: SLF001
-      (len(env_ids),), _i, dtype=torch.long, device=env.device
-    )
+    cmd.forced_motion_id = idx
     # reset 与 step 必须在同一个 inference_mode 里：跨界就地改张量会报错。
     with torch.inference_mode():
       env.reset()

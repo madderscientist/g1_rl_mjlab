@@ -109,7 +109,37 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
     stages = train_cfg.get("algorithm", {}).pop("entropy_stages", ()) or ()
     self._entropy_stages = tuple(tuple(stage) for stage in stages)
     self._entropy_stage = -1
+
+    # Stage II：命令项里配了分层文件就切到 PACE+STAR 的算法类。
+    cmd = getattr(env.unwrapped, "command_manager", None)
+    motion = cmd.get_term("motion") if cmd is not None else None
+    self._stage2 = motion is not None and getattr(motion, "bin_pool_acq", None) is not None
+    if self._stage2:
+      alg = train_cfg.setdefault("algorithm", {})
+      alg["class_name"] = "g1_lower_rl.rl.pace_star:PaceStarPPO"
+      alg["acquisition_fraction"] = motion.cfg.acquisition_fraction
+
     super().__init__(env, train_cfg, log_dir, device)
+
+    if self._stage2:
+      self._motion_cmd = motion
+      self.alg.bin_weight_fn = _BinWeight(motion)
+      self.alg.pace_requested = True
+      self._wrap_step_for_bin_record()
+
+  def _wrap_step_for_bin_record(self) -> None:
+    """每个环境步把起点 bin 记进环形缓冲，供 STAR 在更新时按 fragment 还原难度。"""
+    env, cmd = self.env, self._motion_cmd
+    inner = env.step
+    n_steps = self.cfg["num_steps_per_env"]
+    state = {"i": 0}
+
+    def step(actions):
+      cmd.record_bins(state["i"] % n_steps, n_steps)
+      state["i"] += 1
+      return inner(actions)
+
+    env.step = step
 
   @staticmethod
   def _get_export_paths(checkpoint_path: str) -> tuple[Path, str, Path]:
@@ -229,3 +259,19 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
         + "\n"
       )
     return infos
+
+
+class _BinWeight:
+  """STAR 的难度权重 w_t = B * p_{b_t}，>1 表示该 bin 的采样概率高于均匀基线。"""
+
+  def __init__(self, motion) -> None:
+    self._m = motion
+
+  def bins(self):
+    return self._m.bin_history
+
+  def __call__(self):
+    hist, probs = self._m.bin_history, self._m.last_bin_probs
+    if hist is None or probs is None:
+      return None
+    return probs.numel() * probs[hist.clamp(min=0)]

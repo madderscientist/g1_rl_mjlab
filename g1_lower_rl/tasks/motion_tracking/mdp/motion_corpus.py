@@ -9,9 +9,33 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import torch
+
+
+class MotionBins(NamedTuple):
+  """语料按固定时长切分后的采样单元。
+
+  以 bin 而不是整条动作作为采样单位：难点通常只占一条动作里的几秒，按条加权的话
+  这几秒会被同条动作里早就练熟的部分稀释掉。
+  """
+
+  motion_id: torch.Tensor
+  """(num_bins,) 每个 bin 属于哪条动作。"""
+  phase_start: torch.Tensor
+  """(num_bins,) 每个 bin 在所属动作内的起始相位。"""
+  offset: torch.Tensor
+  """(num_motions,) 每条动作的首个 bin 下标。"""
+  count: torch.Tensor
+  """(num_motions,) 每条动作切出的 bin 数。"""
+  frames: int
+  """一个 bin 的帧数。"""
+
+  @property
+  def num_bins(self) -> int:
+    return int(self.motion_id.numel())
 
 
 class MotionCorpus:
@@ -70,6 +94,33 @@ class MotionCorpus:
     self.start_idx = start
     self.num_motions = len(files)
     self.time_step_total = int(self.num_frames.sum().item())
+
+  def make_bins(self, bin_frames: int) -> MotionBins:
+    """按固定帧数把语料切成 bin。
+
+    末尾不足一个 bin 的残帧并入本条动作的最后一个 bin，否则会切出一个「刚起步就播完」
+    的采样点，它永远不会失败，白占采样概率。
+    """
+    device = self.num_frames.device
+    count = torch.clamp(self.num_frames // bin_frames, min=1)
+    offset = torch.zeros_like(count)
+    offset[1:] = count.cumsum(0)[:-1]
+
+    motion_id = torch.repeat_interleave(
+      torch.arange(self.num_motions, device=device), count
+    )
+    total = int(count.sum().item())
+    phase_start = (
+      torch.arange(total, device=device) - offset[motion_id]
+    ) * bin_frames
+
+    return MotionBins(
+      motion_id=motion_id,
+      phase_start=phase_start,
+      offset=offset,
+      count=count,
+      frames=bin_frames,
+    )
 
   def describe(self, fps: float = 50.0) -> str:
     total_s = self.time_step_total / fps

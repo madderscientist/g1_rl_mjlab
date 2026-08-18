@@ -36,6 +36,8 @@ class PlayConfig:
   viewer: Literal["auto", "native", "viser"] = "auto"
   no_terminations: bool = False
   """关掉所有终止条件（用假策略看运动时有用）。"""
+  motion_dir: str | None = None
+  """覆盖动作语料目录，比如用 ``motions/bench_lafan1`` 只看评测基准那 80 条。"""
 
 
 def _dummy_policy(kind: str, env: RslRlVecEnvWrapper):
@@ -53,6 +55,9 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
   env_cfg = load_env_cfg(task_id, play=True)
   agent_cfg = load_rl_cfg(task_id)
   trained = cfg.agent == "trained"
+
+  if cfg.motion_dir is not None:
+    env_cfg.commands["motion"].motion_dir = cfg.motion_dir
 
   if cfg.no_terminations:
     env_cfg.terminations = {}

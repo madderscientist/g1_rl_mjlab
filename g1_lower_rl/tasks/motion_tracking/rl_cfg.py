@@ -6,42 +6,50 @@ from mjlab.rl import (
   RslRlPpoAlgorithmCfg,
 )
 
-GRU_NUM_STEPS_PER_ENV = 48
-"""RNN 靠 BPTT 学时序，截断窗口要能跨过一个步态周期（24 拍 = 0.48 s 不够）。"""
+from g1_lower_rl.rl.rgmt_model import RgmtModelCfg
+from g1_lower_rl.tasks.motion_tracking.env_cfg import RGMT_PROP_TERMS
+
+RGMT_OBS_GROUPS: dict[str, tuple[str, ...]] = {
+  "actor": tuple(f"rg_{n}" for n in RGMT_PROP_TERMS) + ("rg_actions", "rg_reference"),
+  "critic": ("critic",),
+}
 
 
 def motion_tracking_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
-  """actor 用 GRU：负载与补偿器误差都只能从「指令 vs 实际响应」的历史里推断。
+  """actor 用 RGMT 架构（Extreme-RGMT 第 IV-A 节）。
 
-  拼接 5 帧本体历史只给了 0.1 s 的窗口，而隐状态没有这个上限。下肢行走任务换 GRU
-  后是压倒性优势（iter 9800 时 reward 50.3 vs 14.4），这里加了负载随机化之后，需要
-  隐式在线辨识的成分更重。
+  三分支独立编码 + 逐分支 LayerNorm + 因果历史编码器 + cross-attention + FSQ 瓶颈。
+  取代原来的 GRU：GRU 只能把历史压进一个隐状态，而 cross-attention 能按当前状态
+  从局部参考窗口里**挑**相关帧——高动态动作里相位偏一点，该看的参考帧就完全不同。
 
-  rsl_rl 5.4 的 ``RNNModel`` 自带 ONNX 导出，部署链路不用改。
+  ``obs_normalization`` 必须关：RGMT 用逐分支 LayerNorm 代替经验归一化，后者的
+  running statistics 在 Stage II 换语料后会漂。
   """
   return RslRlOnPolicyRunnerCfg(
-    actor=RslRlModelCfg(
-      class_name="RNNModel",
-      rnn_type="gru",
-      # 比下肢版（32）宽一倍：这里要辨识的量更多（负载 + 补偿器增益 + 接触）。
-      rnn_hidden_dim=64,
-      rnn_num_layers=1,
-      # GRU 之后的 MLP 收窄：隐状态已承担大部分容量，再堆宽只是更难训。
-      hidden_dims=(512, 256),
+    actor=RgmtModelCfg(
+      class_name="g1_lower_rl.rl.rgmt_model:RgmtActor",
+      hidden_dims=(1024, 1024, 512, 256),
       activation="elu",
-      obs_normalization=True,
+      obs_normalization=False,
       distribution_cfg={
         "class_name": "GaussianDistribution",
         "init_std": 1.0,
         "std_type": "scalar",
       },
+      history_len=10,
+      reference_dim=38,
+      token_dim=64,
+      num_heads=4,
+      history_layers=2,
+      fsq_levels=5,
     ),
     critic=RslRlModelCfg(
       # critic 吃特权观测且不上机，保持 MLP。
-      hidden_dims=(1024, 512, 256),
+      hidden_dims=(1024, 1024, 512, 512),
       activation="elu",
       obs_normalization=True,
     ),
+    obs_groups=RGMT_OBS_GROUPS,
     algorithm=RslRlPpoAlgorithmCfg(
       value_loss_coef=1.0,
       use_clipped_value_loss=True,
@@ -59,9 +67,8 @@ def motion_tracking_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
     experiment_name="g1_gloria_gmt",
     logger="tensorboard",
     save_interval=200,
-    num_steps_per_env=GRU_NUM_STEPS_PER_ENV,
-    # 语料从 10 段扩到 80 段真实动捕（含镜像），涵盖行走/跑步/冲刺/跳跃/格斗/舞蹈/
-    # 摔倒起身，要学的动作流形大了一个量级，迭代上限跟着放大。收敛看
-    # Train/mean_episode_length 与 Metrics/motion/error_body_pos 是否进平台期。
-    max_iterations=60001,
+    # 论文写 24，但那是配它自己的环境数定的资源配比，不是架构主张。这里保持 48：
+    # 更长的 rollout 让 GAE 少一次 bootstrap、偏差更小，且与上一轮 GRU 基线逐项可比。
+    num_steps_per_env=48,
+    max_iterations=140001,
   )

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import faulthandler
 import logging
 import os
+import signal
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -51,6 +53,10 @@ class TrainConfig:
 
 
 def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
+  # 多卡训练挂起时唯一能拿到栈的手段：ptrace_scope=1 下 py-spy/gdb 都够不到 worker
+  # （它们是兄弟进程不是祖先），只能让进程自己转储。`kill -USR1 <worker pid>`。
+  faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+
   if os.environ.get("CUDA_VISIBLE_DEVICES", "") == "":
     device, seed, rank = "cpu", cfg.agent.seed, 0
   else:
