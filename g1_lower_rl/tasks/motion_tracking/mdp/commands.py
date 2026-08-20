@@ -129,6 +129,7 @@ class GeneralMotionCommand(CommandTerm):
     )
     self.bin_pool_acq: torch.Tensor | None = None
     self.bin_pool_con: torch.Tensor | None = None
+    self._offsets_cache: torch.Tensor | None = None
     if cfg.strata_file is not None:
       self._load_strata(cfg.strata_file, cfg.acquisition_fraction)
 
@@ -200,19 +201,45 @@ class GeneralMotionCommand(CommandTerm):
     ).flatten(1)
 
   def _window_indexes(self) -> torch.Tensor:
-    """(num_envs, 2L+1) 连续参考窗口的全局帧下标，含过去 L 帧与未来 L 帧。
+    """(num_envs, 2L+1) 参考窗口的全局帧下标，含过去与未来各 L 个 token。
 
     与 ``_lookahead_indexes`` 的区别：那个是稀疏远前瞻（最远 1.9 s）给 MLP 拍扁用的；
-    这个是 RGMT 的**局部稠密窗口**，要保住 token 结构喂 cross-attention。
+    这个是 RGMT 的局部窗口，要保住 token 结构喂 cross-attention。
     两端都按本条动作的首末帧钳住，避免跨条串帧。
     """
-    L = self.cfg.reference_window
-    offsets = torch.arange(-L, L + 1, device=self.device, dtype=torch.float)
-    offsets = offsets * self.cfg.reference_stride
+    offsets = self._window_offsets()
     phase = self.phase.unsqueeze(1) + offsets.unsqueeze(0) * self.speed.unsqueeze(1)
     last = (self.motion.num_frames[self.motion_ids] - 1).unsqueeze(1).float()
     phase = phase.clamp(min=0.0).minimum(last)
     return self.motion.start_idx[self.motion_ids].unsqueeze(1) + phase.long()
+
+  def _window_offsets(self) -> torch.Tensor:
+    """token 的帧偏移，跨度与曲率都是照着实测注意力分布定的。
+
+    在 ±0.6 s 窗口上钩出 cross-attn 的权重后，形状非常明确：
+
+      偏移(s)  -0.60  -0.30   0.00  +0.16  +0.22  +0.30  +0.40  +0.60
+      权重      0.4%   0.7%  11.0%  10.2%  19.0%  13.5%   3.2%   0.65%
+
+    未来占 70.7%（策略确实在看前瞻），但峰值在 +0.22 s，0.4 s 以外总共不到 5%。
+    也就是说 ±0.6 s 里有三分之一的 token 只分到 7% 注意力，纯属浪费；而最早的
+    ±0.2 s 窗口边界恰好卡在峰值前面，这才是当初「前瞻不足」的真实缺口——只差
+    0.1 s，不是 0.4 s。多给的远端还会反过来拖累高动态：把可视未来从 0.6 s 砍到
+    0.04 s，jumps/fight/dance 各涨 7~8%（追一个已经跟丢的远期目标只会诱发激进动作）。
+
+    所以跨度收到 ±0.3 s 刚好罩住峰值，省下的 token 全部加密到关键区间。
+    指数取 1.5 而非 2：跨度缩小后曲率必须跟着变缓，否则近处会算出重复偏移。
+    """
+    L = self.cfg.reference_window
+    s = self.cfg.reference_stride
+    if s == 1:
+      return torch.arange(-L, L + 1, device=self.device, dtype=torch.float)
+    if self._offsets_cache is None:
+      i = torch.arange(1, L + 1, device=self.device, dtype=torch.float)
+      span = round(L * s)
+      far = torch.round(((i / L) ** 1.5) * (span - 1) + 1)
+      self._offsets_cache = torch.cat([-far.flip(0), torch.zeros(1, device=self.device), far])
+    return self._offsets_cache
 
   @property
   def reference_tokens(self) -> torch.Tensor:
@@ -617,13 +644,18 @@ class GeneralMotionCommandCfg(CommandTermCfg):
   """前瞻帧偏移（控制步）。50 Hz 下最远看到约 1.9 秒后。"""
   reference_window: int = 10
   """RGMT 局部参考窗口的单边半径 L，产出 2L+1 个 token。"""
-  reference_stride: int = 1
-  """窗口内相邻 token 的帧间隔。1 = 稠密，覆盖 ±L/50 秒。
+  reference_stride: float = 1.5
+  """窗口跨度系数：最远 token 落在 ``L*stride`` 帧外。1 = 稠密均匀，覆盖 ±L/50 秒。
 
   论文用 21 token 稠密窗口（±0.2 s），比本仓原来的稀疏前瞻（最远 1.9 s）短得多——
   RGMT 的设计是让 cross-attention 在局部窗口里按当前状态挑相关帧，靠的不是看得远。
-  调大它可以在不增加 token 数的前提下换更长的时域覆盖。
-  """
+
+  取 1.5（±0.3 s）是钩出注意力权重后定的：未来占 70.7%，峰值在 +0.22 s，
+  而 0.4 s 以外加起来不到 5%。±0.3 s 刚好罩住峰值，再远就是白送 token。
+
+  走过的弯路记在这：先按「起跳蓄力中位提前 0.500 s」把它设成 3（±0.6 s），
+  结果训练 eplen 124→167 但评测 41.6→38.9；改成近密远疏后评测回到 42.1，
+  仍未超基线。蓄力提前量的统计没错，错在假定策略能用上那么远的信息。"""
   pose_range: dict[str, tuple[float, float]] = field(default_factory=dict)
   velocity_range: dict[str, tuple[float, float]] = field(default_factory=dict)
   joint_position_range: tuple[float, float] = (-0.1, 0.1)
