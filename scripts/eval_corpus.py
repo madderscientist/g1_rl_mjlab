@@ -81,6 +81,16 @@ def main(
   survived = torch.zeros(n, dtype=torch.long, device=device)
   err_sum = torch.zeros(n, device=device)
   err_cnt = torch.zeros(n, device=device)
+  # 概率终止下失败不等于回合结束，所以能量「摔了之后爬不爬得回来」——
+  # 这正是硬终止口径根本测不到的东西。直接取包装前的原判据，不受抛硬币影响。
+  raw_terms = [
+    (t.params.get("base_func", t.func), {k: v for k, v in t.params.items() if k not in ("base_func", "p_term")})
+    for name, t in cfg.terminations.items()
+    if name != "time_out"
+  ]
+  ever_failed = torch.zeros(n, dtype=torch.bool, device=device)
+  recovered = torch.zeros(n, dtype=torch.bool, device=device)
+  fail_steps = torch.zeros(n, dtype=torch.long, device=device)
 
   total_frames = cmd.motion.num_frames[assign]
   steps = min(int(max_seconds * 50), int(total_frames.max().item()))
@@ -88,6 +98,15 @@ def main(
   with torch.inference_mode():
     for _ in range(steps):
       actions = policy(obs)
+
+      failing = torch.zeros(n, dtype=torch.bool, device=device)
+      for func, params in raw_terms:
+        failing |= func(env, **params)
+      failing &= alive
+      recovered |= ever_failed & ~failing & alive
+      ever_failed |= failing
+      fail_steps += failing.long()
+
       obs, _, dones, _ = wrapped.step(actions)
 
       err = torch.norm(cmd.body_pos_relative_w - cmd.robot_body_pos_w, dim=-1).mean(-1)
@@ -121,6 +140,13 @@ def main(
   # 存活分布极偏（均值/中位差过 3 倍），只报均值会把「几条跑满拉高全场」看成普遍变好。
   secs = survived.float() / 50
   print(f"中位存活 {secs.median().item():.1f} s   存活>5s {(secs > 5).float().mean().item() * 100:.1f}%")
+  # 恢复率对应论文的 recovery success rate；失败态占比用来验明存活时长不是靠苟延凑出来的。
+  if ever_failed.any():
+    print(
+      f"曾失败 {ever_failed.float().mean().item() * 100:.0f}%   "
+      f"其中恢复率 {recovered[ever_failed].float().mean().item() * 100:.0f}%   "
+      f"失败态占存活 {fail_steps.sum().item() / max(survived.sum().item(), 1) * 100:.0f}%"
+    )
 
 
 if __name__ == "__main__":

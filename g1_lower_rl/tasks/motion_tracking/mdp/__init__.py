@@ -23,5 +23,5 @@ from g1_lower_rl.tasks.motion_tracking.mdp.observations import (
   motion_reference_window as motion_reference_window,
 )
 from g1_lower_rl.tasks.motion_tracking.mdp.terminations import (
-  with_grace as with_grace,
+  with_probabilistic_termination as with_probabilistic_termination,
 )

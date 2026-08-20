@@ -22,6 +22,7 @@ from mjlab.managers.command_manager import CommandTermCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.termination_manager import TerminationTermCfg as EnvTerminationTermCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.tracking.tracking_env_cfg import VELOCITY_RANGE, make_tracking_env_cfg
@@ -171,7 +172,25 @@ INIT_HEIGHT_RANGE: tuple[float, float] = (-0.01, 0.06)
 #   半幅    无宽限 eplen 47.5 reward +0.454 | +宽限15 eplen 52.8 reward +0.180
 # eplen 只换来 +10%，reward 却掉 50~60%——在优势信号本来就弱的时候，这等于把熵项
 # 推上主导位（见 eval-gotchas 第 24 条）。
-TERMINATION_GRACE_STEPS: int = 0
+# 跟踪失败后每步的终止概率（Stubborn 式软终止，arXiv:2606.12814 §3.1）。
+#
+# 硬终止下策略永远见不到「已经摔了」之后的状态——失败即复位，倒地过程被剪掉，
+# 那片状态空间对策略是未知的，恢复行为无从学起。改成概率终止后失败态会持续进入
+# rollout，跟踪奖励自然把机器人往参考姿态拉，恢复行为作为副产品涌现，
+# 不需要恢复专用奖励，也不需要独立的起身策略。
+#
+# 取值由物理恢复时间反推：存活步数服从 Geo(p)，令 1/p = f_ctrl * t_rec，
+# 50 Hz、t_rec=4 s 得 p=0.005，期望恢复窗口 200 步。论文消融里强扰动下的
+# 恢复成功率 77.5%/85.0%(硬终止) -> 100%(软终止)。本仓实测跨类别存活 46.9 -> 78.1 s。
+FALL_RECOVERY_SECONDS: float = 4.0
+PROB_TERMINATION: float = 1.0 / (50.0 * FALL_RECOVERY_SECONDS)
+
+# 训练回合上限。上游默认 10 s（500 步），开了概率终止后不够用：
+# 失败后平均还要跑 200 步，实测 37.2% 的回合撞上 500 步上限被截断。
+# 而截断引入的价值估计偏差正是概率终止想避开的东西（几何分布的无记忆性
+# 才能保证 TD 一致）。p=0.005 下要让 99% 的失败回合在上限前概率终止，
+# 需约 ln(0.01)/ln(0.995) ≈ 920 步，所以取 20 s（1000 步），与论文 T_max 一致。
+EPISODE_LENGTH_S: float = 20.0
 
 
 def _self_collision_sensor() -> ContactSensorCfg:
@@ -275,19 +294,21 @@ def motion_tracking_env_cfg(
   cfg.scene.entities = {"robot": get_robot_cfg()}
   cfg.scene.sensors = (_self_collision_sensor(),)
 
-  # 给两个"跟丢"判据加复位宽限期。倒地判据 anchor_ori 不包——真摔了就该立刻结束。
-  # 包装时把原 func 和原 params 原样透传，阈值不动。
-  if TERMINATION_GRACE_STEPS > 0:
-    for name in ("ee_body_pos", "anchor_pos"):
-      term = cfg.terminations[name]
-      cfg.terminations[name] = EnvTerminationTermCfg(
-        func=mdp.with_grace,
-        params={
-          "base_func": term.func,
-          "grace_steps": TERMINATION_GRACE_STEPS,
-          **term.params,
-        },
-      )
+  # 三个失败判据全部改成概率终止，倒地判据也包——摔了之后那段状态正是要学的。
+  # 三者共享同一次伯努利采样，否则实际终止率会翻三倍、窗口缩到 1.3 s。
+  #
+  # 训练和回放都开：若评测走硬终止，误差一超阈就判死，恢复行为根本没机会发生——
+  # 量到的只是「多不容易失败」而不是「失败后能不能爬起来」，两者正是 Stubborn 要统一的两个能力。
+  for name in ("ee_body_pos", "anchor_pos", "anchor_ori"):
+    term = cfg.terminations[name]
+    cfg.terminations[name] = EnvTerminationTermCfg(
+      func=mdp.with_probabilistic_termination,
+      params={
+        "base_func": term.func,
+        "p_term": PROB_TERMINATION,
+        **term.params,
+      },
+    )
 
   # 动作：29 个 G1 关节；两个夹爪关节由真机上独立的控制器管，不进动作空间。
   # 手臂用带重力补偿的动作项，对应真机上把补偿力矩折算成位置偏移的做法。
@@ -375,6 +396,19 @@ def motion_tracking_env_cfg(
     },
   )
   cfg.terminations["ee_body_pos"].params["body_names"] = END_EFFECTORS
+
+  # 末端单独立一项，否则抬脚学不会。``motion_body_pos`` 把 14 个 body 的误差取平均，
+  # 拖着一只脚走（差 0.107 m）摊下来只剩 0.00082，奖励从 1.000 掉到 0.991——
+  # 0.9% 的信号连噪声都不如，策略当然不抬。硬终止时不抬脚会直接摔死，是终止条件在
+  # 替奖励施加压力；改成概率终止后那个压力没了，奖励里一直存在的稀释缺陷就暴露了
+  # （实测抬脚比从 c8 的 0.95x 塔到 0.51x）。
+  #
+  # 只看双踝 + std 收到 0.15，区分度从 0.9% 提到 22%（拖脚 0.775 vs 抬脚 0.998）。
+  cfg.rewards["motion_feet_pos"] = RewardTermCfg(
+    func=cfg.rewards["motion_body_pos"].func,
+    params={"command_name": "motion", "std": 0.15, "body_names": END_EFFECTORS},
+    weight=0.5,
+  )
   cfg.viewer.body_name = "torso_link"
 
   # 上游默认 njmax=250 / nconmax=35 是按站立/行走估的；语料里 fallAndGetUp、爬行、
@@ -388,6 +422,10 @@ def motion_tracking_env_cfg(
   # nconmax 是**逐世界**上限（总分配 = nconmax × nworld），按峰值留 2.8 倍余量。
   cfg.sim.njmax = 800
   cfg.sim.nconmax = 256
+
+  # 回合上限要给概率终止留出空间：失败后平均还要跑 200 步，500 步上限下实测
+  # 37.2% 的回合撞上限；延到 1000 步后失败回合的截断率降到 5.8%。
+  cfg.episode_length_s = EPISODE_LENGTH_S
 
   if play:
     cfg.episode_length_s = int(1e9)

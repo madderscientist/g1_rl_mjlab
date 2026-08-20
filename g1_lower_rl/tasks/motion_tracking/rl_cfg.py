@@ -54,7 +54,12 @@ def motion_tracking_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       value_loss_coef=1.0,
       use_clipped_value_loss=True,
       clip_param=0.2,
-      entropy_coef=0.005,
+      # 开概率终止后必须调小：倒地样本把跟踪奖励每步摊薄 58%，优势信号变弱，
+      # 而熵项是固定系数，相对权重从 c8 的 5.6 倍策略梯度涨到 10.5 倍，
+      # σ 随之单调发散（200 iter 涨 0.035，0.263->0.357 无收敛迹象）。
+      # 按比例回压到 c8 那个稳定档位。探索够不够不靠 σ——恢复行为的探索来自
+      # 失败态本身进了 rollout。
+      entropy_coef=0.0025,
       num_learning_epochs=5,
       num_mini_batches=4,
       learning_rate=1.0e-3,
