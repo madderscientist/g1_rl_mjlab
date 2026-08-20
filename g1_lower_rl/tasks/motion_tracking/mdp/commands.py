@@ -120,6 +120,7 @@ class GeneralMotionCommand(CommandTerm):
     self.bin_failed = torch.full(
       (self.bins.num_bins,), cfg.adaptive_failure_cap, device=self.device
     )
+    self.bin_speed_weight = self._speed_balance_weights()
 
     # Stage II：前 ceil(ξ*N) 个环境跑 acquisition（challenging 自适应采样），
     # 其余跑 consolidation（mastered 均匀采样）。**固定分配**而不是每回合重抽，
@@ -415,6 +416,56 @@ class GeneralMotionCommand(CommandTerm):
     decay = (1.0 - self.cfg.adaptive_alpha) ** visits
     self.bin_failed.mul_(decay).add_((1.0 - decay) * fails / visits.clamp(min=1.0))
 
+  def _speed_balance_weights(self) -> torch.Tensor:
+    """按**整条动作**的速度档做逆频率加权，纠正语料里高动态动作的稀缺。
+
+    语料速度分布极端偏斜：按 clip 的 p90 速度归档，跑步及以上（>2 m/s）只占 4.4%
+    的采样 bin，而这正好对上评测里 walk 109 s、run 11 s 的落差——策略不是学不会跑，
+    是几乎没见过。
+
+    档位必须按整条 clip 定、clip 内所有 bin 继承，不能按单个 bin 的均速定。
+    走过的弯路：先按 bin 均速分档，实测把 sprint 压到 0.70x、walk 0.76x，只有
+    run 拿到 1.06x —— 因为每条 clip 都含大量低速过渡帧（sprint 也有 61% 的帧
+    <0.5 m/s，那是助跑准备和冲刺后减速），压低速档等于把所有动作的过渡段一起压了。
+    原意是「多练跑步这类**动作**」，不是「多练跑步的**瞬间**」，高速帧脱离低速上下文
+    反而有害。改成按 clip 归档后：sprint 3.90x、run 2.69x，而 walk/dance/jumps
+    保持在 0.93~0.96x 基本不受影响。
+
+    用 p90 而非均值刻画 clip：一条 sprint 的均速会被大段准备动作拉低，
+    p90 才抓得住「这条到底跑没跑起来」。
+
+    为什么不靠已有的失败率自适应：那套按 bin 估 P(失败)，而当前语料 24 h 切出
+    84302 个 bin 配 1536 环境（比例 55，设计点是 4.3），EMA 时间常数 50 次访问，
+    5000 iter 下每个 bin 平均只被访问约 15 次，估计量还没走出初值。日志里
+    sampling_entropy 恒为 1.0000 就是这么来的。
+
+    ``alpha=0`` 时权重恒为 1，行为与改动前完全一致，可无痛回退。
+    """
+    alpha = self.cfg.speed_balance_alpha
+    if alpha <= 0.0:
+      return torch.ones(self.bins.num_bins, device=self.device)
+
+    vel = self.motion.body_lin_vel_w[:, 0, :2].norm(dim=-1)
+    starts = self.motion.start_idx
+    ends = starts + self.motion.num_frames
+    p90 = torch.stack(
+      [torch.quantile(vel[s:e], 0.9) for s, e in zip(starts.tolist(), ends.tolist())]
+    )
+
+    edges = torch.tensor([0.5, 1.0, 1.5, 2.0, 3.0], device=self.device)
+    tier = torch.bucketize(p90, edges)[self.bins.motion_id]
+    cnt = torch.bincount(tier, minlength=len(edges) + 1).float()
+    freq = (cnt / cnt.sum()).clamp(min=1e-6)
+    w = freq.pow(-alpha)
+    w = w / (w * freq).sum()
+
+    share = (w * freq) * 100
+    print(
+      f"[GMT] 速度重加权 alpha={alpha}（按 clip p90 归档）：各档份额 "
+      + " / ".join(f"{s:.1f}%" for s in share.tolist())
+    )
+    return w[tier]
+
   def _sample_bins(self, num: int) -> torch.Tensor:
     """按「带上限的失败率 + 均匀分布」混合采样一批 bin。
 
@@ -431,6 +482,10 @@ class GeneralMotionCommand(CommandTerm):
     else:
       blend = self.cfg.adaptive_uniform_ratio
       probs = (1.0 - blend) * (fail / total) + blend * uniform
+
+    # 速度重加权独立于失败率：前者纠正语料的先天偏斜，后者追踪学习进度
+    probs = probs * self.bin_speed_weight
+    probs = probs / probs.sum()
 
     self.metrics["sampling_entropy"][:] = -(probs * (probs + 1e-12).log()).sum() / max(
       math.log(n_bins), 1e-6
@@ -677,6 +732,14 @@ class GeneralMotionCommandCfg(CommandTermCfg):
   会把采样预算全部吸走，而它们再练也不会变好。它同时是 ``bin_failed`` 的初值。
   """
   sampling_mode: Literal["adaptive", "uniform", "start"] = "adaptive"
+  speed_balance_alpha: float = 0.5
+  """按 clip 速度档做逆频率加权的强度。0 = 不加权（原行为），1 = 各档完全等份。
+
+  按 clip p90 归档后各档 bin 份额是 41.6/25.1/23.2/5.7/3.0/1.4%，跑步及以上占 4.4%。
+  取 0.5 把它抬到 13.5%（3 倍），bench 上 sprint 拿到 3.90x、run 2.69x，
+  而 walk/dance/jumps 保持 0.93~0.96x 基本不动。不取 1.0 是因为 >3 m/s 档只有
+  19 条 clip，等份会把它抬到 16.7%，几乎必然过拟合到那几条。
+  """
 
   strata_file: str | None = None
   """Stage II 的分层结果（``scripts/stratify_motions.py`` 的输出）。None = Stage I。"""
