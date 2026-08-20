@@ -268,6 +268,8 @@ def motion_tracking_env_cfg(
   # actor 组到此只剩下“当过 rg_* 的模板”这个用途：模型吃的是 rg_*，critic 吃 critic。
   # 留着它 ObservationManager 会每步白算一遍（项在 critic/rg_* 里都有），
   # 实测 512 env 下删掉提速 12.9%、观测总维度 3256 -> 2390。
+  #
+  # 导出部署契约时需要它，由 scripts/export_onnx.py 用 rg_* 各组的并集重建。
   del cfg.observations["actor"]
 
   cfg.scene.entities = {"robot": get_robot_cfg()}

@@ -10,6 +10,7 @@ ONNX 的 metadata，读的时候对不上就拒绝启动。
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -41,6 +42,33 @@ def _resolve_task_id(checkpoint: Path, task_id: str | None) -> str:
   return matches[0]
 
 
+def _restore_actor_group(cfg) -> None:
+  """训练时 ``actor`` 组被删掉（死代码，每步白算，删掉提速 12.9%），导出得补回来。
+
+  mjlab 的 ``get_base_metadata`` 和本仓的 ``deployment_metadata`` 都按
+  ``active_terms["actor"]`` 取观测规格来生成部署契约。没有它会 KeyError，
+  ONNX 照样导得出来但契约是空的，部署端不知道观测该怎么喂——是个静默的坑。
+
+  用 ``rg_*`` 各组的并集重建，而不是拿 critic 当模板：critic 含 command、body_pos
+  这些特权信息，写进部署契约会误导部署端去准备它拿不到的量。rg_* 的并集才是
+  策略真正消费的本体观测。
+  """
+  from mjlab.managers.observation_manager import ObservationGroupCfg
+
+  if "actor" in cfg.observations:
+    return
+  terms = {}
+  for group in ("rg_projected_gravity", "rg_base_ang_vel", "rg_joint_pos", "rg_joint_vel", "rg_actions"):
+    if group in cfg.observations:
+      for name, term in cfg.observations[group].terms.items():
+        terms[name] = copy.deepcopy(term)
+  if not terms:
+    raise KeyError("没有可用于重建 actor 组的 rg_* 观测组")
+  cfg.observations["actor"] = ObservationGroupCfg(
+    terms=terms, concatenate_terms=True, enable_corruption=False
+  )
+
+
 def main(
   checkpoint: str,
   output_dir: str | None = None,
@@ -59,9 +87,12 @@ def main(
   resolved_task_id = _resolve_task_id(checkpoint_path, task_id)
   print(f"[导出] 任务: {resolved_task_id}")
 
+
+
   cfg = load_env_cfg(resolved_task_id, play=True)
   agent_cfg = load_rl_cfg(resolved_task_id)
   cfg.scene.num_envs = 1
+  _restore_actor_group(cfg)
 
   env = ManagerBasedRlEnv(cfg=cfg, device=device)
   wrapped = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
