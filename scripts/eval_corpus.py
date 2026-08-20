@@ -3,6 +3,9 @@
 对语料里的每一条动作，从第 0 帧起放，统计：能跟住多久、跟到哪一步失败、跟踪误差多大。
 训练日志里的「平均回合长度」是所有动作混在一起的均值，看不出是「每条都跟一半」还是
 「几条跟满、几条一开始就废」——而这两种情况对能不能上机是完全不同的结论。
+
+``--tilt/--joint/--height-lo/--height-hi`` 给初始状态加扰动，用来测「非直立启动能不能
+站住」。默认全 0 即干净启动。
 """
 
 from __future__ import annotations
@@ -21,6 +24,10 @@ def main(
   envs_per_motion: int = 16,
   device: str = "cuda:0",
   max_seconds: float = 200.0,
+  tilt: float = 0.0,
+  joint: float = 0.0,
+  height_lo: float = 0.0,
+  height_hi: float = 0.0,
 ) -> None:
   from mjlab.envs import ManagerBasedRlEnv
   from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
@@ -30,6 +37,19 @@ def main(
   agent_cfg = load_rl_cfg("G1-Gloria-MotionTracking")
   if motion_dir is not None:
     cfg.commands["motion"].motion_dir = motion_dir
+
+  # play 会清空初始扰动，这里按需放回。默认全 0 = 干净启动，测跟踪上限；
+  # 带上扰动才是测「非直立启动能不能站住」。两者要一起看：只看前者会低估鲁棒性训练，
+  # 只看后者会掩盖跟踪能力的退化。
+  if tilt or joint or height_lo or height_hi:
+    mc = cfg.commands["motion"]
+    mc.pose_range = {
+      "roll": (-tilt, tilt),
+      "pitch": (-tilt, tilt),
+      "yaw": (-tilt, tilt),
+      "z": (height_lo, height_hi),
+    }
+    mc.joint_position_range = (-joint, joint)
 
   # 先建一个最小环境问出动作条数，再按条数定环境数。
   cfg.scene.num_envs = 1
@@ -90,10 +110,7 @@ def main(
     surv = survived[sl].float().mean().item()
     tot = float(total_frames[sl][0].item())
     err = (err_sum[sl] / err_cnt[sl].clamp(min=1)).mean().item()
-    print(
-      f"{name:<28}{tot:>7.0f}{surv:>8.0f}{surv / 50:>8.1f}"
-      f"{100 * surv / tot:>7.0f}%{err:>10.3f}"
-    )
+    print(f"{name:<28}{tot:>7.0f}{surv:>8.0f}{surv / 50:>8.1f}{100 * surv / tot:>7.0f}%{err:>10.3f}")
   print("-" * 70)
   print(
     f"{'合计':<28}{'':>7}{survived.float().mean().item():>8.0f}"
@@ -101,6 +118,9 @@ def main(
     f"{finished.float().mean().item() * 100:>7.0f}%"
     f"{(err_sum / err_cnt.clamp(min=1)).mean().item():>10.3f}"
   )
+  # 存活分布极偏（均值/中位差过 3 倍），只报均值会把「几条跑满拉高全场」看成普遍变好。
+  secs = survived.float() / 50
+  print(f"中位存活 {secs.median().item():.1f} s   存活>5s {(secs > 5).float().mean().item() * 100:.1f}%")
 
 
 if __name__ == "__main__":

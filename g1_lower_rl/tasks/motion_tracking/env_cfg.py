@@ -142,23 +142,36 @@ COMMAND_NOISE: float = 0.02
 # 所以范围就是训练分布在参考流形周围的“半径”。原来的 ±0.1 rad / ±1 cm 太窄，
 # 上机时只要初始姿态不是直立就落到分布外。
 #
-# 取值按 model_34600 实测的 20 步存活率定：关节 ±0.3 -> 90%、倾角 ±0.3 -> 84%，
-# 都是“难但可学”；倾角 ±0.6 只剩 34%，再大就浪费采样预算了。
-INIT_JOINT_RANGE: tuple[float, float] = (-0.3, 0.3)
-INIT_TILT_RANGE: tuple[float, float] = (-0.3, 0.3)
+# 幅度必须**分阶段加宽**，不能一步到位。曾经直接拉到 ±0.3 / +0.15 训了 1600 迭代：
+# 单步存活率看着还行（关节 ±0.3 -> 90%、倾角 ±0.3 -> 84%），但整条回合的 reward 从
+# +0.97 掉到 -0.4，优势信号弱到 surrogate 只有 -0.005，自适应 KL 把学习率压到 1e-5
+# （正常量级 5.8e-4），于是固定的 entropy_coef 反过来主导了目标——σ 从 0.265 单调
+# 涨到 0.344，策略越训越随机。确定性评测：干净启动 30.2 s -> 15.4 s，扰动启动
+# 16.3 s -> 8.4 s，两个场景一起退化。
+#
+# 所以这里是课程的**第一档**（约目标值的一半）。等 reward 回正、σ 回落到 0.27 附近
+# 再往上加，判据见 README。
+INIT_JOINT_RANGE: tuple[float, float] = (-0.15, 0.15)
+INIT_TILT_RANGE: tuple[float, float] = (-0.15, 0.15)
 
 # 高度必须**不对称**：向下会把脚压进地面造出虚假的穿透接触，向上才是有意义的
-# “下落 + 落地”任务。上界 0.15 m 是量出来的：+0.15 存活 98%，而 +0.30 直接超过
-# ``anchor_pos`` 的 0.25 m 阈值，复位当拍就终止，存活 0%——那是纯废样本。
-INIT_HEIGHT_RANGE: tuple[float, float] = (-0.02, 0.15)
+# “下落 + 落地”任务。目标上界 0.15 m（+0.15 存活 98%，+0.30 超过 ``anchor_pos``
+# 的 0.25 m 阈值直接废掉），当前同样先取一半。
+INIT_HEIGHT_RANGE: tuple[float, float] = (-0.01, 0.06)
 
-# 复位后屏蔽“跟丢”终止的步数。
+# 复位后屏蔽“跟丢”终止的步数。0 = 关闭。
 #
-# 实测：上面三项随机化造成的足部位置误差是**相加**的（关节 0.189 + 倾角 0.185 +
-# 高度 0.150），组合中位数 0.344 m，而 ``ee_body_pos`` 阈值只有 0.25 m——**84.6% 的
-# 回合在第一帧就被判死**。不宽限的话，“从偏离姿态追回参考”这件事就被定义成了失败。
-# 15 步 = 0.3 s，够 PD 把 0.3 rad 的关节偏差拉回。
-TERMINATION_GRACE_STEPS: int = 15
+# 当初开这个是为了救 ±0.3/+0.15 那档随机化——三项误差相加后组合中位 0.344 m 超过
+# ``ee_body_pos`` 的 0.25 m 阈值，84.6% 的回合复位当帧即死。收窄到半幅后这个前提
+# 没了：实测复位首帧误差中位 0.058、p90 0.086，离阈值还差 3 倍，根本不会秒死。
+#
+# 而它的副作用是实打实的：已经跟丢的回合被强行多跑 15 步，那 15 步跟踪奖励接近 0、
+# 惩罚项照算。同一策略同一语料的控制变量实测（512 env × 400 步）：
+#   窄±0.1  无宽限 eplen 53.2 reward +0.721 | +宽限15 eplen 58.8 reward +0.371
+#   半幅    无宽限 eplen 47.5 reward +0.454 | +宽限15 eplen 52.8 reward +0.180
+# eplen 只换来 +10%，reward 却掉 50~60%——在优势信号本来就弱的时候，这等于把熵项
+# 推上主导位（见 eval-gotchas 第 24 条）。
+TERMINATION_GRACE_STEPS: int = 0
 
 
 def _self_collision_sensor() -> ContactSensorCfg:
@@ -175,7 +188,6 @@ def _self_collision_sensor() -> ContactSensorCfg:
 
 def motion_tracking_env_cfg(
   motion_dir: str = DEFAULT_MOTION_DIR,
-  has_state_estimation: bool = False,
   arm_gravcomp_gain_range: tuple[float, float] = ARM_GRAVCOMP_GAIN_RANGE,
   payload_mass_range: tuple[float, float] = PAYLOAD_MASS_RANGE,
   motion_speed_range: tuple[float, float] = MOTION_SPEED_RANGE,
@@ -184,8 +196,9 @@ def motion_tracking_env_cfg(
 ) -> ManagerBasedRlEnvCfg:
   """构造全身动作跟踪配置（平地）。
 
-  ``has_state_estimation`` 默认关闭：真机上根节点的水平速度没有可靠来源，训练时喂进去
-  会造出一个部署时补不上的观测。
+  真机上根节点的水平速度没有可靠来源，所以策略侧观测里不能出现它。
+  这一约束现在由 ``rg_*`` 组的构成天然保证（只有重力投影/角速度/关节/动作/参考）；
+  critic 不受限，它拿得到特权信息。
   """
   cfg = make_tracking_env_cfg()
 
@@ -252,22 +265,27 @@ def motion_tracking_env_cfg(
     concatenate_terms=True,
     enable_corruption=True,
   )
+  # actor 组到此只剩下“当过 rg_* 的模板”这个用途：模型吃的是 rg_*，critic 吃 critic。
+  # 留着它 ObservationManager 会每步白算一遍（项在 critic/rg_* 里都有），
+  # 实测 512 env 下删掉提速 12.9%、观测总维度 3256 -> 2390。
+  del cfg.observations["actor"]
 
   cfg.scene.entities = {"robot": get_robot_cfg()}
   cfg.scene.sensors = (_self_collision_sensor(),)
 
   # 给两个"跟丢"判据加复位宽限期。倒地判据 anchor_ori 不包——真摔了就该立刻结束。
   # 包装时把原 func 和原 params 原样透传，阈值不动。
-  for name in ("ee_body_pos", "anchor_pos"):
-    term = cfg.terminations[name]
-    cfg.terminations[name] = EnvTerminationTermCfg(
-      func=mdp.with_grace,
-      params={
-        "base_func": term.func,
-        "grace_steps": TERMINATION_GRACE_STEPS,
-        **term.params,
-      },
-    )
+  if TERMINATION_GRACE_STEPS > 0:
+    for name in ("ee_body_pos", "anchor_pos"):
+      term = cfg.terminations[name]
+      cfg.terminations[name] = EnvTerminationTermCfg(
+        func=mdp.with_grace,
+        params={
+          "base_func": term.func,
+          "grace_steps": TERMINATION_GRACE_STEPS,
+          **term.params,
+        },
+      )
 
   # 动作：29 个 G1 关节；两个夹爪关节由真机上独立的控制器管，不进动作空间。
   # 手臂用带重力补偿的动作项，对应真机上把补偿力矩折算成位置偏移的做法。
@@ -369,20 +387,11 @@ def motion_tracking_env_cfg(
   cfg.sim.njmax = 800
   cfg.sim.nconmax = 256
 
-  if not has_state_estimation:
-    cfg.observations["actor"] = ObservationGroupCfg(
-      terms={
-        k: v
-        for k, v in actor.terms.items()
-        if k not in ("motion_anchor_pos_b", "base_lin_vel")
-      },
-      concatenate_terms=True,
-      enable_corruption=True,
-    )
-
   if play:
     cfg.episode_length_s = int(1e9)
-    cfg.observations["actor"].enable_corruption = False
+    # 必须遍历所有组：RGMT actor 吃的是 rg_* 组，只关 actor 组等于没关
+    for group in cfg.observations.values():
+      group.enable_corruption = False
     cfg.events.pop("push_robot", None)
     motion_cmd = cfg.commands["motion"]
     assert isinstance(motion_cmd, GeneralMotionCommandCfg)

@@ -17,6 +17,7 @@ from typing import Protocol
 
 import torch
 from rsl_rl.algorithms import PPO
+from rsl_rl.modules.distribution import GaussianDistribution
 from rsl_rl.storage.rollout_storage import RolloutStorage
 from torch import nn
 
@@ -178,6 +179,9 @@ class PaceStarPPO(PPO):
       "PACE/STAR 的分组依赖扁平下标反推环境，循环网络走的是按轨迹切分的生成器，不兼容"
     )
     assert self.rnd is None and self.symmetry is None, "PACE/STAR 未适配 RND / 镜像增广"
+    # BC 项直接拿分布参数的第 0 项当均值用（省一次前向），这只对高斯成立。
+    # Beta 分布的 params[0] 是 alpha，换了不会报错，只会静默把 BC 目标训歪。
+    assert isinstance(self.actor.distribution, GaussianDistribution), "PACE 的行为克隆项依赖高斯分布的 params[0] 就是均值"
 
     st = self.storage
     num_envs = st.num_envs
@@ -215,7 +219,9 @@ class PaceStarPPO(PPO):
       if self.pace_enabled and (~acq).any():
         with torch.no_grad():
           a_ref = self.reference_actor(batch.observations)
-        a_cur = self.actor(batch.observations)
+        # 复用上面那次前向的均值，别再前向一遍：高斯分布下 forward(obs) 返回的就是
+        # mlp_output，而 update(mlp_output) 里 mean = mlp_output，两者同值同图。
+        a_cur = dparams[0]
         con_loss = _masked_mean((a_cur - a_ref).pow(2).sum(-1), ~acq)
         loss = loss + self._lambda_con * con_loss
 
@@ -230,7 +236,7 @@ class PaceStarPPO(PPO):
       sums["value"] += value_loss.item()
       sums["surrogate"] += surrogate_loss.item()
       sums["entropy"] += entropy.mean().item()
-      sums["consolidation"] += float(con_loss)
+      sums["consolidation"] += con_loss.item()
       n_updates += 1
 
     st.clear()
