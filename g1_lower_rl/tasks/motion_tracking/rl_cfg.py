@@ -3,10 +3,10 @@
 from mjlab.rl import (
   RslRlModelCfg,
   RslRlOnPolicyRunnerCfg,
-  RslRlPpoAlgorithmCfg,
 )
 
 from g1_lower_rl.rl.rgmt_model import RgmtModelCfg
+from g1_lower_rl.rl.runner import ScheduledPpoAlgorithmCfg
 from g1_lower_rl.tasks.motion_tracking.env_cfg import RGMT_PROP_TERMS
 
 RGMT_OBS_GROUPS: dict[str, tuple[str, ...]] = {
@@ -50,7 +50,7 @@ def motion_tracking_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       obs_normalization=True,
     ),
     obs_groups=RGMT_OBS_GROUPS,
-    algorithm=RslRlPpoAlgorithmCfg(
+    algorithm=ScheduledPpoAlgorithmCfg(
       value_loss_coef=1.0,
       use_clipped_value_loss=True,
       clip_param=0.2,

@@ -38,6 +38,12 @@ class ScheduledPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
 
   entropy_stages: tuple[tuple[int, float, float], ...] = ()
 
+  # AMP（arXiv:2104.02180）。>0 才启用，此时算法类切到 AmpPPO。
+  amp_coef: float = 0.0
+  amp_lr: float = 1.0e-4
+  amp_grad_penalty: float = 10.0
+  amp_epochs: int = 1
+
 
 def action_joint_names(env) -> list[str]:
   """动作项实际驱动的关节，按动作向量的顺序。"""
@@ -119,6 +125,17 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
       alg["class_name"] = "g1_lower_rl.rl.pace_star:PaceStarPPO"
       alg["acquisition_fraction"] = motion.cfg.acquisition_fraction
 
+    # AMP（Stage II 的另一种形态，与 PACE 互斥）：amp_coef>0 才切算法类。
+    alg_cfg = train_cfg.setdefault("algorithm", {})
+    self._amp_coef = float(alg_cfg.get("amp_coef", 0.0) or 0.0)
+    self._amp_on = self._amp_coef > 0.0 and not self._stage2
+    if self._amp_on:
+      alg_cfg["class_name"] = "g1_lower_rl.rl.amp:AmpPPO"
+    else:
+      # 没启用就摘干净，否则这些键会被 splat 进不认识它们的 PPO。
+      for k in ("amp_coef", "amp_lr", "amp_grad_penalty", "amp_epochs"):
+        alg_cfg.pop(k, None)
+
     super().__init__(env, train_cfg, log_dir, device)
 
     if self._stage2:
@@ -126,6 +143,45 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
       self.alg.bin_weight_fn = _BinWeight(motion)
       self.alg.pace_requested = True
       self._wrap_step_for_bin_record()
+
+    if self._amp_on:
+      self._setup_amp(motion)
+
+  def _setup_amp(self, motion_cmd) -> None:
+    """挂上判别器，并把风格奖励注入 env.step 的返回值。"""
+    from g1_lower_rl.rl.amp import MotionExpertSampler, _local_features
+
+    robot = self.env.unwrapped.scene["robot"]
+    body_names = list(motion_cmd.cfg.body_names)
+    robot_bi = [robot.body_names.index(n) for n in body_names]
+    robot_ai = robot.body_names.index(motion_cmd.cfg.anchor_body_name)
+    motion_bi = list(range(len(body_names)))
+    motion_ai = motion_cmd.motion_anchor_body_index
+
+    sampler = MotionExpertSampler(motion_cmd.motion, motion_bi, motion_ai)
+    self.alg.attach_amp(sampler.feature_dim(), sampler, self.device)
+
+    def policy_features() -> torch.Tensor:
+      d = robot.data
+      return _local_features(
+        d.joint_pos,
+        d.body_link_pos_w[:, robot_bi],
+        d.body_link_pos_w[:, robot_ai],
+        d.body_link_quat_w[:, robot_ai],
+        d.body_link_lin_vel_w[:, robot_ai],
+      )
+
+    env = self.env
+    inner = env.step
+
+    def step(actions):
+      prev = policy_features()
+      obs, rewards, dones, extras = inner(actions)
+      cur = policy_features()
+      self.alg.record_amp_pair(prev, cur)
+      return obs, rewards + self.alg.style_reward(prev, cur).to(rewards.device), dones, extras
+
+    env.step = step
 
   def _wrap_step_for_bin_record(self) -> None:
     """每个环境步把起点 bin 记进环形缓冲，供 STAR 在更新时按 fragment 还原难度。"""
