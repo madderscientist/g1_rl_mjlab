@@ -24,7 +24,6 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -121,24 +120,7 @@ class GeneralMotionCommand(CommandTerm):
       (self.bins.num_bins,), cfg.adaptive_failure_cap, device=self.device
     )
     self.bin_speed_weight = self._speed_balance_weights()
-
-    # Stage II：前 ceil(ξ*N) 个环境跑 acquisition（challenging 自适应采样），
-    # 其余跑 consolidation（mastered 均匀采样）。**固定分配**而不是每回合重抽，
-    # 因为 PPO 那边要用扁平下标 ``i % num_envs`` 反推角色，映射必须稳定。
-    self.role_acquisition = torch.zeros(
-      self.num_envs, dtype=torch.bool, device=self.device
-    )
-    self.bin_pool_acq: torch.Tensor | None = None
-    self.bin_pool_con: torch.Tensor | None = None
     self._offsets_cache: torch.Tensor | None = None
-    if cfg.strata_file is not None:
-      self._load_strata(cfg.strata_file, cfg.acquisition_fraction)
-
-    # STAR 要用逐转移的 bin 难度。同一个 fragment 内 bin_ids 恒定（只在复位时重抽），
-    # 所以逐步记下来就能在更新时按 fragment 还原。
-    self.bin_history: torch.Tensor | None = None
-    self._bin_cursor = 0
-    self.last_bin_probs: torch.Tensor | None = None
 
     self._ghost_model = None
 
@@ -360,41 +342,6 @@ class GeneralMotionCommand(CommandTerm):
       self.joint_vel - self.robot_joint_vel, dim=-1
     )
 
-  def _load_strata(self, path: str, acquisition_fraction: float) -> None:
-    """把分层结果映射成 bin 级的两个采样池。"""
-    import json
-
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    n_acq = math.ceil(acquisition_fraction * self.num_envs)
-    self.role_acquisition[:n_acq] = True
-
-    starts = self.bins.phase_start
-    mids = self.bins.motion_id
-
-    def pool(clips: list[list[int]]) -> torch.Tensor:
-      mask = torch.zeros(self.bins.num_bins, dtype=torch.bool, device=self.device)
-      for mid, s, e in clips:
-        # 按 bin 的**起点**归属片段：采样时起始相位就是在 bin 内抽的，起点决定回合从哪开始。
-        mask |= (mids == mid) & (starts >= s) & (starts < e)
-      return mask.nonzero(as_tuple=False).squeeze(-1)
-
-    self.bin_pool_acq = pool(data["challenging"])
-    self.bin_pool_con = pool(data["mastered"])
-    print(
-      f"[GMT] Stage II 分层: challenging {len(self.bin_pool_acq)} bin / "
-      f"mastered {len(self.bin_pool_con)} bin，acquisition 环境 {n_acq}/{self.num_envs}"
-    )
-    if len(self.bin_pool_acq) == 0 or len(self.bin_pool_con) == 0:
-      raise ValueError("分层后某一类为空，检查 strata 文件与当前语料是否匹配")
-
-  def record_bins(self, step: int, num_steps: int) -> None:
-    """把当前步的起点 bin 写进环形缓冲，供 STAR 在更新时取用。"""
-    if self.bin_history is None or self.bin_history.shape[0] != num_steps:
-      self.bin_history = torch.full(
-        (num_steps, self.num_envs), -1, dtype=torch.long, device=self.device
-      )
-    self.bin_history[step] = self.bin_ids
-
   def _record_outcome(self, env_ids: torch.Tensor) -> None:
     """把这批回合的成败记到它们各自的**起点 bin** 上。
 
@@ -491,43 +438,7 @@ class GeneralMotionCommand(CommandTerm):
       math.log(n_bins), 1e-6
     )
     self.metrics["sampling_failure_rate"][:] = self.bin_failed.mean()
-    self.last_bin_probs = probs
     return torch.multinomial(probs, num, replacement=True)
-
-  def _sample_bins_by_role(self, env_ids: torch.Tensor) -> torch.Tensor:
-    """acquisition 环境在 challenging 池里自适应抽，consolidation 环境在 mastered 池里均匀抽。"""
-    assert self.bin_pool_acq is not None and self.bin_pool_con is not None
-    probs = self._role_probs()
-    acq = self.role_acquisition[env_ids]
-    out = torch.empty(len(env_ids), dtype=torch.long, device=self.device)
-    n_a = int(acq.sum())
-    if n_a:
-      out[acq] = self.bin_pool_acq[torch.multinomial(probs, n_a, replacement=True)]
-    n_c = len(env_ids) - n_a
-    if n_c:
-      idx = torch.randint(len(self.bin_pool_con), (n_c,), device=self.device)
-      out[~acq] = self.bin_pool_con[idx]
-    return out
-
-  def _role_probs(self) -> torch.Tensor:
-    assert self.bin_pool_acq is not None
-    fail = self.bin_failed[self.bin_pool_acq].clamp(max=self.cfg.adaptive_failure_cap)
-    total = fail.sum()
-    n = len(self.bin_pool_acq)
-    if total <= 0:
-      probs = torch.full((n,), 1.0 / n, device=self.device)
-    else:
-      b = self.cfg.adaptive_uniform_ratio
-      probs = (1.0 - b) * (fail / total) + b / n
-    self.metrics["sampling_entropy"][:] = -(probs * (probs + 1e-12).log()).sum() / max(
-      math.log(n), 1e-6
-    )
-    self.metrics["sampling_failure_rate"][:] = self.bin_failed[self.bin_pool_acq].mean()
-    # 映回全局 bin 空间，STAR 的难度权重要按全局下标查
-    full = torch.zeros(self.bins.num_bins, device=self.device)
-    full[self.bin_pool_acq] = probs
-    self.last_bin_probs = full
-    return probs
 
   def _resample_command(self, env_ids: torch.Tensor) -> None:
     self._record_outcome(env_ids)
@@ -543,11 +454,7 @@ class GeneralMotionCommand(CommandTerm):
       )
       self.phase[env_ids] = 0.0
     else:
-      bins = (
-        self._sample_bins_by_role(env_ids)
-        if self.bin_pool_acq is not None
-        else self._sample_bins(len(env_ids))
-      )
+      bins = self._sample_bins(len(env_ids))
       self.bin_ids[env_ids] = bins
       self.motion_ids[env_ids] = self.bins.motion_id[bins]
       # bin 内均匀取起点，免得策略把 1 秒网格上的固定起始状态背下来。
@@ -740,12 +647,6 @@ class GeneralMotionCommandCfg(CommandTermCfg):
   而 walk/dance/jumps 保持 0.93~0.96x 基本不动。不取 1.0 是因为 >3 m/s 档只有
   19 条 clip，等份会把它抬到 16.7%，几乎必然过拟合到那几条。
   """
-
-  strata_file: str | None = None
-  """Stage II 的分层结果（``scripts/stratify_motions.py`` 的输出）。None = Stage I。"""
-
-  acquisition_fraction: float = 0.8
-  """跑 challenging 的环境占比 ξ。高动态回合早终止、有效样本少，所以给到 0.8。"""
 
   speed_range: tuple[float, float] = (1.0, 1.0)
   """播放倍率的采样区间，每回合一个。<1 即放慢。
