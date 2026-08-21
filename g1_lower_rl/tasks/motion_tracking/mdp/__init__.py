@@ -22,6 +22,9 @@ from g1_lower_rl.tasks.motion_tracking.mdp.motion_corpus import MotionCorpus as 
 from g1_lower_rl.tasks.motion_tracking.mdp.observations import (
   motion_reference_window as motion_reference_window,
 )
+from g1_lower_rl.tasks.motion_tracking.mdp.rewards import (
+  motion_swing_lift_ratio as motion_swing_lift_ratio,
+)
 from g1_lower_rl.tasks.motion_tracking.mdp.terminations import (
   with_probabilistic_termination as with_probabilistic_termination,
 )
