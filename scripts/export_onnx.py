@@ -120,11 +120,18 @@ def main(
   )
   if resolved_task_id == "G1-Gloria-MotionTracking":
     motion_cmd = env.command_manager.get_term("motion")
+    # 窗口由 _window_offsets() 实算（含历史帧，非均匀），cfg.lookahead_steps 是遗留字段，对不上。
+    offsets = [int(x) for x in motion_cmd._window_offsets().tolist()]
+    feature_dim = 38
+    ref_dim = int(motion_cmd.reference_tokens.shape[-1])
+    assert ref_dim == len(offsets) * feature_dim, (
+      f"参考窗口契约与实际不符: {ref_dim} != {len(offsets)} x {feature_dim}"
+    )
     metadata.update(
       {
-        "lookahead_steps": list(motion_cmd.cfg.lookahead_steps),
-        "lookahead_feature_dim": 39,
-        "lookahead_layout": "height1,proj_gravity3,lin_vel_local3,ang_vel_local3,joint_pos29",
+        "lookahead_steps": offsets,
+        "lookahead_feature_dim": feature_dim,
+        "lookahead_layout": "lin_vel_local3,ang_vel_local3,proj_gravity3,joint_pos29",
         "anchor_body_name": motion_cmd.cfg.anchor_body_name,
         "tracked_body_names": list(motion_cmd.cfg.body_names),
         "all_body_names": list(robot.body_names),
