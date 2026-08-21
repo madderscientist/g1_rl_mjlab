@@ -30,8 +30,10 @@ def main(
   height_hi: float = 0.0,
 ) -> None:
   from mjlab.envs import ManagerBasedRlEnv
-  from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
+  from mjlab.rl import RslRlVecEnvWrapper
   from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
+
+  from g1_lower_rl.rl import load_trained_runner
 
   cfg = load_env_cfg("G1-Gloria-MotionTracking", play=True)
   agent_cfg = load_rl_cfg("G1-Gloria-MotionTracking")
@@ -62,10 +64,11 @@ def main(
   env = ManagerBasedRlEnv(cfg=cfg, device=device)
   wrapped = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-  from dataclasses import asdict
-
-  runner = MjlabOnPolicyRunner(wrapped, asdict(agent_cfg), log_dir=None, device=device)
-  runner.load(checkpoint)
+  # 走任务注册表拿 runner 类：本包的配置带训练专用字段（entropy_stages / amp_*），
+  # 基类 runner 会把它们直接 splat 进 PPO。
+  runner = load_trained_runner(
+    "G1-Gloria-MotionTracking", wrapped, agent_cfg, Path(checkpoint), device
+  )
   policy = runner.get_inference_policy(device=device)
 
   cmd = env.command_manager.get_term("motion")
