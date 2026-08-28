@@ -15,6 +15,8 @@ mjlab 的 ``MjlabOnPolicyRunner`` 只把 ``common_step_counter`` 存进 checkpoi
 
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -23,6 +25,7 @@ from mjlab.rl import MjlabOnPolicyRunner, RslRlPpoAlgorithmCfg, RslRlVecEnvWrapp
 from mjlab.rl.exporter_utils import attach_metadata_to_onnx
 from mjlab.tasks.registry import load_runner_cls
 from mjlab.tasks.velocity.rl.runner import VelocityOnPolicyRunner
+from torch import nn
 
 
 @dataclass
@@ -39,10 +42,14 @@ class ScheduledPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
   entropy_stages: tuple[tuple[int, float, float], ...] = ()
 
   # AMP（arXiv:2104.02180）。>0 才启用，此时算法类切到 AmpPPO。
+  # AMP（arXiv:2104.02180）。>0 才启用，此时算法类切到 AmpPPO。默认值对齐官方 nv-tlabs/ASE。
   amp_coef: float = 0.0
+  amp_task_w: float = 0.5
   amp_lr: float = 1.0e-4
-  amp_grad_penalty: float = 10.0
-  amp_epochs: int = 1
+  amp_grad_penalty: float = 5.0
+  amp_logit_reg: float = 0.05
+  amp_epochs: int = 2
+  amp_replay_size: int = 200_000
 
 
 def action_joint_names(env) -> list[str]:
@@ -95,6 +102,60 @@ def load_trained_runner(task_id: str, env, agent_cfg, checkpoint: Path, device: 
   return runner
 
 
+def _widen_reference_encoder(path: str, policy, map_location: str) -> str:
+  """把旧存档的 ``command_encoder`` 输入层零填充到新 token 维度，返回可加载的路径。
+
+  参考 token 加了「机器人坐标系下的 key body 位置」后维度从 38 涨到 53，旧权重直接
+  加载会形状不匹配。新增列**置零**，于是加载瞬间策略行为与旧版严格等价，再由训练
+  自己学会用这几维——否则只能从零重训，而那要吃掉整个时间预算。
+
+  扩容结果写临时文件，**不动原存档**。
+  """
+  first = getattr(policy, "command_encoder", None)
+  if first is None:
+    return path
+  layer = next((m for m in first.modules() if isinstance(m, nn.Linear)), None)
+  if layer is None:
+    return path
+
+  ckpt = torch.load(path, map_location=map_location, weights_only=False)
+  sd = ckpt.get("actor_state_dict")
+  if sd is None:
+    return path
+  key = next(
+    (k for k in sd if k.startswith("command_encoder") and k.endswith(".weight")), None
+  )
+  if key is None:
+    return path
+
+  old, new = sd[key].shape[1], layer.weight.shape[1]
+  if old == new:
+    return path
+  if old > new:
+    raise ValueError(f"存档 token 维度 {old} 大于当前 {new}，不支持收窄")
+
+  def _pad(t: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros(t.shape[0], new, dtype=t.dtype)
+    out[:, :old] = t
+    return out
+
+  shape = sd[key].shape
+  sd[key] = _pad(sd[key])
+
+  # Adam 的 exp_avg / exp_avg_sq 同样按旧维度存着，不一起扩容会在 optimizer.step()
+  # 撞形状；丢弃优化器状态则会重置动量，实测那会推高 σ（见 eval-gotchas 第 29 条）。
+  osd = ckpt.get("optimizer_state_dict") or {}
+  for st in (osd.get("state") or {}).values():
+    for k, v in st.items():
+      if torch.is_tensor(v) and v.dim() == 2 and tuple(v.shape) == tuple(shape):
+        st[k] = _pad(v)
+
+  tmp = Path(tempfile.gettempdir()) / f"widen_{Path(path).stem}_{os.getpid()}.pt"
+  torch.save(ckpt, tmp)
+  print(f"[INFO]: 参考 token {old} -> {new} 维，command_encoder 零填充扩容（初始行为不变）")
+  return str(tmp)
+
+
 class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
   """保存课程状态
 
@@ -116,16 +177,25 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
     self._entropy_stages = tuple(tuple(stage) for stage in stages)
     self._entropy_stage = -1
 
-    # Stage II 走 AMP：amp_coef>0 才切算法类。
+    # AMP：amp_coef>0 才切算法类。
     cmd = getattr(env.unwrapped, "command_manager", None)
     motion = cmd.get_term("motion") if cmd is not None else None
     alg_cfg = train_cfg.setdefault("algorithm", {})
+
     self._amp_on = float(alg_cfg.get("amp_coef", 0.0) or 0.0) > 0.0
     if self._amp_on:
       alg_cfg["class_name"] = "g1_lower_rl.rl.amp:AmpPPO"
     else:
       # 没启用就摘干净，否则这些键会被 splat 进不认识它们的 PPO。
-      for k in ("amp_coef", "amp_lr", "amp_grad_penalty", "amp_epochs"):
+      for k in (
+        "amp_coef",
+        "amp_task_w",
+        "amp_lr",
+        "amp_grad_penalty",
+        "amp_logit_reg",
+        "amp_epochs",
+        "amp_replay_size",
+      ):
         alg_cfg.pop(k, None)
 
     super().__init__(env, train_cfg, log_dir, device)
@@ -151,10 +221,12 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
       d = robot.data
       return _local_features(
         d.joint_pos,
+        d.joint_vel,
         d.body_link_pos_w[:, robot_bi],
         d.body_link_pos_w[:, robot_ai],
         d.body_link_quat_w[:, robot_ai],
         d.body_link_lin_vel_w[:, robot_ai],
+        d.body_link_ang_vel_w[:, robot_ai],
       )
 
     env = self.env
@@ -165,7 +237,9 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
       obs, rewards, dones, extras = inner(actions)
       cur = policy_features()
       self.alg.record_amp_pair(prev, cur)
-      return obs, rewards + self.alg.style_reward(prev, cur).to(rewards.device), dones, extras
+      # 官方 _combine_rewards 是加权和，不是直接相加：任务奖励要同步降权。
+      style = self.alg.style_reward(prev, cur).to(rewards.device)
+      return obs, self.alg.amp_task_w * rewards + style, dones, extras
 
     env.step = step
 
@@ -262,6 +336,7 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
     strict: bool = True,
     map_location: str | None = None,
   ) -> dict:
+    path = _widen_reference_encoder(path, self.alg.actor, map_location or self.device)
     infos = super().load(path, load_cfg, strict, map_location)
     saved = (infos or {}).get("curriculum_state") or {}
     restored, missing = [], []

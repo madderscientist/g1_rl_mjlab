@@ -84,6 +84,11 @@ class GeneralMotionCommand(CommandTerm):
       dtype=torch.long,
       device=self.device,
     )
+    self.reference_key_indexes = torch.tensor(
+      [cfg.body_names.index(n) for n in cfg.reference_key_bodies],
+      dtype=torch.long,
+      device=self.device,
+    )
 
     self.motion = MotionCorpus(cfg.motion_dir, self.body_indexes, device=self.device)
     self.bins = self.motion.make_bins(cfg.bin_frames)
@@ -226,10 +231,18 @@ class GeneralMotionCommand(CommandTerm):
 
   @property
   def reference_tokens(self) -> torch.Tensor:
-    """RGMT 的参考窗口观测，(num_envs, (2L+1) * 38)，模型内部再 reshape 回 token。
+    """RGMT 的参考窗口观测，(num_envs, (2L+1) * token_dim)，模型内部再 reshape 回 token。
 
-    每个 token 是 Extreme-RGMT 式 (2)：``[v_ref, ω_ref, g_ref, q_ref]``。
+    基础 token 是 Extreme-RGMT 式 (2)：``[v_ref, ω_ref, g_ref, q_ref]``（38 维）。
     前三项都转到该帧参考根节点的自身坐标系，因此对世界偏航与平移不变。
+
+    **但只有这 38 维时 actor 是开环的**：整个 token 对世界平移不变，策略无法知道自己
+    离参考漂了多远，位置误差没有任何输入通道，漂移必然随时间无界累积；手臂也只有关节角
+    目标，没有笛卡尔目标可供补偿重力/惯性负载下的稳态误差。
+
+    ``reference_key_bodies`` 补上这条通路：给出参考 key body 位置，且表达在**机器人当前**
+    anchor 的 yaw 局部系下（GMT 论文 §3.4 特别强调要对齐到机器人而非参考的朝向——
+    前者才带误差信息）。当前帧的 anchor 分量就是漂移量本身，未来帧则是「手该往哪去」。
     """
     idx = self._window_indexes()
     root_quat = self.motion.body_quat_w[idx, 0]  # (N, T, 4)
@@ -243,7 +256,32 @@ class GeneralMotionCommand(CommandTerm):
     ang_vel = quat_rotate_inverse(root_quat, self.motion.body_ang_vel_w[idx, 0]) * scale
     joint_pos = self.motion.joint_pos[idx][:, :, self.policy_joint_indexes]
 
-    return torch.cat([lin_vel, ang_vel, proj_gravity, joint_pos], dim=-1).flatten(1)
+    tokens = torch.cat([lin_vel, ang_vel, proj_gravity, joint_pos], dim=-1)
+    if len(self.reference_key_indexes) == 0:
+      return tokens.flatten(1)
+
+    n, t = tokens.shape[0], tokens.shape[1]
+    k = len(self.reference_key_indexes)
+    ref_pos_w = (
+      self.motion.body_pos_w[idx][:, :, self.reference_key_indexes]
+      + self._env.scene.env_origins[:, None, None, :]
+    )
+    rel = ref_pos_w - self.robot_anchor_pos_w[:, None, None, :]
+    inv = quat_inv(yaw_quat(self.robot_anchor_quat_w))
+    inv = inv[:, None, None, :].expand(n, t, k, 4).reshape(-1, 4)
+    local = quat_apply(inv, rel.reshape(-1, 3)).view(n, t, k * 3)
+
+    if not self.cfg.reference_key_body_vel:
+      return torch.cat([tokens, local], dim=-1).flatten(1)
+
+    # 位置只告诉策略「现在该到哪」，靠它差分出速度要跨 token 看；直接给速度才能
+    # 提前起动。实测手部误差随参考手速从 0.056 升到 0.118 m，是相位滞后而非稳态偏差。
+    ref_vel_w = (
+      self.motion.body_lin_vel_w[idx][:, :, self.reference_key_indexes]
+      * self.speed[:, None, None, None]
+    )
+    vel_local = quat_apply(inv, ref_vel_w.reshape(-1, 3)).view(n, t, k * 3)
+    return torch.cat([tokens, local, vel_local], dim=-1).flatten(1)
 
   @property
   def joint_pos(self) -> torch.Tensor:
@@ -608,7 +646,6 @@ class GeneralMotionCommandCfg(CommandTermCfg):
   """RGMT 局部参考窗口的单边半径 L，产出 2L+1 个 token。"""
   reference_stride: float = 1.5
   """窗口跨度系数：最远 token 落在 ``L*stride`` 帧外。1 = 稠密均匀，覆盖 ±L/50 秒。
-
   论文用 21 token 稠密窗口（±0.2 s），比本仓原来的稀疏前瞻（最远 1.9 s）短得多——
   RGMT 的设计是让 cross-attention 在局部窗口里按当前状态挑相关帧，靠的不是看得远。
 
@@ -618,6 +655,14 @@ class GeneralMotionCommandCfg(CommandTermCfg):
   走过的弯路记在这：先按「起跳蓄力中位提前 0.500 s」把它设成 3（±0.6 s），
   结果训练 eplen 124→167 但评测 41.6→38.9；改成近密远疏后评测回到 42.1，
   仍未超基线。蓄力提前量的统计没错，错在假定策略能用上那么远的信息。"""
+  reference_key_bodies: tuple[str, ...] = ()
+  """参考 token 里额外给出笛卡尔位置的刚体，表达在**机器人当前** anchor 的 yaw 局部系下。
+
+  空元组 = 关闭（token 维度退回 38，兼容旧 checkpoint）。"""
+  reference_key_body_vel: bool = False
+  """再追加这些刚体的线速度（同一局部系），每个 body 由 3 维变 6 维。
+
+  追加在末尾，所以旧 checkpoint 靠零填充扩容即可续训，初始行为不变。"""
   pose_range: dict[str, tuple[float, float]] = field(default_factory=dict)
   velocity_range: dict[str, tuple[float, float]] = field(default_factory=dict)
   joint_position_range: tuple[float, float] = (-0.1, 0.1)

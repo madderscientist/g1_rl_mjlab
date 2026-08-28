@@ -23,6 +23,12 @@ from g1_lower_rl.tasks.motion_tracking.mdp.observations import (
   motion_reference_window as motion_reference_window,
 )
 from g1_lower_rl.tasks.motion_tracking.mdp.rewards import (
+  motion_anchor_lin_vel_error_exp as motion_anchor_lin_vel_error_exp,
+)
+from g1_lower_rl.tasks.motion_tracking.mdp.rewards import (
+  motion_ee_pos_torso_relative_exp as motion_ee_pos_torso_relative_exp,
+)
+from g1_lower_rl.tasks.motion_tracking.mdp.rewards import (
   motion_swing_lift_ratio as motion_swing_lift_ratio,
 )
 from g1_lower_rl.tasks.motion_tracking.mdp.terminations import (

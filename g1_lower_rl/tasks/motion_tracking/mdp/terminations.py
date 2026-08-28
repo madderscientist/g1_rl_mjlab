@@ -51,4 +51,5 @@ def with_probabilistic_termination(
 
   出处：Stubborn (arXiv:2606.12814) 3.1 节，式 (2)(3)。
   """
-  return base_func(env, **params) & _shared_termination_coin(env, p_term)
+  failed = base_func(env, **params)
+  return failed & _shared_termination_coin(env, p_term)

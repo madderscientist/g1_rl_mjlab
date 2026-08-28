@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import copy
+import os
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
@@ -94,6 +95,40 @@ END_EFFECTORS: tuple[str, ...] = (
   "left_ankle_roll_link",
   "right_ankle_roll_link",
 )
+
+# 参考 token 里额外给笛卡尔位置的刚体，坐标系是**机器人当前** anchor 的 yaw 局部系。
+# anchor 自身在内：它的当前帧分量就是「我离虚影多远」，是治漂移的误差反馈通道。
+# 手腱在内：手臂原本只有关节角目标，没有笛卡尔目标可补偿重力/惯性下的稳态误差。
+REFERENCE_KEY_BODIES: tuple[str, ...] = (
+  "torso_link",
+  "left_wrist_yaw_link",
+  "right_wrist_yaw_link",
+  "left_ankle_roll_link",
+  "right_ankle_roll_link",
+)
+
+
+# 手部单独立项的末端。与双脚同理：14 个 body 取平均再套 σ=0.3 的核，手腱误差会被
+# 腿部稀释，而手在动捕里运动幅度最大、误差天然更大。ASAP/OmniH2O/DeepMimic 三家
+# 都给上肢更严的 σ（分别严 2× / 50× / 2.2×）。
+HANDS: tuple[str, ...] = (
+  "left_wrist_yaw_link",
+  "right_wrist_yaw_link",
+)
+
+
+def resolve_reference_key_bodies() -> tuple[str, ...]:
+  """env_cfg / rl_cfg / export_onnx **必须**共用这一个来源。
+
+  三处各自拼一遍曾经导致维度对不上，现在只留一个真值。
+  """
+  return REFERENCE_KEY_BODIES
+
+
+def resolve_key_body_vel() -> bool:
+  """关键 body 线速度是否追加进参考 token。与上面同理，三处必须一致。"""
+  return True
+
 
 # 真机手臂带重力补偿：补偿器算出力矩后按 kp 折算成位置偏移叠加到目标上。这里同样建模，
 # 系数**按臂共享**（同一条臂共用一套模型参数和一个负载估计器，误差是相关的）。
@@ -239,6 +274,8 @@ def motion_tracking_env_cfg(
       motion_dir=motion_dir,
       anchor_body_name="torso_link",
       body_names=TRACKED_BODIES,
+      reference_key_bodies=resolve_reference_key_bodies(),
+      reference_key_body_vel=resolve_key_body_vel(),
       policy_joint_names=WHOLE_BODY_JOINTS,
       speed_range=motion_speed_range,
     )
@@ -263,33 +300,42 @@ def motion_tracking_env_cfg(
   # mjlab 对每个项先展开历史再拼接，合并后的向量布局是 ``[项1全部历史 | 项2全部历史 | ...]``，
   # 直接 reshape 成 (H, d) 会把时间轴和特征轴拧反。每项一组后，组维度 / H 就是每拍维度，
   # 布局自描述，模型不需要额外配置就能还原 token 序列。
-  for name in RGMT_PROP_TERMS + ("actions",):
-    if name in actor.terms:
-      term = copy.deepcopy(actor.terms[name])
-    else:
-      term = ObservationTermCfg(func=getattr(mdp, name))
-    term.history_length = RGMT_HISTORY
-    term.flatten_history_dim = True
-    cfg.observations[f"rg_{name}"] = ObservationGroupCfg(
-      terms={name: term}, concatenate_terms=True, enable_corruption=True
-    )
-  cfg.observations["rg_reference"] = ObservationGroupCfg(
-    terms={
-      "reference_window": ObservationTermCfg(
-        func=mdp.motion_reference_window,
-        params={"command_name": "motion"},
-        noise=Unoise(n_min=-COMMAND_NOISE, n_max=COMMAND_NOISE),
-      )
-    },
-    concatenate_terms=True,
-    enable_corruption=True,
-  )
-  # actor 组到此只剩下“当过 rg_* 的模板”这个用途：模型吃的是 rg_*，critic 吃 critic。
-  # 留着它 ObservationManager 会每步白算一遍（项在 critic/rg_* 里都有），
-  # 实测 512 env 下删掉提速 12.9%、观测总维度 3256 -> 2390。
   #
-  # 导出部署契约时需要它，由 scripts/export_onnx.py 用 rg_* 各组的并集重建。
-  del cfg.observations["actor"]
+  # ``GRU_ACTOR=1`` 走另一条路：保留单一 ``actor`` 组、不建 rg_*。GRU 靠隐状态自己记
+  # 时序，再给 10 帧显式历史就不是干净的架构对比了。
+  #
+  # 只在这里分支、不提前 return：传感器、概率终止、奖励整形都在后面，early-return
+  # 会把它们全跳过（self_collision 传感器没注册但奖励项还在，第一次算 reward 直接崩）。
+  if os.environ.get("GRU_ACTOR", "0") == "1":
+    cfg.observations["actor"].enable_corruption = True
+  else:
+    for name in RGMT_PROP_TERMS + ("actions",):
+      if name in actor.terms:
+        term = copy.deepcopy(actor.terms[name])
+      else:
+        term = ObservationTermCfg(func=getattr(mdp, name))
+      term.history_length = RGMT_HISTORY
+      term.flatten_history_dim = True
+      cfg.observations[f"rg_{name}"] = ObservationGroupCfg(
+        terms={name: term}, concatenate_terms=True, enable_corruption=True
+      )
+    cfg.observations["rg_reference"] = ObservationGroupCfg(
+      terms={
+        "reference_window": ObservationTermCfg(
+          func=mdp.motion_reference_window,
+          params={"command_name": "motion"},
+          noise=Unoise(n_min=-COMMAND_NOISE, n_max=COMMAND_NOISE),
+        )
+      },
+      concatenate_terms=True,
+      enable_corruption=True,
+    )
+    # actor 组到此只剩下“当过 rg_* 的模板”这个用途：模型吃的是 rg_*，critic 吃 critic。
+    # 留着它 ObservationManager 会每步白算一遍（项在 critic/rg_* 里都有），
+    # 实测 512 env 下删掉提速 12.9%、观测总维度 3256 -> 2390。
+    #
+    # 导出部署契约时需要它，由 scripts/export_onnx.py 用 rg_* 各组的并集重建。
+    del cfg.observations["actor"]
 
   cfg.scene.entities = {"robot": get_robot_cfg()}
   cfg.scene.sensors = (_self_collision_sensor(),)
@@ -306,9 +352,19 @@ def motion_tracking_env_cfg(
       params={
         "base_func": term.func,
         "p_term": PROB_TERMINATION,
-        **term.params,
+        **dict(term.params),
       },
     )
+
+  # 上游 anchor_pos 判据是 `bad_anchor_pos_z_only`：**只看高度，漂 5 米也不终止**。
+  # 于是「漂着但站得好好的」永远不被判负，反因存活久被 advantage 强化——漂移的正反馈。
+  # 换上全 3D 版本，阈值 2.0 m：分离实验表明漂移的 −93% 里 **−76% 来自奖励**，
+  # 只有最后 17 个点来自紧终止，而那 17 个点要用 9 s 存活 + 手部与全身精度去换。
+  from mjlab.tasks.tracking.mdp import terminations as _tracking_terms
+
+  p = cfg.terminations["anchor_pos"].params
+  p["base_func"] = _tracking_terms.bad_anchor_pos
+  p["threshold"] = 2.0
 
   # 动作：29 个 G1 关节；两个夹爪关节由真机上独立的控制器管，不进动作空间。
   # 手臂用带重力补偿的动作项，对应真机上把补偿力矩折算成位置偏移的做法。
@@ -415,9 +471,53 @@ def motion_tracking_env_cfg(
   # 换成比值后同一偏差的信号强 87 倍（区分度 0.9% -> 78.7%）。
   cfg.rewards["motion_swing_lift"] = RewardTermCfg(
     func=mdp.motion_swing_lift_ratio,
-    params={"command_name": "motion", "body_names": END_EFFECTORS, "std": 0.3},
+    params={
+      "command_name": "motion",
+      "body_names": END_EFFECTORS,
+      "std": 0.3,
+    },
     weight=1.5,
   )
+
+  # 手部单独立项，σ 比整体 body_pos 紧一倍。完全照搬 `motion_feet_pos` 的做法——
+  # 那一项当初就是为了解决「末端误差被 14 个 body 平均稀释」，手部是同一个病。
+  # σ=0.07：实测手部误差 0.0668 时，σ=0.15 得 0.82、σ=0.10 得 0.64，收紧能提区分度且不饱和。
+  cfg.rewards["motion_hand_pos"] = RewardTermCfg(
+    func=cfg.rewards["motion_body_pos"].func,
+    params={
+      "command_name": "motion",
+      "std": 0.07,
+      "body_names": HANDS,
+    },
+    weight=1.0,
+  )
+
+  # 手相对躯干的**位形**跟踪，专供精细操作：上一项比的是重锚定后的世界位置，
+  # 里面混着全身平移与朝向；这一项只问「手相对身体在哪」。两者互补。
+  cfg.rewards["motion_hand_torso_rel"] = RewardTermCfg(
+    func=mdp.motion_ee_pos_torso_relative_exp,
+    params={
+      "command_name": "motion",
+      "body_names": HANDS,
+      "std": 0.07,
+      "still_std": 0.03,
+      "still_speed": 0.5,
+    },
+    weight=0.75,
+  )
+
+  # 以下两项治「越漂越远」：250 s 漂移从 5.71 m 压到 0.41 m（−93%），其中 −76% 来自这两
+  # 项奖励本身，不靠收紧终止阈值。
+  cfg.rewards["motion_anchor_lin_vel"] = RewardTermCfg(
+    func=mdp.motion_anchor_lin_vel_error_exp,
+    params={"command_name": "motion", "std": 0.4},
+    weight=0.4,
+  )
+  coarse = copy.deepcopy(cfg.rewards["motion_global_root_pos"])
+  coarse.params = {**coarse.params, "std": 1.2}
+  coarse.weight = 0.3
+  cfg.rewards["motion_global_root_pos_coarse"] = coarse
+
   cfg.viewer.body_name = "torso_link"
 
   # 上游默认 njmax=250 / nconmax=35 是按站立/行走估的；语料里 fallAndGetUp、爬行、
