@@ -52,6 +52,26 @@ python scripts/disturb_video.py <run>/model_8800.pt out.mp4 20
 
 动作跟踪任务另有一组脚本，见 [`tasks/motion_tracking/README.md`](g1_lower_rl/tasks/motion_tracking/README.md)。
 
+**全身动作跟踪当前水平**（80 条 LAFAN1，250 s 无删失）：平均存活 **165.6 s**，
+30/80 条跟满全程；全局漂移 40-250 s 段 **0.29 m**、手部误差 **0.047 m**、
+抬脚达参考的 **99.7%**。有效配方见该目录 README。
+
+走过的弯路与全部已排除方向按时间顺序记在 [`EXPERIMENTS.md`](EXPERIMENTS.md)。
+
+### 动作跟踪的训练命令
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python scripts/train.py G1-Gloria-MotionTracking \
+    --gpu-ids '[0]' --env.scene.num-envs 768 --mirror-schedule '()'
+```
+
+> `--mirror-schedule '()'` 必须带：镜像增广是按 15 自由度下肢写的，29 自由度会**静默
+> 镜错手臂**。
+
+奖励与终止的配方已全部固化进 `env_cfg.py`，不再需要环境变量。唯一的开关是
+`GRU_ACTOR=1`——把 actor 换成 GRU 走单一观测组，用于和默认的 RGMT 架构做对照。
+
 ## 训练数据（motions/，不入库）
 
 `motions/` 整个目录在 `.gitignore` 里，需要自己下载重建。
