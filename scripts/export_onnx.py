@@ -122,16 +122,28 @@ def main(
     motion_cmd = env.command_manager.get_term("motion")
     # 窗口由 _window_offsets() 实算（含历史帧，非均匀），cfg.lookahead_steps 是遗留字段，对不上。
     offsets = [int(x) for x in motion_cmd._window_offsets().tolist()]
-    feature_dim = 38
     ref_dim = int(motion_cmd.reference_tokens.shape[-1])
-    assert ref_dim == len(offsets) * feature_dim, (
-      f"参考窗口契约与实际不符: {ref_dim} != {len(offsets)} x {feature_dim}"
+    feature_dim, rem = divmod(ref_dim, len(offsets))
+    assert rem == 0, f"参考窗口契约与实际不符: {ref_dim} 不能被 {len(offsets)} 整除"
+    key_bodies = list(motion_cmd.cfg.reference_key_bodies)
+    layout = "lin_vel_local3,ang_vel_local3,proj_gravity3,joint_pos29"
+    if key_bodies:
+      # 这几维是**机器人当前 anchor 的 yaw 局部系**下的参考 key body 位置，
+      # 部署端必须用机器人自身位姿去算，用参考位姿算等于把误差信号抹掉。
+      layout += f",key_body_pos_in_robot_anchor_yaw{len(key_bodies) * 3}"
+      if motion_cmd.cfg.reference_key_body_vel:
+        layout += f",key_body_vel_in_robot_anchor_yaw{len(key_bodies) * 3}"
+    expect = 38 + len(key_bodies) * (6 if motion_cmd.cfg.reference_key_body_vel else 3)
+    assert feature_dim == expect, (
+      f"契约 layout 与实际维度不符: layout 描述 {expect}，实际 {feature_dim}。"
+      "部署端会按 layout 排布输入，对不上就是静默错位。"
     )
     metadata.update(
       {
         "lookahead_steps": offsets,
         "lookahead_feature_dim": feature_dim,
-        "lookahead_layout": "lin_vel_local3,ang_vel_local3,proj_gravity3,joint_pos29",
+        "lookahead_layout": layout,
+        "reference_key_bodies": key_bodies,
         "anchor_body_name": motion_cmd.cfg.anchor_body_name,
         "tracked_body_names": list(motion_cmd.cfg.body_names),
         "all_body_names": list(robot.body_names),
