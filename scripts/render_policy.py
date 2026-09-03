@@ -3,7 +3,8 @@
 与 ``render_motion.py`` 的区别：那个只做参考轨迹的运动学回放，这个跑完整物理 + 策略，
 看的是「机器人到底跟不跟得住」。片段之间会打上动作名和存活时长。
 
-    python scripts/render_policy.py --checkpoint logs/.../model_59200.pt \
+    python scripts/render_policy.py \
+        --checkpoint artifacts/final_model_215787/model_215787.pt \
         --motions walk1_subject1,jumps1_subject1 --output logs/render/policy.mp4
 """
 
@@ -14,13 +15,13 @@ from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
-import imageio.v2 as imageio  # noqa: E402
-import numpy as np  # noqa: E402
-import torch  # noqa: E402
-import tyro  # noqa: E402
-from PIL import Image, ImageDraw, ImageFont  # noqa: E402
+import imageio.v2 as imageio
+import numpy as np
+import torch
+import tyro
+from PIL import Image, ImageDraw, ImageFont
 
-import g1_lower_rl.tasks  # noqa: F401,E402  注册任务
+import g1_lower_rl.tasks  # noqa: F401  注册任务
 
 TASK = "G1-Gloria-MotionTracking"
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"

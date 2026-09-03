@@ -14,17 +14,18 @@
 
 | 类别 | 平均存活 | 2026-08-21 起点 | 倍数 |
 |---|---|---|---|
-| walk (24) | **231.6 s** | 49.4 | 4.7× |
-| run (8) | **217.2 s** | 20.3 | **10.7×** |
-| dance (16) | **187.0 s** | 46.5 | 4.0× |
-| sprint (4) | **164.6 s** | 14.6 | **11.3×** |
-| fight (6) | **162.4 s** | 27.0 | 6.0× |
-| jumps (6) | **125.1 s** | 15.9 | 7.9× |
-| fightAndSports (4) | 67.8 s | 21.9 | 3.1× |
-| fallAndGetUp (12) | 25.1 s | 14.1 | 1.8× |
-| **合计 (80)** | **165.6 s** | 33.3 | **5.0×** |
+| walk (24) | **232.0 s** | 49.4 | 4.7× |
+| run (8) | **204.7 s** | 20.3 | **10.1×** |
+| dance (16) | **183.7 s** | 46.5 | 4.0× |
+| sprint (4) | **134.5 s** | 14.6 | **9.2×** |
+| fight (6) | **166.7 s** | 27.0 | 6.2× |
+| jumps (6) | **123.8 s** | 15.9 | 7.8× |
+| fightAndSports (4) | 83.6 s | 21.9 | 3.8× |
+| fallAndGetUp (12) | 28.4 s | 14.1 | 2.0× |
+| **合计 (80)** | **163.7 s** | 33.3 | **4.9×** |
 
-更早的 GRU 架构基线同口径只有 48.5 s。跟满 250 s 的有 30/80 条。
+类别均值显示到 0.1 s；合计直接由原始存活帧计算，因此与表内舍入值反算可能相差 0.1 s。
+更早的 GRU 架构基线同口径只有 48.5 s。环境级跟满率 36%，中位存活 214.1 s，恢复率 91%。
 
 按 (motion_id, 帧号) 配对的行为指标（相对 2026-08-21 起点，427 万配对帧）：
 
@@ -37,7 +38,7 @@
 
 ## 有效配方（按贡献排序，每一项都有配对实验数据）
 
-### 1. 参考 token 补 key body 位置，表达在**机器人当前** anchor 的 yaw 局部系下
+### 1. 参考 token 补 key body 位置与速度
 
 **这是结构性修复，不是调参，单独一项就把漂移砍半。**
 
@@ -46,7 +47,8 @@
 并扣分，actor 却拿不到可纠正的信号——**这在结构上就是开环，漂移必然无界累积**。
 手臂同理：只有 $q_{ref}$，没有笛卡尔目标。
 
-修法是给 5 个 key body（torso / 双腕 / 双踝）补上位置，token 38 → **53** 维。
+修法是给 5 个 key body（torso / 双腕 / 双踝）补上位置和线速度，token
+38 → 53 → **68** 维。位置闭合漂移反馈，速度帮助策略提前起动。
 坐标系必须用**机器人自己的** anchor 朝向（GMT §3.4 特别强调这一点）——用参考的朝向
 会把误差信号精确抹掉，等于没改。
 
@@ -118,7 +120,7 @@ ASAP / OmniH2O / DeepMimic 三家都给上肢更严的 σ（分别严 2× / 50×
 
 ### 7. 足量迭代
 
-累计约 114000 迭代（77800 → 191789）。至少六次「以为收敛了」其实没有。
+累计训练至 `model_215787`。至少六次「以为收敛了」其实没有。
 
 > 已排除的方向（AMP、PACE/STAR、swing 加压、key body 加双肘、`action_rate` 上下肢分离、
 > 各种 σ 微调）及其配对实验数据，按时间顺序记在仓库根目录的
@@ -141,7 +143,7 @@ ASAP / OmniH2O / DeepMimic 三家都给上肢更严的 σ（分别严 2× / 50×
 **若在 20000 处停手，会得出「改动有害」的完全相反结论。**
 → 结构性改动的消融终点必须设在两条曲线都走平之后，不能按预算截断。
 
-> 证据边界：消融只跑到 40000，而交付模型是 191789，**只覆盖 21%**。所以能说的是
+> 证据边界：消融只跑到 40000，而交付模型是 215787，**只覆盖 19%**。所以能说的是
 > 「相同迭代数下新配置更好且差距扩大」，**不能说「最终水平更高」**——那需要把旧配置
 > 也训到同等迭代数。且 n=1，单种子。
 
@@ -350,10 +352,11 @@ python scripts/train.py G1-Gloria-MotionTracking --env.scene.num-envs 4096 \
     --mirror-schedule '()'
 
 # 逐条动作定量评测：能跟多久、跟到哪一步失败、误差多大
-python scripts/eval_corpus.py --checkpoint <run>/model_59200.pt --envs-per-motion 8
+python scripts/eval_corpus.py \
+   --checkpoint artifacts/final_model_215787/model_215787.pt --envs-per-motion 8
 
 # 渲染策略跟踪效果（实体 = 策略，半透明 ghost = 参考动作）
-python scripts/render_policy.py --checkpoint <run>/model_59200.pt \
+python scripts/render_policy.py --checkpoint artifacts/final_model_215787/model_215787.pt \
     --motions walk1_subject1,jumps1_subject1 --output logs/render/policy.mp4
 
 # 网页实时预览，同样带 ghost 对照
@@ -363,7 +366,8 @@ python scripts/play.py G1-Gloria-MotionTracking --viewer viser
 python scripts/render_motion.py --motion motions/lafan1/walk1_subject1.npz
 
 # 导出部署用 ONNX + 可读契约
-python scripts/export_onnx.py --checkpoint <run>/model_59200.pt --output-dir export
+python scripts/export_onnx.py \
+   --checkpoint artifacts/final_model_215787/model_215787.pt --output-dir export
 
 # 给部署包瘦身用的动作裁剪
 python scripts/slim_motion.py

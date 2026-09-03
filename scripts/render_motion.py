@@ -7,7 +7,11 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+# 必须在 import mujoco 之前设置无头渲染后端。
+os.environ.setdefault("MUJOCO_GL", "egl")
 
 import imageio.v2 as imageio
 import mujoco
@@ -17,7 +21,7 @@ import tyro
 
 def main(
   motion: str,
-  output: str = 'motion.mp4',
+  output: str = "motion.mp4",
   width: int = 960,
   height: int = 720,
   camera_distance: float = 3.0,
@@ -27,10 +31,14 @@ def main(
   from g1_lower_rl.assets.g1_gloria import get_spec
 
   data_npz = np.load(Path(motion))
-  joint_pos = data_npz['joint_pos']
-  root_pos = data_npz['body_pos_w'][:, 0]
-  root_quat = data_npz['body_quat_w'][:, 0]  # wxyz，与 MuJoCo qpos 一致
-  fps = float(data_npz['fps'][0]) if 'fps' in data_npz.files else 50.0
+  joint_pos = data_npz["joint_pos"]
+  if "root_pos" in data_npz.files:
+    root_pos = data_npz["root_pos"]
+    root_quat = data_npz["root_quat"]
+  else:
+    root_pos = data_npz["body_pos_w"][:, 0]
+    root_quat = data_npz["body_quat_w"][:, 0]  # wxyz，与 MuJoCo qpos 一致
+  fps = float(data_npz["fps"][0]) if "fps" in data_npz.files else 50.0
   n_frames, n_joints = joint_pos.shape
 
   spec = get_spec()
@@ -40,7 +48,7 @@ def main(
   model = spec.compile()
   data = mujoco.MjData(model)
   if model.nq != 7 + n_joints:
-    raise ValueError(f'模型 nq={model.nq} 与动作的 7+{n_joints} 对不上')
+    raise ValueError(f"模型 nq={model.nq} 与动作的 7+{n_joints} 对不上")
 
   renderer = mujoco.Renderer(model, height=height, width=width)
   camera = mujoco.MjvCamera()
@@ -61,10 +69,10 @@ def main(
     writer.append_data(renderer.render())
   writer.close()
 
-  print(f'[渲染] {out.resolve()}')
-  print(f'  {n_frames} 帧 @ {fps:.0f} fps = {n_frames / fps:.1f} 秒')
-  print(f'  盆骨高度 {root_pos[:, 2].min():.3f} ~ {root_pos[:, 2].max():.3f} m')
+  print(f"[渲染] {out.resolve()}")
+  print(f"  {n_frames} 帧 @ {fps:.0f} fps = {n_frames / fps:.1f} 秒")
+  print(f"  盆骨高度 {root_pos[:, 2].min():.3f} ~ {root_pos[:, 2].max():.3f} m")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
   tyro.cli(main)

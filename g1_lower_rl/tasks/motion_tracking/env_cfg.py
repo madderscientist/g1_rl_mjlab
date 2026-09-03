@@ -106,6 +106,8 @@ REFERENCE_KEY_BODIES: tuple[str, ...] = (
   "left_ankle_roll_link",
   "right_ankle_roll_link",
 )
+REFERENCE_KEY_BODY_POS = True
+REFERENCE_KEY_BODY_VEL = True
 
 
 # 手部单独立项的末端。与双脚同理：14 个 body 取平均再套 σ=0.3 的核，手腱误差会被
@@ -123,11 +125,6 @@ def resolve_reference_key_bodies() -> tuple[str, ...]:
   三处各自拼一遍曾经导致维度对不上，现在只留一个真值。
   """
   return REFERENCE_KEY_BODIES
-
-
-def resolve_key_body_vel() -> bool:
-  """关键 body 线速度是否追加进参考 token。与上面同理，三处必须一致。"""
-  return True
 
 
 # 真机手臂带重力补偿：补偿器算出力矩后按 kp 折算成位置偏移叠加到目标上。这里同样建模，
@@ -275,7 +272,8 @@ def motion_tracking_env_cfg(
       anchor_body_name="torso_link",
       body_names=TRACKED_BODIES,
       reference_key_bodies=resolve_reference_key_bodies(),
-      reference_key_body_vel=resolve_key_body_vel(),
+      reference_key_body_pos=REFERENCE_KEY_BODY_POS,
+      reference_key_body_vel=REFERENCE_KEY_BODY_VEL,
       policy_joint_names=WHOLE_BODY_JOINTS,
       speed_range=motion_speed_range,
     )

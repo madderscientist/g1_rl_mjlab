@@ -10,8 +10,9 @@ from mjlab.rl import (
 from g1_lower_rl.rl.rgmt_model import RgmtModelCfg
 from g1_lower_rl.rl.runner import ScheduledPpoAlgorithmCfg
 from g1_lower_rl.tasks.motion_tracking.env_cfg import (
+  REFERENCE_KEY_BODY_POS,
+  REFERENCE_KEY_BODY_VEL,
   RGMT_PROP_TERMS,
-  resolve_key_body_vel,
   resolve_reference_key_bodies,
 )
 
@@ -25,7 +26,7 @@ GRU_OBS_GROUPS: dict[str, tuple[str, ...]] = {"actor": ("actor",), "critic": ("c
 
 def _reference_dim() -> int:
   """token 维度必须与 ``reference_tokens`` 实际产出一致，否则模型 reshape 会算错 token 数。"""
-  per_body = 6 if resolve_key_body_vel() else 3
+  per_body = 3 * REFERENCE_KEY_BODY_POS + 3 * REFERENCE_KEY_BODY_VEL
   return 38 + len(resolve_reference_key_bodies()) * per_body
 
 

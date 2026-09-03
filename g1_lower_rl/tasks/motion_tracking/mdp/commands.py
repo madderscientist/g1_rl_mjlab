@@ -64,10 +64,10 @@ RESET_ROOT_ANG_VEL_LIMIT = 20.0
 
 
 class GeneralMotionCommand(CommandTerm):
-  cfg: "GeneralMotionCommandCfg"
-  _env: "ManagerBasedRlEnv"
+  cfg: GeneralMotionCommandCfg
+  _env: ManagerBasedRlEnv
 
-  def __init__(self, cfg: "GeneralMotionCommandCfg", env: "ManagerBasedRlEnv"):
+  def __init__(self, cfg: GeneralMotionCommandCfg, env: ManagerBasedRlEnv):
     super().__init__(cfg, env)
 
     self.robot: Entity = env.scene[cfg.entity_name]
@@ -240,9 +240,8 @@ class GeneralMotionCommand(CommandTerm):
     离参考漂了多远，位置误差没有任何输入通道，漂移必然随时间无界累积；手臂也只有关节角
     目标，没有笛卡尔目标可供补偿重力/惯性负载下的稳态误差。
 
-    ``reference_key_bodies`` 补上这条通路：给出参考 key body 位置，且表达在**机器人当前**
-    anchor 的 yaw 局部系下（GMT 论文 §3.4 特别强调要对齐到机器人而非参考的朝向——
-    前者才带误差信息）。当前帧的 anchor 分量就是漂移量本身，未来帧则是「手该往哪去」。
+    key body 的位置和速度都表达在机器人当前 anchor 的 yaw 局部系下；位置依赖里程计，
+    速度只依赖 yaw 姿态。
     """
     idx = self._window_indexes()
     root_quat = self.motion.body_quat_w[idx, 0]  # (N, T, 4)
@@ -257,31 +256,31 @@ class GeneralMotionCommand(CommandTerm):
     joint_pos = self.motion.joint_pos[idx][:, :, self.policy_joint_indexes]
 
     tokens = torch.cat([lin_vel, ang_vel, proj_gravity, joint_pos], dim=-1)
-    if len(self.reference_key_indexes) == 0:
+    k = len(self.reference_key_indexes)
+    if k == 0:
       return tokens.flatten(1)
 
     n, t = tokens.shape[0], tokens.shape[1]
-    k = len(self.reference_key_indexes)
-    ref_pos_w = (
-      self.motion.body_pos_w[idx][:, :, self.reference_key_indexes]
-      + self._env.scene.env_origins[:, None, None, :]
-    )
-    rel = ref_pos_w - self.robot_anchor_pos_w[:, None, None, :]
     inv = quat_inv(yaw_quat(self.robot_anchor_quat_w))
     inv = inv[:, None, None, :].expand(n, t, k, 4).reshape(-1, 4)
-    local = quat_apply(inv, rel.reshape(-1, 3)).view(n, t, k * 3)
+    parts = [tokens]
 
-    if not self.cfg.reference_key_body_vel:
-      return torch.cat([tokens, local], dim=-1).flatten(1)
+    if self.cfg.reference_key_body_pos:
+      ref_pos_w = (
+        self.motion.body_pos_w[idx][:, :, self.reference_key_indexes]
+        + self._env.scene.env_origins[:, None, None, :]
+      )
+      rel = ref_pos_w - self.robot_anchor_pos_w[:, None, None, :]
+      parts.append(quat_apply(inv, rel.reshape(-1, 3)).view(n, t, k * 3))
 
-    # 位置只告诉策略「现在该到哪」，靠它差分出速度要跨 token 看；直接给速度才能
-    # 提前起动。实测手部误差随参考手速从 0.056 升到 0.118 m，是相位滞后而非稳态偏差。
-    ref_vel_w = (
-      self.motion.body_lin_vel_w[idx][:, :, self.reference_key_indexes]
-      * self.speed[:, None, None, None]
-    )
-    vel_local = quat_apply(inv, ref_vel_w.reshape(-1, 3)).view(n, t, k * 3)
-    return torch.cat([tokens, local, vel_local], dim=-1).flatten(1)
+    if self.cfg.reference_key_body_vel:
+      ref_vel_w = (
+        self.motion.body_lin_vel_w[idx][:, :, self.reference_key_indexes]
+        * self.speed[:, None, None, None]
+      )
+      parts.append(quat_apply(inv, ref_vel_w.reshape(-1, 3)).view(n, t, k * 3))
+
+    return torch.cat(parts, dim=-1).flatten(1)
 
   @property
   def joint_pos(self) -> torch.Tensor:
@@ -659,10 +658,10 @@ class GeneralMotionCommandCfg(CommandTermCfg):
   """参考 token 里额外给出笛卡尔位置的刚体，表达在**机器人当前** anchor 的 yaw 局部系下。
 
   空元组 = 关闭（token 维度退回 38，兼容旧 checkpoint）。"""
+  reference_key_body_pos: bool = False
+  """是否加入 key body 位置（每个 body 3 维）；该通道依赖里程计。"""
   reference_key_body_vel: bool = False
-  """再追加这些刚体的线速度（同一局部系），每个 body 由 3 维变 6 维。
-
-  追加在末尾，所以旧 checkpoint 靠零填充扩容即可续训，初始行为不变。"""
+  """是否加入 key body 线速度（每个 body 3 维）；该通道只依赖 yaw 姿态。"""
   pose_range: dict[str, tuple[float, float]] = field(default_factory=dict)
   velocity_range: dict[str, tuple[float, float]] = field(default_factory=dict)
   joint_position_range: tuple[float, float] = (-0.1, 0.1)
@@ -701,5 +700,5 @@ class GeneralMotionCommandCfg(CommandTermCfg):
   这里改成每回合随机，让同一段动作能以不同速度反复练到，而不用把语料扩容好几倍。
   """
 
-  def build(self, env: "ManagerBasedRlEnv") -> GeneralMotionCommand:
+  def build(self, env: ManagerBasedRlEnv) -> GeneralMotionCommand:
     return GeneralMotionCommand(self, env)
