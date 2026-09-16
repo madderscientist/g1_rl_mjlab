@@ -22,6 +22,7 @@ from mjlab.utils.os import dump_yaml, get_checkpoint_path
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
 
+from g1_lower_rl.tasks import FOOTSTEP_TASK
 from g1_lower_rl.tasks.lower_body.cfg.constants import MIRROR_STAGES
 
 
@@ -49,10 +50,25 @@ class TrainConfig:
 
   @staticmethod
   def from_task(task_id: str) -> "TrainConfig":
-    return TrainConfig(env=load_env_cfg(task_id), agent=load_rl_cfg(task_id))
+    """从注册任务构建训练参数，脚步布局不使用旧速度任务的镜像增强"""
+    return TrainConfig(
+      env=load_env_cfg(task_id),
+      agent=load_rl_cfg(task_id),
+      mirror_schedule=() if task_id == FOOTSTEP_TASK else MIRROR_STAGES,
+    )
 
 
 def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
+  """按任务配置启动物理环境与 PPO，脚步任务先统一执行器、奖励和模型相位"""
+  if task_id == FOOTSTEP_TASK:
+    if cfg.mirror_schedule:
+      raise ValueError("Footstep observations require mirror_schedule=(); the velocity-task mirror layout is incompatible")
+    # CLI 可覆盖生成器相位，必须同步到奖励窗口和模型导出元数据
+    phase_cfg = cfg.env.commands["footsteps"].manager.phase
+    cfg.agent.actor.phase_cfg = phase_cfg
+    for term in cfg.env.rewards.values():
+      if "phase_cfg" in term.params:
+        term.params["phase_cfg"] = phase_cfg
   # 多卡训练挂起时唯一能拿到栈的手段：ptrace_scope=1 下 py-spy/gdb 都够不到 worker
   # （它们是兄弟进程不是祖先），只能让进程自己转储。`kill -USR1 <worker pid>`。
   faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
