@@ -13,3 +13,4 @@ export/
 .vscode/
 motions/
 .ruff_cache/
+tests/
