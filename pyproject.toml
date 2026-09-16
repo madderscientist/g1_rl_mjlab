@@ -21,6 +21,7 @@ include = ["g1_lower_rl*"]
 
 [tool.setuptools.package-data]
 "g1_lower_rl.assets" = ["**/*.xml", "**/*.stl", "**/*.STL", "**/*.urdf"]
+"g1_lower_rl.footsteps" = ["web/*"]
 
 [tool.ruff]
 line-length = 128

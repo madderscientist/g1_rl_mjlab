@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>G1 / Footstep Lab</title>
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <header class="app-header">
+    <div class="identity"><span class="brand-mark">G1</span><div><h1>Footstep Lab</h1><span class="subtitle">脚步输入预览</span></div></div>
+    <div class="header-status"><span class="simulation-tag"><span></span>纯规划 · 无物理仿真</span><span id="connection">连接中</span></div>
+    <button id="export" class="icon-button" title="导出规划记录 JSON" aria-label="导出规划记录 JSON"><span class="symbol" aria-hidden="true">⇩</span></button>
+  </header>
+  <div id="error" class="error" role="alert" hidden></div>
+  <main>
+    <section class="workspace" aria-label="脚印预览">
+      <div class="workspace-toolbar">
+        <div class="transport">
+          <button id="play" class="icon-button primary" title="播放" aria-label="播放"><span class="symbol" aria-hidden="true">▶</span></button>
+          <button id="step" class="icon-button" title="单步 20ms" aria-label="单步 20ms"><span class="symbol" aria-hidden="true">▸|</span></button>
+          <button id="reset" class="icon-button" title="重置预览" aria-label="重置预览"><span class="symbol" aria-hidden="true">↺</span></button>
+          <span class="divider"></span>
+          <select id="speed" aria-label="播放速度"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select>
+          <span id="clock" class="mono">00:00.00</span>
+        </div>
+        <span id="mode" class="mode" data-mode="walking">行走</span>
+      </div>
+      <div class="map-wrap">
+        <canvas id="map" aria-label="世界坐标系左右脚印与四步预览"></canvas>
+        <div class="map-heading"><span class="eyebrow">FOOTPRINTS / WORLD</span><h2>脚印平面图</h2></div>
+        <div class="map-tools">
+          <button id="zoom-in" class="icon-button" title="放大" aria-label="放大"><span class="symbol" aria-hidden="true">+</span></button>
+          <button id="zoom-out" class="icon-button" title="缩小" aria-label="缩小"><span class="symbol" aria-hidden="true">−</span></button>
+          <button id="fit" class="icon-button" title="显示完整轨迹" aria-label="显示完整轨迹"><span class="symbol" aria-hidden="true">↔</span></button>
+          <button id="follow" class="icon-button active" title="跟随四步窗口" aria-label="跟随四步窗口" aria-pressed="true"><span class="symbol" aria-hidden="true">◎</span></button>
+        </div>
+        <div class="map-legend"><span><b class="dot left"></b>L 左脚</span><span><b class="dot right"></b>R 右脚</span><span class="preview-key">四步预览</span></div>
+        <div id="selection" class="selection mono" hidden></div>
+        <div class="map-bottom"><span id="distance" class="mono">0 次计划落地</span><span id="scale" class="mono">0.5 m</span></div>
+      </div>
+      <div class="metrics">
+        <div><span>当前 f</span><strong><b id="frequency">1.667</b><small> Hz</small></strong></div>
+        <div><span>总步频 2f</span><strong><b id="cadence">3.333</b><small> 步/s</small></strong></div>
+        <div><span>全局相位</span><strong><b id="phase">288.0</b><small> °</small></strong></div>
+        <div class="contact-metric"><span>计划接触</span><div><b id="contact-left" class="contact left">L</b><b id="contact-right" class="contact right">R</b></div></div>
+      </div>
+      <section class="timeline" aria-label="频率与相位时序">
+        <div class="section-heading"><div class="segmented" id="chart-tabs"><button class="selected" data-chart="frequency">步频 f</button><button data-chart="phase">相位 sin / cos</button></div><span id="chart-legend" class="chart-legend">实线 f · 虚线目标</span><select id="time-window" aria-label="时间窗口"><option value="15">15 s</option><option value="30" selected>30 s</option><option value="60">60 s</option></select></div>
+        <canvas id="chart" aria-label="步频和相位随模拟时间变化曲线"></canvas>
+      </section>
+    </section>
+    <aside class="controls" aria-label="控制输入">
+      <div class="panel-title"><h2>控制输入</h2><span class="eyebrow">50 Hz</span></div>
+      <section class="control-section">
+        <div class="field-heading"><h3>移动方向</h3><div class="number-unit"><input id="direction" type="number" value="0" min="-180" max="180" step="1" aria-label="移动方向角度"><span>°</span></div></div>
+        <input id="direction-slider" type="range" min="-180" max="180" value="0" step="1" aria-label="移动方向滑块">
+        <div class="direction-area"><div class="direction-pad">
+          <button class="icon-button" data-direction="135" title="左后 135°" aria-label="左后 135°"><span class="symbol" aria-hidden="true">↖</span></button>
+          <button class="icon-button" data-direction="90" title="左移 90°" aria-label="左移 90°"><span class="symbol" aria-hidden="true">↑</span></button>
+          <button class="icon-button" data-direction="45" title="左前 45°" aria-label="左前 45°"><span class="symbol" aria-hidden="true">↗</span></button>
+          <button class="icon-button" data-direction="180" title="后退 180°" aria-label="后退 180°"><span class="symbol" aria-hidden="true">←</span></button>
+          <span class="pad-center">XY</span>
+          <button class="icon-button selected" data-direction="0" title="前进 0°" aria-label="前进 0°"><span class="symbol" aria-hidden="true">→</span></button>
+          <button class="icon-button" data-direction="-135" title="右后 -135°" aria-label="右后 -135°"><span class="symbol" aria-hidden="true">↙</span></button>
+          <button class="icon-button" data-direction="-90" title="右移 -90°" aria-label="右移 -90°"><span class="symbol" aria-hidden="true">↓</span></button>
+          <button class="icon-button" data-direction="-45" title="右前 -45°" aria-label="右前 -45°"><span class="symbol" aria-hidden="true">↘</span></button>
+        </div><canvas id="compass" aria-label="移动方向与脚掌朝向"></canvas></div>
+        <div class="field-heading"><label for="heading">脚掌朝向</label><div class="number-unit"><input id="heading" type="number" value="0" min="-180" max="180" step="1" aria-label="脚掌朝向角度"><span>°</span></div></div>
+        <input id="heading-slider" type="range" min="-180" max="180" value="0" step="1" aria-label="脚掌朝向滑块">
+      </section>
+      <section class="control-section">
+        <div class="field-heading"><h3>步频输入</h3><span class="unit-label">完整周期 / s</span></div>
+        <div class="segmented full" id="frequency-tabs"><button class="selected" data-frequency-mode="random">随机慢变</button><button data-frequency-mode="manual">手动目标</button></div>
+        <div class="field-heading frequency-field"><label for="frequency-target">目标 f</label><div class="number-unit"><input id="frequency-target" type="number" min="0.8" max="1.8" step="0.01" value="1.667" disabled><span>Hz</span></div></div>
+        <input id="frequency-slider" type="range" min="0.8" max="1.8" step="0.01" value="1.667" disabled aria-label="目标步频滑块">
+        <div class="range-labels mono"><span id="frequency-min-label">0.80 Hz</span><span id="frequency-max-label">1.80 Hz</span></div>
+        <div class="frequency-parameters">
+          <h3>随机游走参数</h3>
+          <div class="pair"><label>f 下限 / Hz<input form="settings-form" name="frequency_min" type="number" value="0.8" min="0.6" max="2" step="0.01" required></label><label>f 上限 / Hz<input form="settings-form" name="frequency_max" type="number" value="1.8" min="0.6" max="2" step="0.01" required></label></div>
+          <div class="pair"><label>df/dt 下限 / Hz/s<input form="settings-form" name="frequency_rate_min" type="number" value="-0.3" min="-2" max="0" step="0.01" required></label><label>df/dt 上限 / Hz/s<input form="settings-form" name="frequency_rate_max" type="number" value="0.3" min="0" max="2" step="0.01" required></label></div>
+          <label>变化率保持时间 / s<input form="settings-form" name="frequency_rate_interval_s" type="number" value="2" min="0.02" max="30" step="0.02" required></label>
+          <div class="range-labels"><span>采样变化率</span><output id="random-rate" class="mono">0.000 Hz/s</output></div>
+          <button class="command-button apply" type="submit" form="settings-form"><span class="symbol" aria-hidden="true">✓</span>应用并重置</button>
+        </div>
+      </section>
+      <section class="control-section">
+        <div class="field-heading"><h3>停走指令</h3><span id="pending" class="unit-label"></span></div>
+        <div class="command-buttons"><button id="stop" class="command-button"><span class="symbol" aria-hidden="true">■</span>请求站立</button><button id="start" class="command-button" disabled><span class="symbol" aria-hidden="true">▶</span>重新起步</button></div>
+        <label class="switch-row"><span>自动指令与停走</span><input id="automation" type="checkbox" role="switch"></label>
+      </section>
+      <details class="settings">
+        <summary>步距与其他参数 <span class="symbol" aria-hidden="true">≡</span></summary>
+        <form id="settings-form">
+          <label>随机种子<input name="seed" type="number" value="7" min="0" max="4294967295" required></label>
+          <label>初始 f / Hz<input name="initial_frequency" type="number" value="1.6666666667" min="0.6" max="2" step="any" required></label>
+          <label>频率执行限速 / Hz/s<input name="slew_rate" type="number" value="0.2" min="0.01" max="1" step="0.01" required></label>
+          <div class="pair"><label>自动方向下限 / °<input name="direction_min" type="number" value="-180" min="-180" max="180" required></label><label>自动方向上限 / °<input name="direction_max" type="number" value="180" min="-180" max="180" required></label></div>
+          <div class="pair"><label>自动朝向下限 / °<input name="heading_min" type="number" value="0" min="-180" max="180" required></label><label>自动朝向上限 / °<input name="heading_max" type="number" value="0" min="-180" max="180" required></label></div>
+          <h3>步距分布 · 截断正态</h3>
+          <div class="pair"><label>候选距离下限 / m<input name="distance_min" type="number" value="0.05" min="0.05" max="0.8" step="0.01" required></label><label>距离上限 / m<input name="distance_max" type="number" value="0.36" min="0.05" max="0.8" step="0.01" required></label></div>
+          <div class="pair"><label>截断前均值 / m<input name="distance_mean" type="number" value="0.25" min="0.01" max="0.8" step="0.01" required></label><label>标准差 / m<input name="distance_std" type="number" value="0.10" min="0.001" max="0.5" step="0.001" required></label></div>
+          <div class="pair"><label>横向间距下限 / m<input name="min_width" type="number" value="0.10" min="0.08" max="0.5" step="0.01" required></label><label>横向间距上限 / m<input name="max_width" type="number" value="0.36" min="0.08" max="0.6" step="0.01" required></label></div>
+          <label>收步间距 / m<input name="hold_width" type="number" value="0.22" min="0.08" max="0.5" step="0.01" required></label>
+          <div class="range-labels"><span>生效距离上限</span><output id="distance-cap" class="mono">0.360 m</output></div>
+          <div class="range-labels"><span>生效横向范围</span><output id="width-cap" class="mono">0.100-0.360 m</output></div>
+          <div class="pair"><label>方向扰动 / ±°<input name="direction_noise" type="number" value="40" min="0" max="90" required></label><label>朝向扰动 / ±°<input name="yaw_noise" type="number" value="30" min="0" max="60" required></label></div>
+          <label>停止概率 / 每次重采样<input name="stop_probability" type="number" value="0.1" min="0" max="1" step="0.01" required></label>
+          <button class="command-button apply" type="submit"><span class="symbol" aria-hidden="true">✓</span>应用并重置</button>
+        </form>
+      </details>
+    </aside>
+    <section class="queue-section">
+      <div class="section-heading"><h2>四步输入</h2><div class="segmented" id="frame-tabs"><button class="selected" data-frame="local">支撑参考系</button><button data-frame="world">世界系</button></div><span class="eyebrow">L1 · L2 · R1 · R2</span></div>
+      <div class="table-wrap"><table><thead><tr><th>槽位</th><th>目标 ID</th><th>X / m</th><th>Y / m</th><th>Yaw / °</th></tr></thead><tbody id="queue"></tbody></table></div>
+    </section>
+    <section class="event-section"><div class="section-heading"><h2>指令记录</h2><span id="seed-label" class="eyebrow">SEED 7</span></div><ol id="events"></ol></section>
+  </main>
+  <footer><span>MIND YOUR STEPS / 四步预览适配</span><span>G1 · XY + YAW · 20 ms</span></footer>
+</body>
+</html>
