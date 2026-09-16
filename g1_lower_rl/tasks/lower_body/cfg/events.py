@@ -11,6 +11,7 @@ from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 from g1_lower_rl.assets import ARM_TARGET_RANGES
+from g1_lower_rl.tasks.domain_randomization import make_link_mass_event
 from g1_lower_rl.tasks.lower_body import mdp
 from g1_lower_rl.tasks.lower_body.cfg.constants import (
   ARM_DRIFT_LEVELS,
@@ -145,6 +146,7 @@ def make_events() -> dict[str, EventTermCfg]:
         "ranges": (0.0, 2.0),
       },
     ),
+    "link_mass": make_link_mass_event(),
     # 每只脚一个事件，各自内部共享一个采样值，于是两只脚的摩擦相互独立。合成一个事件的话
     # 机器人在接触处完全对称，永远不需要主动保持航向——而那正是它在实机上栽掉的地方。
     "foot_friction_left": EventTermCfg(

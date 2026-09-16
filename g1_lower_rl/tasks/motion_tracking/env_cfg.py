@@ -36,6 +36,7 @@ from g1_lower_rl.assets import (
   WHOLE_BODY_JOINTS,
   get_robot_cfg,
 )
+from g1_lower_rl.tasks.domain_randomization import make_link_mass_event
 from g1_lower_rl.tasks.motion_tracking import mdp
 from g1_lower_rl.tasks.motion_tracking.mdp import (
   GeneralMotionCommandCfg,
@@ -151,11 +152,6 @@ PAYLOAD_MASS_RANGE: tuple[float, float] = (-0.5, 1.0)
 # ARMATURE * ω²），完全没算连杆惯量，所以真机上的**等效**增益本来就不确定；
 # 再加上固件电流环的实际带宽差异，±20% 是保守估计。
 PD_GAIN_SCALE_RANGE: tuple[float, float] = (0.8, 1.2)
-
-# 连杆质量密度的全局缩放（质量与惯量同时按 e^{2α} 变，COM 不变）。
-# ±0.05 ≈ 质量 ±10%。用 pseudo_inertia 而不是 body_mass：后者只改质量不改惯量，
-# 会造出密度不自洽的刚体，等于把策略往不存在的动力学上训。
-LINK_INERTIA_ALPHA_RANGE: tuple[float, float] = (-0.05, 0.05)
 
 # 关节干摩擦（N·m，绝对值）。模型里是 0，而真机谐波减速器 + 密封的静摩擦不可忽略；
 # 不建模的话策略会学出依赖「零摩擦自由摆动」的步态。
@@ -389,8 +385,6 @@ def motion_tracking_env_cfg(
   ].geom_names = r"^(left|right)_foot[1-7]_collision$"
   cfg.events["base_com"].params["asset_cfg"].body_names = ("torso_link",)
 
-  # 下面三项都是 startup 模式：每个并行环境开局抽一次并保持不变，靠环境间的差异
-  # 而不是回合间的差异提供多样性（MJWarp 改不了逐回合的模型参数）。
   cfg.events["pd_gains"] = EventTermCfg(
     func=dr.pd_gains,
     mode="startup",
@@ -401,14 +395,7 @@ def motion_tracking_env_cfg(
       "operation": "scale",
     },
   )
-  cfg.events["link_inertia"] = EventTermCfg(
-    func=dr.pseudo_inertia,
-    mode="startup",
-    params={
-      "asset_cfg": SceneEntityCfg("robot"),
-      "alpha_range": LINK_INERTIA_ALPHA_RANGE,
-    },
-  )
+  cfg.events["link_mass"] = make_link_mass_event()
   cfg.events["joint_friction"] = EventTermCfg(
     func=dr.joint_friction,
     mode="startup",
