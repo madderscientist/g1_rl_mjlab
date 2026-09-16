@@ -74,6 +74,25 @@ python scripts/train.py G1-Gloria-MotionTracking \
 奖励、终止和 68 维参考 token 配方已固化进 `env_cfg.py`。`GRU_ACTOR=1` 仅用于
 把 actor 换成 GRU 做架构对照。
 
+## 连杆质量随机化
+
+所有 G1 任务（下肢 MLP/GRU、站立、脚步、全身动作跟踪）的训练和回放配置，
+默认启用 `events["link_mass"]`。每个环境、每个机器人刚体独立均匀采样
+`scale ~ U(0.95, 1.05)`，每回合 reset 重采，回合内保持不变；左右连杆不共享系数。
+
+- 连杆质量和惯量使用同一个系数：`mass = nominal_mass * scale + payload`，
+  `inertia = nominal_inertia * scale`，不改变质心位置或惯性主轴。
+- 已有 startup 夹爪负载保持独立，不被缩放或清除。每次基于名义值重新计算，不累积缩放。
+- 局部 reset 只更新对应环境；mjlab 会重算质量相关的派生物理常量。
+- 全身动作跟踪原有 startup `link_inertia`（约 -9.52% 到 +10.52%）已由此项替换，
+  不重复叠加。其他任务新增这一项，现有高度、铜损、负载和其他随机化范围不变。
+
+共享实现与范围见 [domain_randomization.py](g1_lower_rl/tasks/domain_randomization.py)。
+需要仅评估名义连杆参数时，在创建环境前设
+`cfg.events["link_mass"].params["scale_range"] = (1.0, 1.0)`；这不会关闭额外负载。
+已初始化的训练进程不会自动应用新的源码或配置，需在下一次创建环境时生效。
+独立逐连杆的 ±5% 不等于每回合整机总质量也按 ±5% 均匀变化。
+
 ## 训练数据（motions/，不入库）
 
 `motions/` 整个目录在 `.gitignore` 里，需要自己下载重建。
