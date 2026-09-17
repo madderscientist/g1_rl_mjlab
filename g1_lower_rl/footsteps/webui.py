@@ -25,6 +25,7 @@ from g1_lower_rl.footsteps import (
   RandomCommandCfg,
   RandomCommandSource,
 )
+from g1_lower_rl.footsteps.config import DEFAULT_FOOT_WIDTH
 from g1_lower_rl.footsteps.footprint_geometry import load_footprint_geometry
 
 ASSETS = Path(__file__).with_name("web")
@@ -72,11 +73,11 @@ class PreviewSession:
     sampler = FootstepSamplerCfg(
       distance_range=(
         number(options.get("distance_min", 0.05), "distance_min", 0.05, 0.8),
-        number(options.get("distance_max", 0.36), "distance_max", 0.05, 0.8),
+        number(options.get("distance_max", FootstepSamplerCfg().distance_range[1]), "distance_max", 0.05, 0.8),
       ),
       distance_mean=number(options.get("distance_mean", 0.25), "distance_mean", 0.01, 0.8),
       distance_std=number(options.get("distance_std", 0.10), "distance_std", 0.001, 0.5),
-      min_width=number(options.get("min_width", 0.10), "min_width", 0.08, 0.5),
+      min_width=number(options.get("min_width", FootstepSamplerCfg().min_width), "min_width", 0.08, 0.5),
       max_width=number(options.get("max_width", 0.36), "max_width", 0.08, 0.6),
       direction_noise=(-direction_noise, direction_noise),
       yaw_noise=(-yaw_noise, yaw_noise),
@@ -86,7 +87,7 @@ class PreviewSession:
       frequency_range=(low, high),
       initial_frequency=initial,
       frequency_slew_rate=number(options.get("slew_rate", 0.2), "slew_rate", 0.01, 1.0),
-      hold_width=number(options.get("hold_width", 0.22), "hold_width", 0.08, 0.5),
+      hold_width=number(options.get("hold_width", DEFAULT_FOOT_WIDTH), "hold_width", 0.08, 0.5),
       require_contact_confirmation=False,
     )
     source_cfg = RandomCommandCfg(
@@ -97,7 +98,7 @@ class PreviewSession:
         number(options.get("frequency_rate_max", 0.3), "frequency_rate_max", 0, 2),
       ),
       frequency_rate_interval_s=number(options.get("frequency_rate_interval_s", 2.0), "frequency_rate_interval_s", 0.02, 30),
-      stop_probability=number(options.get("stop_probability", 0.1), "stop_probability", 0, 1),
+      stop_probability=number(options.get("stop_probability", RandomCommandCfg().stop_probability), "stop_probability", 0, 1),
       direction_range=(
         math.radians(number(options.get("direction_min", -180), "direction_min", -180, 180)),
         math.radians(number(options.get("direction_max", 180), "direction_max", -180, 180)),

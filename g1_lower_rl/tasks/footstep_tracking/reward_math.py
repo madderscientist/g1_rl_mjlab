@@ -55,33 +55,24 @@ def footprint_errors(actual: torch.Tensor, target: torch.Tensor) -> tuple[torch.
   return distance, yaw_error
 
 
-def footprint_accuracy_score(
+def footprint_accuracy_cost(
   distance: torch.Tensor,
   yaw_error: torch.Tensor,
-  position_std: float,
-  yaw_std: float,
+  position_scale: float,
+  yaw_scale: float,
 ) -> torch.Tensor:
-  """平面位置与朝向各自评分后等权相加，单脚最高分保持为1"""
-  if not all(math.isfinite(value) and value > 0 for value in (position_std, yaw_std)):
-    raise ValueError("Tracking standard deviations must be finite and positive")
-  position_score = torch.exp(-(distance / position_std).square())
-  yaw_score = torch.exp(-(yaw_error / yaw_std).square())
-  return 0.5 * position_score + 0.5 * yaw_score
+  """Equal-weight linear position and shortest-angle error, without clipping."""
+  if not all(math.isfinite(value) and value > 0 for value in (position_scale, yaw_scale)):
+    raise ValueError("Tracking scales must be finite and positive")
+  wrapped_yaw = torch.atan2(yaw_error.sin(), yaw_error.cos())
+  return 0.5 * distance / position_scale + 0.5 * wrapped_yaw.abs() / yaw_scale
 
 
-def footprint_tracking_score(
-  actual: torch.Tensor,
-  target: torch.Tensor,
-  required_contact: torch.Tensor,
-  contact: torch.Tensor,
-  position_std: float = 0.05,
-  yaw_std: float = 0.15,
-) -> torch.Tensor:
-  """支撑脚的位置与朝向独立评分，未接触的脚不计分"""
-  distance, yaw_error = footprint_errors(actual, target)
-  score = footprint_accuracy_score(distance, yaw_error, position_std, yaw_std)
-  count = required_contact.sum(dim=-1).clamp_min(1)
-  return (score * required_contact * contact).sum(dim=-1) / count
+def swing_tracking_score(error: torch.Tensor, stance: torch.Tensor, std: float = 0.1) -> torch.Tensor:
+  """Exponential accuracy for the scheduled swing foot, without a progress ramp."""
+  if not math.isfinite(std) or std <= 0:
+    raise ValueError("Swing tracking std must be finite and positive")
+  return (torch.exp(-(error / std).square()) * ~stance).sum(-1)
 
 
 def contact_schedule_score(required_contact: torch.Tensor, contact: torch.Tensor) -> torch.Tensor:

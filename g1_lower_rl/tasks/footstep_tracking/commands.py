@@ -10,6 +10,7 @@ import torch
 from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
 
 from g1_lower_rl.footsteps import FootstepManager, FootstepManagerCfg, RandomCommandCfg, RandomCommandSource
+from g1_lower_rl.footsteps.footprint_geometry import load_footprint_geometry
 from g1_lower_rl.tasks.footstep_tracking.rewards import FootstepRewardState
 
 
@@ -58,6 +59,7 @@ class FootstepCommand(CommandTerm):
     self.managers = [FootstepManager(cfg.manager, int(seed)) for seed in seeds]
     self.sources = [RandomCommandSource(cfg.source, int(seed)) for seed in seeds]
     self.pending_reset = np.ones(self.num_envs, dtype=bool)
+    self._footprint_geometry = None
     self.last_step = -1
     self.failed = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
     self._command = torch.zeros((self.num_envs, 14), device=self.device)
@@ -127,6 +129,43 @@ class FootstepCommand(CommandTerm):
   def compute(self, dt: float) -> None:
     """默认步末回调只完成 reset，不推进时间或重采样行走意图"""
     self._update_command()
+
+  def _debug_vis_impl(self, visualizer) -> None:
+    """绘制未来四步和本拍奖励快照的左右执行目标，不推进脚步状态"""
+    if self._footprint_geometry is None:
+      self._footprint_geometry = load_footprint_geometry()["feet"]
+    colors = ((0.05, 0.65, 1.0), (1.0, 0.3, 0.12))
+    for env_index in visualizer.get_env_indices(self.num_envs):
+      if self.pending_reset[env_index]:
+        continue
+      command = self.managers[env_index].command()
+      current_targets = self.reward_state.targets_w[env_index].detach().cpu().numpy()
+      targets = [(slot // 2, slot % 2, pose, False) for slot, pose in enumerate(command.footsteps_w)]
+      targets.extend((side, 0, pose, True) for side, pose in enumerate(current_targets))
+      for side, future, pose, current in targets:
+        suffix = "_current" if current else str(future + 1)
+        label = f"footstep_{env_index}_{'L' if side == 0 else 'R'}{suffix}"
+        color = tuple(channel * (1.0 if future == 0 else 0.65) for channel in colors[side]) + (0.7,)
+        cosine, sine = math.cos(pose[2]), math.sin(pose[2])
+        rotation = np.array(((cosine, -sine), (sine, cosine)))
+        height = float(self.reward_state.ground_height[env_index, side]) + (0.025 if current else 0.015)
+        for capsule_index, capsule in enumerate(self._footprint_geometry[side]["capsules"]):
+          endpoints = np.array((capsule["start"], capsule["end"])) @ rotation.T + pose[:2]
+          start, end = np.column_stack((endpoints, np.full(2, height)))
+          capsule_label = f"{label}_capsule_{capsule_index}"
+          visualizer.add_cylinder(start, end, radius=capsule["radius"], color=color, label=capsule_label)
+          visualizer.add_sphere(start, radius=capsule["radius"], color=color, label=f"{capsule_label}_start")
+          visualizer.add_sphere(end, radius=capsule["radius"], color=color, label=f"{capsule_label}_end")
+        if current:
+          lower, upper = np.asarray(self._footprint_geometry[side]["bounds"]) + np.array(([-0.015, -0.015], [0.015, 0.015]))
+          corners = np.array(((lower[0], lower[1]), (upper[0], lower[1]), (upper[0], upper[1]), (lower[0], upper[1])))
+          corners = corners @ rotation.T + pose[:2]
+          corners = np.column_stack((corners, np.full(4, height)))
+          for edge, start in enumerate(corners):
+            visualizer.add_cylinder(start, corners[(edge + 1) % 4], radius=0.004, color=color, label=f"{label}_border_{edge}")
+        origin = np.array((pose[0], pose[1], height + 0.035))
+        direction = np.array((cosine, sine, 0.0))
+        visualizer.add_arrow(origin, origin + 0.16 * direction, color=color, width=0.014 if current else 0.008, label=label)
 
   def finish_step(self) -> torch.Tensor:
     """在奖励前消费刚结束的一拍，超时变成局部终止并保留本拍奖励快照"""
