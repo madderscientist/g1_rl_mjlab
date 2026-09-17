@@ -20,7 +20,7 @@
 - [相位配置](g1_lower_rl/footstep_phase.py)：`FootstepPhaseCfg`，奖励与模型导出共用的理论双支撑窗口。
 - [测试](tests/test_footstep_model.py)：输入布局、编码、GRU、PPO 更新、导出和连续推理。
 - [奖励配置](g1_lower_rl/tasks/footstep_tracking/rewards_cfg.py)：`make_rewards`、`make_terminations`。
-- [奖励实现](g1_lower_rl/tasks/footstep_tracking/rewards.py)及[测试](tests/test_footstep_rewards.py)：落地锁分、支撑与节拍、铜损代理、腰部约束。
+- [奖励实现](g1_lower_rl/tasks/footstep_tracking/rewards.py)及[测试](tests/test_footstep_tracking_objectives.py)：摆动指数奖励、落地锁定线性代价、实时支撑与接触节拍。
 
 ## 1. 任务边界
 
@@ -255,7 +255,7 @@ checkpoint 恢复、真实 CPU PPO 更新（含 episode 截断）、TorchScript 
 多拍动作/隐状态对齐、契约一致性和部署端动作映射。测试使用合成张量，不验证行走、铜损或抗扰性能。
 
 下一轮训练仍遵循已讨论的目标：落点/脚掌朝向/节拍跟踪、不摔倒、受控 15 轴铜损代理最小，
-腰 yaw 靠近零、腰 roll/pitch 临近限位惩罚；不加入身体高度跟踪目标。
+腰 yaw 靠近零、腰 roll/pitch 临近限位惩罚；加入骨盆高度单调封顶奖励，但不增加身体高度指令。
 上肢摆动、外力扰动及课程参考 lower_body GRU，课程升级改用脚印跟踪与存活质量。
 没有电机电阻/力矩常数/传动标定时，力矩平方仅称为铜损代理。
 脚印范围和频率参数已有可调实现初值，仍需验证可行性；轨迹分布、课程阈值和训练预算仍待确定。
@@ -268,21 +268,24 @@ checkpoint 恢复、真实 CPU PPO 更新（含 episode 截断）、TorchScript 
 只有摔倒项是事件代价，函数内部除以 `step_dt`，所以每次真正终止固定扣 10 分；
 时间上限结束不算摔倒。不要再额外对总奖励做非负裁剪。
 
-### 10.1 初始奖励表
+### 10.1 当前奖励表
 
 | 名称 | 权重 | 意图/原始值 |
 | --- | --- | --- |
-| `footstep_landing` | +4.0 | 行走时锁定首次落地精度；站立时改为实时双脚保持精度，不要求先抬脚 |
-| `footstep_support` | +1.0 | 支撑脚当前位置/yaw 相对原计划目标的精度，要求实际接触 |
-| `footstep_approach` | -0.5 | 摆动进度平方乘目标平面距离，提供远离指数核时的轻量引导 |
+| `footstep_landing` | -4.0 | 首次触地锁定线性XY/yaw代价；漏落地/错时触地加代价；站立改为实时双脚代价 |
+| `footstep_support` | -1.0 | 计划支撑脚相对原目标的实时线性XY/yaw代价，不因失去接触清零 |
+| `footstep_swing_position` | +5.0 | 计划摆动脚 `exp(-(XY_distance/0.10)^2)`，无摆动进度权重、无实际接触门控 |
+| `footstep_swing_yaw` | +5.0 | 计划摆动脚 `exp(-(wrapped_yaw_error/0.10)^2)`，阶段门控同上 |
 | `contact_schedule` | +2.0 | 左右脚同时满足接触模式才得 1 分；f>0 按相位，f=0 始终要求双接触 |
 | `swing_clearance` | -0.5 | 摆动脚低于相位相关离地间隙的归一化平方代价，高于目标不额外惩罚 |
 | `foot_slip` | -2.0 | 实际触地脚的 XY 速度模长 + 0.05 m × 竖直轴角速度绝对值之和 |
 | `soft_landing` | -0.002 | 复用速度跟踪任务的首次触地接触力模长惩罚，无速度/频率门控，持续支撑不收费 |
-| `lower_body_copper_proxy` | -0.5 | 15 轴实际力矩的统一尺度平方和，见下文 |
+| `lower_body_copper_proxy` | -2.0 | 15 轴实际力矩的统一尺度平方和，见下文 |
 | `waist_yaw_zero` | -0.4 | `waist_yaw_joint` 绝对角度平方，目标是 0 rad，不是默认姿态偏差 |
 | `waist_roll_pitch_edges` | -2.0 | 两个腰轴靠近硬限位的边缘平方惩罚，内部区域为零 |
 | `torso_upright` | -0.5 | torso 重力向量 XY 分量平方和，不约束世界 yaw，不控制身体高度 |
+| `pelvis_height` | +2.0 | `clip((pelvis_z-ground_z)/0.78,0,1)`，至少一脚接触且未失败时启用 |
+| `pelvis_upright_filtered` | -1.0 | 随f调整的一阶低通骨盆重力向量XY分量平方和，不罚步频摆动的原始幅度 |
 | `action_rate` | -0.02 | 15 维动作相邻拍差的平方和 |
 | `controlled_joint_acc` | -2.5e-7 | 仅 15 轴关节加速度平方和，不罚外部控制的手臂/夹爪 |
 | `self_collisions` | -2.0 | 复用 lower_body 的腿间自碰撞传感器，统计控制拍内超过 10 N 的接触子步数 |
@@ -294,19 +297,26 @@ checkpoint 恢复、真实 CPU PPO 更新（含 episode 截断）、TorchScript 
 
 ### 10.2 精度、节拍与防刷分
 
-默认 `position_std=0.08 m`、`yaw_std=0.20 rad`，可通过工厂参数修改；
-这是指数核尺度，不是容许误差上界或已实现的实机精度。
+2026-09-17起采用摆动指数奖励、落地及支撑线性惩罚。
+摆动核参考 [Mind Your Steps §IV-C及附录D、F](https://arxiv.org/html/2606.08253v1)，
+位置尺度0.10m、角度尺度0.10rad，两个分量各权重+5，不乘摆动进度平方。
+按计划摆动阶段启用，不以实际接触门控；双支撑及f=0时关闭。
+默认工厂参数 `position_std=0.08 m`、`yaw_std=0.20 rad` 保留名称，但改为落地/支撑线性代价尺度。
+这些尺度不是容许误差上界或已实现的实机精度。
 
 ```text
-score_xy = exp(-(XY_distance/position_std)^2)
-score_yaw = exp(-(wrapped_yaw_error/yaw_std)^2)
-score = 0.5 * score_xy + 0.5 * score_yaw
+r_swing_xy = 5 * sum_swing(exp(-(XY_distance/0.10)^2))
+r_swing_yaw = 5 * sum_swing(exp(-(wrapped_yaw_error/0.10)^2))
+cost = 0.5 * XY_distance/position_std + 0.5 * abs(wrapped_yaw_error)/yaw_std
+r_landing = -4 * mean_planned_stance(latched_or_pending_cost)
+r_support = -1 * mean_planned_stance(cost)
 ```
 
-2026-09-16起，XY平面距离与yaw改为独立等权评分，不把X和Y拆开
-落地锁分、实时支撑和站立保持共享同一评分核，接触门控和时间窗不变
-最高单脚分数仍为1，落地+4和支撑+1的外层权重、15项奖励名称均不变
-部分失配时奖励比旧乘积核宽容，比较run需使用原始XY/yaw误差，成功判据仍需两者同时达标
+线性代价不截断，XY整体距离与yaw各占50%，不把X和Y拆开。
+旧 `footstep_approach`、`footstep_distance`、旧指数落地/支撑原语及 `distance_penalty` 参数已删除。
+当前只有一套18项配置（4正、14负）；历史A/B脚本须使用对应源码快照，不能直接调用当前奖励工厂。
+持续续训入口为 `scripts/train_footstep_resume.py`，支持双卡精确恢复及更新结束后同步保存退出。
+比较run需使用原始XY/yaw误差和存活率，不能通过不同定义下的总奖励判断效果。
 下肢平滑保持动作差分-0.02及实际关节加速度-2.5e-7，不添加站立增量或力矩差分项
 
 两只脚的 yaw 均为 `left_foot/right_foot` site 的世界 yaw，使用 wxyz 四元数转换，并将角差 wrap。
@@ -315,18 +325,19 @@ score = 0.5 * score_xy + 0.5 * score_yaw
 旧 `stance_fraction` 参数仍可使用，但不能与 `phase_cfg` 同时传入；其派生配置必须同步给 actor。
 `phase_windows` 是后续调度器和奖励应共同使用的窗口定义，不得另外写一套起脚边界。
 
-首次落地分要求该脚在本目标摆动期真正离地，随后在理论落地前后各 0.1 个完整周期内首次接触。
+正常首次落地要求该脚在本目标摆动期真正离地，随后在理论落地前后各 0.1 个完整周期内首次接触。
 默认 `landing_window=0.25` 表示摆动时长的 25%，即 `0.25*(1-0.6)=0.1` 个周期。
-过早/过晚的首次接触锁定为零；同一目标再跳一次或滑到正确落点不能修改该次成绩。
-reset 后未离地的脚没有落地分；每环境 reset 会清理奖励记忆，不会串到下一 episode。
+正常首次触地锁定当时的线性代价，过早/过晚则锁定 `cost_touch+landing_miss_cost`，默认附加代价1。
+尚未完成离地再触地（包括reset后）的计划支撑脚使用 `cost_current+landing_miss_cost`，不再给零分。
+附加代价属于落地项，随-4权重、计划支撑脚平均及dt一起累计，不是独立事件罚款。
+同一目标再跳一次或滑到正确落点不能修改首次触地代价；目标ID变化及局部reset清理对应历史。
 
-以上落地锁分针对 f>0。f=0 时改为实时双脚保持精度，清理历史锁分，不要求 reset 站立先抬脚。
-支撑 mask 覆盖为双脚支撑，approach/clearance 关闭；重新起步后必须重新离地再触地才能获得落地锁分。
+以上触地锁定针对 f>0。f=0 时改为实时双脚线性代价，清理历史，不要求reset站立先抬脚，也不收未落地附加代价。
+支撑mask覆盖为双脚支撑，两个摆动奖励及clearance关闭；重新起步后须重新离地再触地才能锁定落地代价。
 精确零频率才切换模式，小的正频率仍按行走评分。
 
-落地成绩在随后支撑期计为奖励率，而不是每个 touchdown 发一笔固定奖金，避免纯粹多迈步拿更多分。
-支撑分仍按当前偏差计算，并保留接触门控。全程不离地最多拿到双支撑部分的节拍分；
-没有真正触地时，即使足端 XY/yaw 完美重合也没有支撑/落地分。
+落地代价在计划支撑期持续累计，不是每个touchdown单独罚一次。
+支撑代价实时计算，两个惩罚都不因失去接触清零；节拍奖励仍要求两只脚实际接触模式匹配计划。
 摆动间隙为 `0.08 m * sin(pi*swing_progress)` 的下界引导，不规定身体高度或完整关节轨迹。
 实际接触来自传感器 `found > 0`，当前没有迟滞滤波；将来改变接触判据时需同步测试和时序。
 
@@ -362,6 +373,14 @@ copper_proxy = sum_j copper_weight[j] * (actual_actuator_torque[j] / 100 Nm)^2
 实际铜损对应 `sum R_j * I_j^2`，电流与关节力矩之间还需传动/效率模型；
 当前默认值只表示力矩平方代理，不能标注为真实瓦特数。
 
+骨盆高度奖励在0到0.78m内单调线性增加、之后封顶，双脚腾空或非超时失败拍不发此奖励。
+高度参考 `ground_height` 而不是运动中的脚底；它不改变84维actor输入，也不加入高度命令或固定膝角。
+骨盆倾斜使用真实骨盆局部单位重力向量的一阶低通，`fc=f/4`（f>0），f=0时`fc=0.2Hz`。
+每个控制拍用当前执行频率计算 `alpha=1-exp(-2*pi*fc*step_dt)`，
+`g_filtered=(1-alpha)*g_filtered+alpha*g`，惩罚 `g_filtered[:2]` 的平方和。
+先滤波再平方；该滤波衰减而非完全消除步频分量。各环境独立reset，首次读当前重力初始化，
+同拍重复读取不再积分；原有torso即时倾斜项及骨盆跌倒终止不变。
+
 腰 yaw 目标为腰相对骨盆的扭转角 0，不是把整个机器人世界朝向锁到 0；
 允许转弯时整个机器人随脚印转向，回零只是软约束。
 腰 roll/pitch 不添加全程回零项，只罚各自硬限位两侧 15% 行程：
@@ -376,8 +395,15 @@ edge_cost = relu((lower_limit + margin - q)/margin)^2
 不使用机器人 soft_joint_pos_limits，避免把膝的软限位当作姿态目标间接强迫屈膝。
 仅腰 roll/pitch 使用此项，不对整条腿施加名义姿态回归或直膝奖励。
 
-`make_terminations()` 复用 lower_body：骨盆倾角超过 70 度或相对最低足底高度低于 0.35 m 结束。
+`make_terminations()` 增加 `footstep_distance`：任一计划支撑脚到本拍执行目标的 XY 距离严格超过1m，立即非超时终止。
+使用时钟推进后的 `reward_state.targets_w` 快照，不使用下一步目标；不要求实际接触，不设置持续时间宽限。
+摆动脚不参与此判断，f=0检查双脚。它同样触发固定10分的 `fall` 事件代价。
+其余条件复用 lower_body：骨盆倾角超过 70 度或相对最低足底高度低于 0.35 m 结束。
 0.35 m 是塌坐失败阈值，不是身体高度指令/跟踪奖励。
+
+脚印采样默认横向间距范围12–36cm，以24cm为中心叠加有向横移分量并裁剪，交替左右脚的整体均值约24cm。
+收步间距固定24cm，零关节足距实测23.701291cm；24cm不再是采样下限，也不是独立均匀步宽分布。
+总步距上限48cm、横向上限36cm；改变脚印生成配置不改变实际机器人reset姿态，也不会自动重训旧检查点。
 
 ### 10.4 训练命令状态接口
 
@@ -389,7 +415,7 @@ edge_cost = relu((lower_limit + margin - q)/margin)^2
 | `phase` | `[N]` | 与正在评价的物理状态对应的全局相位，可 wrap 或连续累计 |
 | `targets_w` | `[N,2,3]` | 当前两脚执行/保持的世界 XY/yaw，顺序 left/right，不是未来四步列表 |
 | `target_ids` | `[N,2]` int64 | 非负目标编号，换新摆动目标时更新；即使原地重复落点也要换编号 |
-| `ground_height` | `[N,2]` | 两脚对应接触平面高度，仅为摆动间隙基准 |
+| `ground_height` | `[N,2]` | 两脚对应接触平面高度，用于摆动间隙及骨盆高度奖励的地面基准 |
 | `frequency` | `[N]` | 必填非负实际发布频率，必须与 actor 同步；0 为站立，不是未来停止请求 |
 
 目标编号和世界目标在该脚整个摆动及随后支撑期间保持不变，到该脚下次起脚才换成下一目标。
@@ -430,8 +456,8 @@ CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 micromamba run -n mj python -m unittes
 
 管理器维护 walking -> stopping -> standing -> starting 状态，不新增 actor 输入：
 
-1. 停止意图采样概率设为 `stop_probability=0.10`。约定每次 WALK 的行走指令重采样时抽一次，
-  不是每个控制拍抽一次，也不是保证 10% 时间站立；STOP_PENDING/STAND 期间不重复抽样。
+1. 停止意图采样概率设为 `stop_probability=0.30`。约定每次 WALK 的行走指令重采样时抽一次，
+  不是每个控制拍抽一次，也不是保证 30% 时间站立；STOP_PENDING/STAND 期间不重复抽样。
   默认重采样间隔3-8s、保持时长2-5s，可配置；也支持 reset 直接站立。
 2. 保留已经承诺的四步，在远端补可站立的终止脚印。选择有足够时间减速和完成必要收步的双支撑窗口，
   当前实现先执行原四步，再补一个与远端末脚对齐的收步，随后重复双脚终止目标。
@@ -442,7 +468,7 @@ CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 micromamba run -n mj python -m unittes
 5. STAND 冻结时钟/参考系/足端目标，持续运行策略。再次起步时提供新四步和有准备时间的起步相位，
   恢复正频率，不清空 GRU。
 
-`stop_probability=0.10` 已由独立模块读取执行，不是每个控制拍的概率。
+`stop_probability=0.30` 已由独立模块读取执行，不是每个控制拍的概率；站立后仍保持2–5s并自动再起步。
 现有 lower_body 速度跟踪任务在观测与步态奖励中使用完整左右周期 `period=0.6 s`，
 对应本契约 `f=1/0.6=1.6667 Hz`，左右合计 `2*f=3.3333 步/秒`（200 步/分钟）。
 这是目标节拍，不是已测得的实际落地频率。管理器初始 f 取该值，正常慢变范围初值为0.8-1.8Hz，
@@ -496,17 +522,17 @@ ONNX/JSON 的 `phase.contact_schedule` 保存中心/半宽、弧度窗口及派�
 当前站立奖励率（常规项乘 dt，摔倒另扣固定 10 分）：
 
 ```text
-score_xy = exp(-(XY_error/0.08)^2)
-score_yaw = exp(-(wrapped_yaw_error/0.20)^2)
-hold_score = mean_left_right(contact * (0.5*score_xy + 0.5*score_yaw))
-r_stand = 5.0*hold_score + 2.0*both_contact
-       - 2.0*slip - 0.5*copper_proxy - 0.4*waist_yaw^2
+hold_cost = mean_left_right(0.5*XY_error/0.08 + 0.5*abs(wrapped_yaw_error)/0.20)
+r_stand = -5.0*hold_cost + 2.0*both_contact
+      - 2.0*slip - 2.0*copper_proxy - 0.4*waist_yaw^2
        - 2.0*waist_roll_pitch_edges - 0.5*torso_tilt
        - 0.02*action_rate - 2.5e-7*controlled_joint_acc - 2.0*self_collisions
+      + 2.0*pelvis_height_score - 1.0*pelvis_upright_filtered_cost
 ```
 
-5.0 的保持项来自 landing 分量的 4.0 加 support 分量的 1.0，保留奖励量级但不保留历史成绩。
-一脚未接触时最多拿保持项的一半且双接触分为零；只是软奖励损失，不因恢复抬脚立即终止。
-铜损、腰部、打滑和防摔始终生效；不增加高度目标、全身名义姿态回归或双脚 50/50 承重约束。
+-5.0 的保持项来自 landing 的-4.0加support的-1.0，使用实时误差，不保留历史成绩，无未落地附加代价。
+一脚未接触不会减少保持代价，且双接触奖励为零；不会仅因恢复抬脚而终止，但f=0时任一脚XY偏差超过1m仍会离轨终止。
+铜损、腰部、打滑和防摔始终生效；骨盆高度封顶奖励与低通倾斜项也在站立时生效。
+不增加外部高度指令、全身名义姿态回归或双脚 50/50 承重约束。
 不惩罚独立控制的上肢运动。若训练后仍晃动，可再讨论轻量速度惩罚及落地后的渐进启用；
 当前没有新增站立专用基座速度惩罚，接口测试也不验证物理站立能力。

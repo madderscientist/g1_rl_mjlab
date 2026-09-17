@@ -99,14 +99,14 @@
           <div class="pair"><label>自动方向下限 / °<input name="direction_min" type="number" value="-180" min="-180" max="180" required></label><label>自动方向上限 / °<input name="direction_max" type="number" value="180" min="-180" max="180" required></label></div>
           <div class="pair"><label>自动朝向下限 / °<input name="heading_min" type="number" value="0" min="-180" max="180" required></label><label>自动朝向上限 / °<input name="heading_max" type="number" value="0" min="-180" max="180" required></label></div>
           <h3>步距分布 · 截断正态</h3>
-          <div class="pair"><label>候选距离下限 / m<input name="distance_min" type="number" value="0.05" min="0.05" max="0.8" step="0.01" required></label><label>距离上限 / m<input name="distance_max" type="number" value="0.36" min="0.05" max="0.8" step="0.01" required></label></div>
+          <div class="pair"><label>候选距离下限 / m<input name="distance_min" type="number" value="0.05" min="0.05" max="0.8" step="0.01" required></label><label>距离上限 / m<input name="distance_max" type="number" value="0.48" min="0.05" max="0.8" step="0.01" required></label></div>
           <div class="pair"><label>截断前均值 / m<input name="distance_mean" type="number" value="0.25" min="0.01" max="0.8" step="0.01" required></label><label>标准差 / m<input name="distance_std" type="number" value="0.10" min="0.001" max="0.5" step="0.001" required></label></div>
-          <div class="pair"><label>横向间距下限 / m<input name="min_width" type="number" value="0.10" min="0.08" max="0.5" step="0.01" required></label><label>横向间距上限 / m<input name="max_width" type="number" value="0.36" min="0.08" max="0.6" step="0.01" required></label></div>
-          <label>收步间距 / m<input name="hold_width" type="number" value="0.22" min="0.08" max="0.5" step="0.01" required></label>
-          <div class="range-labels"><span>生效距离上限</span><output id="distance-cap" class="mono">0.360 m</output></div>
-          <div class="range-labels"><span>生效横向范围</span><output id="width-cap" class="mono">0.100-0.360 m</output></div>
+          <div class="pair"><label>横向间距下限 / m<input name="min_width" type="number" value="0.12" min="0.08" max="0.5" step="0.01" required></label><label>横向间距上限 / m<input name="max_width" type="number" value="0.36" min="0.08" max="0.6" step="0.01" required></label></div>
+          <label>收步间距 / m<input name="hold_width" type="number" value="0.24" min="0.08" max="0.5" step="0.01" required></label>
+          <div class="range-labels"><span>生效距离上限</span><output id="distance-cap" class="mono">0.480 m</output></div>
+          <div class="range-labels"><span>生效横向范围</span><output id="width-cap" class="mono">0.120-0.360 m</output></div>
           <div class="pair"><label>方向扰动 / ±°<input name="direction_noise" type="number" value="40" min="0" max="90" required></label><label>朝向扰动 / ±°<input name="yaw_noise" type="number" value="30" min="0" max="60" required></label></div>
-          <label>停止概率 / 每次重采样<input name="stop_probability" type="number" value="0.1" min="0" max="1" step="0.01" required></label>
+          <label>停止概率 / 每次重采样<input name="stop_probability" type="number" value="0.3" min="0" max="1" step="0.01" required></label>
           <button class="command-button apply" type="submit"><span class="symbol" aria-hidden="true">✓</span>应用并重置</button>
         </form>
       </details>

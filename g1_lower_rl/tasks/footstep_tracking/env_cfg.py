@@ -48,7 +48,7 @@ def footstep_env_cfg(play: bool = False):
   """复用基础 G1 平地场景，替换速度和高度任务的命令、观测、奖励与课程"""
   cfg = make_lower_body_env_cfg()
   cfg.scene.num_envs = 1 if play else 64
-  cfg.commands = {"footsteps": FootstepCommandCfg()}
+  cfg.commands = {"footsteps": FootstepCommandCfg(debug_vis=play)}
   joints = SceneEntityCfg("robot", joint_names=WHOLE_BODY_JOINTS, preserve_order=True)
   reference = lower_body_observations()["actor"].terms
   # 拼接顺序就是部署契约：29角度、29速度、两组IMU各6维、脚步命令14维

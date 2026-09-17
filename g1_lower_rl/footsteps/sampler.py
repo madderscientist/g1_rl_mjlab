@@ -100,9 +100,10 @@ class FootstepSampler:
     maximum = self.cfg.distance_range[1]
     direction = self.movement_direction + self.rng.uniform(*self.cfg.direction_noise) - reference[2]
     lateral_sign = 1 if side == 0 else -1
-    # 配置已保证横向上限不超过总距离上限，脚侧约束可能改变原始采样方向
     lateral = float(
-      lateral_sign * np.clip(lateral_sign * distance * math.sin(direction), self.cfg.min_width, self.cfg.max_width)
+      lateral_sign * np.clip(
+        self.cfg.width_center + lateral_sign * distance * math.sin(direction), self.cfg.min_width, self.cfg.max_width
+      )
     )
     # 补足最小站距后，再裁剪前后分量以满足总距离上限
     forward_limit = math.sqrt(max(0.0, maximum**2 - lateral**2))

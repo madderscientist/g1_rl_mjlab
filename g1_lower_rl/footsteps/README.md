@@ -20,7 +20,7 @@
 
 1. 在配置的 `distance_range` 内采样截断正态距离 d
 2. 移动方向加随机扰动，再减参考脚 yaw，得到局部方向角
-3. 计算候选位移，再按脚侧限制横向间距
+3. 以前后候选位移配合居中的步宽：横向分量围绕步宽区间中心偏移，再按脚侧限制范围
 4. 裁剪前后分量，使最终总距离不超过距离上限
 5. 独立采样脚掌 yaw 并限制相邻转角，最后将局部位移旋转、平移回世界系
 
@@ -28,7 +28,8 @@
 
 $$
 x_0=d\cos(\theta+\alpha-\psi_p),\qquad
-y=s\operatorname{clip}\bigl(d\sin(\theta+\alpha-\psi_p)s,w_{\min},w_{\max}\bigr)
+y=s\operatorname{clip}\bigl(w_c+d\sin(\theta+\alpha-\psi_p)s,w_{\min},w_{\max}\bigr),\qquad
+w_c=(w_{\min}+w_{\max})/2
 $$
 
 $$
@@ -37,9 +38,10 @@ x=\operatorname{clip}(x_0,-x_{\max},x_{\max})
 $$
 
 **d 是候选偏移，不是同一只脚或机器人的净移动距离**
-例如无角度扰动、脚掌朝前的纯左移，候选 d=25cm 时，左脚展开25cm，右脚相对左脚收回10cm
-在已经形成10cm站距后，一对左右步净横移15cm；默认初始/收步间距为22cm，首对脚步会有站距过渡
-此时净横移公式为 $\max(d-0.10,0)$，5cm候选可能变成原地踏步，而不是5cm净横移
+例如无角度扰动、脚掌朝前的纯左移，候选 d=25cm 时，左脚宽度裁为36cm，右脚宽度裁为12cm，
+两脚平均24cm，稳态一对左右步净横移24cm。前进或后退且无方向扰动时，宽度为区间中心24cm。
+步宽不是独立均匀采样：方向扰动与候选距离共同决定偏离中心的幅度，边界处可能出现截断堆积。
+侧移时展开脚偏宽、跟随脚偏窄；交替左右脚的整体分布均值约24cm，不要求每只脚各自的条件均值相同。
 
 ## 四步与时钟
 
@@ -62,21 +64,27 @@ $$
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| `distance_range` | 0.05–0.36 m | 候选距离截断范围及最终总距离上限 |
+| `distance_range` | 0.05–0.48 m | 候选距离截断范围及最终总距离上限 |
 | `distance_mean` / `distance_std` | 0.25 / 0.10 m | 截断前正态均值和标准差 |
-| `min_width` / `max_width` | 0.10 / 0.36 m | 参考脚系中的横向间距范围 |
-| `hold_width` | 0.22 m | 收步间距 |
+| `min_width` / `max_width` | 0.12 / 0.36 m | 参考脚系中的横向间距范围，中心及整体均值约0.24m |
+| `hold_width` | 0.24 m | 收步间距 |
 | `direction_noise` / `yaw_noise` | ±40° / ±30° | 移动方向和脚掌朝向扰动 |
 | `max_yaw_change` | 30° | 相对前一个异侧目标的转角上限 |
 | `control_dt` | 0.02 s | 固定控制拍长 |
 | `frequency_range` / `initial_frequency` | 0.8–1.8 / 1.667 Hz | source 的采样范围/初值；manager 同名字段为执行范围/缺省值 |
 | `frequency_rate_range` / `frequency_rate_interval_s` | ±0.3 Hz/s / 2 s | 随机变化率及保持时间，触边反向 |
 | `frequency_slew_rate` | 0.2 Hz/s | manager 对所有频率目标的执行限速 |
-| `command_interval_s` / `stop_probability` | 3–8 s / 10% | 每次行走指令重采样时抽一次停止概率 |
+| `command_interval_s` / `stop_probability` | 3–8 s / 30% | 每次行走指令重采样时抽一次停止概率 |
 | `hold_time_s` | 2–5 s | 自动再起步前的站立保持时间 |
 | `direction_range` / `foot_heading_range` | ±180° / 0° | source 的整体方向范围，不是逐脚扰动 |
 
 `hold_width` 属于 manager；整体方向范围、随机变化率、重采样间隔和自动开关属于 source
+停步概率从10%提高至30%，在成功收步、站立保持2–5s后自动再起步，不额外抽起步概率。
+这会增加停走机会，但不保证站立时间占比或成功次数；短回合、失败重置仍可能打断过渡。
+24cm 是默认采样中心及收步间距，不是硬下限；MJCF 全关节为0时左右足底 site 间距为0.23701291m，
+不是左右髋关节原点的12.89cm距离。前进、后退、左右横移各两万步验证，均值为23.98–24.02cm。
+总步距上限为48cm，横向上限仍为36cm；24cm步宽时前后分量最多约41.6cm。
+不修改实际机器人初始关节姿态，候选距离的截断前均值25cm和标准差10cm也不变。
 随机源用实际 f 加 `rate*dt` 产生下一拍目标，不另做平滑；实际变化仍受 manager 的执行限速约束
 默认随机率可达±0.3Hz/s，执行限速为0.2Hz/s，更快变化会被截住；需要完整跟随时显式提高执行限速
 
@@ -98,7 +106,7 @@ source = RandomCommandSource(
 )
 cfg = FootstepManagerCfg(require_contact_confirmation=False)  # 仅离线 demo 关闭接触确认
 manager = FootstepManager(cfg, seed=7)
-command = manager.reset([[0, 0.11, 0], [0, -0.11, 0]], source.reset(heading_origin=0))
+command = manager.reset([[0, 0.12, 0], [0, -0.12, 0]], source.reset(heading_origin=0))
 
 for frame in range(3000):  # 60秒模拟时间，概率停止不保证每次短演示都发生
   before = manager.command()

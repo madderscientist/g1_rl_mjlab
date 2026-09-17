@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.managers.termination_manager import TerminationTermCfg
 
 from g1_lower_rl.assets import LOWER_BODY_JOINTS
 from g1_lower_rl.footstep_phase import FootstepPhaseCfg, resolve_phase_cfg
 from g1_lower_rl.tasks.footstep_tracking import rewards
+from g1_lower_rl.tasks.footstep_tracking.terminations import footstep_distance_exceeded
 from g1_lower_rl.tasks.lower_body import mdp
 from g1_lower_rl.tasks.lower_body.cfg.terminations import make_terminations as lower_body_terminations
 
@@ -22,6 +24,7 @@ def make_rewards(
   *,
   phase_cfg: FootstepPhaseCfg | None = None,
 ) -> dict[str, RewardTermCfg]:
+  """Use exponential swing accuracy rewards and linear landing/support costs."""
   phase_cfg = resolve_phase_cfg(stance_fraction, phase_cfg)
   terms = {
     name: RewardTermCfg(
@@ -35,14 +38,18 @@ def make_rewards(
         "phase_cfg": phase_cfg,
         "position_std": position_std,
         "yaw_std": yaw_std,
+        "swing_position_std": 0.1,
+        "swing_yaw_std": 0.1,
         "landing_window": 0.25,
+        "landing_miss_cost": 1.0,
         "clearance": 0.08,
       },
     )
     for name, component, weight in (
-      ("footstep_landing", "landing", 4.0),
-      ("footstep_support", "support", 1.0),
-      ("footstep_approach", "approach", -0.5),
+      ("footstep_landing", "landing", -4.0),
+      ("footstep_support", "support", -1.0),
+      ("footstep_swing_position", "swing_position", 5.0),
+      ("footstep_swing_yaw", "swing_yaw", 5.0),
       ("contact_schedule", "schedule", 2.0),
       ("swing_clearance", "clearance", -0.5),
       ("foot_slip", "slip", -2.0),
@@ -57,7 +64,7 @@ def make_rewards(
       ),
       "lower_body_copper_proxy": RewardTermCfg(
         func=rewards.LowerBodyTorqueCost,
-        weight=-0.5,
+        weight=-2.0,
         params={
           "asset_cfg": SceneEntityCfg("robot", actuator_names=list(LOWER_BODY_JOINTS), preserve_order=True),
           "reference_torque": 100.0,
@@ -82,6 +89,26 @@ def make_rewards(
         weight=-0.5,
         params={"asset_cfg": SceneEntityCfg("robot", body_names=("torso_link",))},
       ),
+      "pelvis_height": RewardTermCfg(
+        func=rewards.pelvis_height_reward,
+        weight=2.0,
+        params={
+          "asset_cfg": SceneEntityCfg("robot", body_names=("pelvis",)),
+          "command_name": command_name,
+          "sensor_name": sensor_name,
+          "height_cap": 0.78,
+        },
+      ),
+      "pelvis_upright_filtered": RewardTermCfg(
+        func=rewards.FilteredPelvisUpright,
+        weight=-1.0,
+        params={
+          "asset_cfg": SceneEntityCfg("robot", body_names=("pelvis",)),
+          "command_name": command_name,
+          "cutoff_ratio": 0.25,
+          "standing_cutoff_hz": 0.2,
+        },
+      ),
       "action_rate": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.02),
       "controlled_joint_acc": RewardTermCfg(
         func=mdp.joint_acc_l2,
@@ -100,5 +127,11 @@ def make_rewards(
 
 
 def make_terminations():
-  """Keep lower_body fall thresholds; low-height termination is not height control."""
-  return lower_body_terminations()
+  """Check current footstep distance in addition to the lower_body fall thresholds."""
+  return {
+    "footstep_distance": TerminationTermCfg(
+      func=footstep_distance_exceeded,
+      params={"command_name": "footsteps", "max_distance": 1.0},
+    ),
+    **lower_body_terminations(),
+  }

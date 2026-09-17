@@ -7,6 +7,9 @@ from dataclasses import dataclass, field
 
 from g1_lower_rl.footstep_phase import FootstepPhaseCfg
 
+DEFAULT_FOOT_WIDTH = 0.24
+"""Nominal stance width and default sampling centre; G1 zero-joint foot spacing is 0.23701291 m."""
+
 
 def ordered_range(name: str, bounds: tuple[float, float], *, positive: bool = False) -> None:
   """验证区间恰有两个有限且有序的端点，可额外要求端点严格为正"""
@@ -20,14 +23,19 @@ def ordered_range(name: str, bounds: tuple[float, float], *, positive: bool = Fa
 class FootstepSamplerCfg:
   """距离、方向和朝向采样参数，以及平面脚侧与间距约束"""
 
-  distance_range: tuple[float, float] = (0.05, 0.36)
+  distance_range: tuple[float, float] = (0.05, 0.48)
   distance_mean: float = 0.25
   distance_std: float = 0.10
   direction_noise: tuple[float, float] = (-2 * math.pi / 9, 2 * math.pi / 9)
   yaw_noise: tuple[float, float] = (-math.pi / 6, math.pi / 6)
-  min_width: float = 0.10
+  min_width: float = 0.12
   max_width: float = 0.36
   max_yaw_change: float = math.pi / 6
+
+  @property
+  def width_center(self) -> float:
+    """Centre of the symmetric lateral sampling interval, not a hard minimum."""
+    return (self.min_width + self.max_width) / 2
 
   def __post_init__(self) -> None:
     """检查截断正态参数和横向边界，不包含整体方向重采样规则"""
@@ -55,7 +63,7 @@ class RandomCommandCfg:
   direction_range: tuple[float, float] = (-math.pi, math.pi)
   foot_heading_range: tuple[float, float] = (0.0, 0.0)
   command_interval_s: tuple[float, float] = (3.0, 8.0)
-  stop_probability: float = 0.10
+  stop_probability: float = 0.30
   hold_time_s: tuple[float, float] = (2.0, 5.0)
   automatic_commands: bool = True
   automatic_restart: bool = True
@@ -88,7 +96,7 @@ class FootstepManagerCfg:
   frequency_range: tuple[float, float] = (0.8, 1.8)
   initial_frequency: float = 1 / 0.6
   frequency_slew_rate: float = 0.2
-  hold_width: float = 0.22
+  hold_width: float = DEFAULT_FOOT_WIDTH
   stop_deceleration: float = 0.3
   stop_frequency_floor: float = 0.6
   start_acceleration: float = 0.4
