@@ -52,7 +52,7 @@ class RandomCommandSource:
     if request is not None and not self.cfg.frequency_range[0] <= request.frequency <= self.cfg.frequency_range[1]:
       raise ValueError("Request frequency outside source range")
     self.heading_origin = heading_origin
-    self.request = request or GaitRequest(*self._directions(), self.cfg.initial_frequency)
+    self.request = request or GaitRequest(*self._directions(), self.cfg.initial_frequency, walking=not self.cfg.initial_standing)
     self.elapsed = 0.0
     self.rate = 0.0
     self.rate_remaining = 0.0
@@ -89,7 +89,7 @@ class RandomCommandSource:
       raise RuntimeError("Call reset before using command source")
     if not math.isfinite(dt) or dt <= 0 or not math.isfinite(frequency) or frequency < 0:
       raise ValueError("Expected positive dt and nonnegative actual frequency")
-    if mode not in ("walking", "starting", "stopping", "standing"):
+    if mode not in ("walking", "starting", "stopping", "settling", "standing"):
       raise ValueError("Invalid execution mode")
     self.elapsed += dt
     if mode == "standing":

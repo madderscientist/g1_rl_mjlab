@@ -51,7 +51,7 @@ def footstep_env_cfg(play: bool = False):
   cfg.commands = {"footsteps": FootstepCommandCfg(debug_vis=play)}
   joints = SceneEntityCfg("robot", joint_names=WHOLE_BODY_JOINTS, preserve_order=True)
   reference = lower_body_observations()["actor"].terms
-  # 拼接顺序就是部署契约：29角度、29速度、两组IMU各6维、脚步命令14维
+  # 契约：29角度、29速度、两组IMU各6维、相位/频率及双脚支撑基准与两步目标共14维
   terms = {
     "joint_pos": ObservationTermCfg(
       func=joint_state, params={"asset_cfg": joints}, noise=copy.deepcopy(reference["joint_pos"].noise)

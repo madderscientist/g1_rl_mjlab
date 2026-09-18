@@ -35,7 +35,7 @@ main{max-width:1600px;margin:auto;display:grid;grid-template-columns:minmax(0,1f
 .divider{width:1px;height:20px;background:var(--line);margin:0 3px}
 #clock{font-size:12px;margin-left:8px;min-width:75px}
 .mode{font-size:11px;border-left:3px solid var(--left);padding:2px 0 2px 7px;min-width:39px}
-.mode[data-mode=stopping]{border-color:var(--amber)}
+.mode[data-mode=stopping],.mode[data-mode=settling]{border-color:var(--amber)}
 .mode[data-mode=standing]{border-color:#7f8982}
 .mode[data-mode=starting]{border-color:var(--right)}
 .map-wrap{height:425px;position:relative;border:1px solid var(--line);overflow:hidden;background:#f1f4ef}

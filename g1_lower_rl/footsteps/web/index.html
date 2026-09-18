@@ -28,15 +28,15 @@
         <span id="mode" class="mode" data-mode="walking">行走</span>
       </div>
       <div class="map-wrap">
-        <canvas id="map" aria-label="世界坐标系左右脚印与四步预览"></canvas>
+        <canvas id="map" aria-label="世界坐标系左右支撑基准与两步目标"></canvas>
         <div class="map-heading"><span class="eyebrow">FOOTPRINTS / WORLD</span><h2>脚印平面图</h2></div>
         <div class="map-tools">
           <button id="zoom-in" class="icon-button" title="放大" aria-label="放大"><span class="symbol" aria-hidden="true">+</span></button>
           <button id="zoom-out" class="icon-button" title="缩小" aria-label="缩小"><span class="symbol" aria-hidden="true">−</span></button>
           <button id="fit" class="icon-button" title="显示完整轨迹" aria-label="显示完整轨迹"><span class="symbol" aria-hidden="true">↔</span></button>
-          <button id="follow" class="icon-button active" title="跟随四步窗口" aria-label="跟随四步窗口" aria-pressed="true"><span class="symbol" aria-hidden="true">◎</span></button>
+          <button id="follow" class="icon-button active" title="跟随目标窗口" aria-label="跟随目标窗口" aria-pressed="true"><span class="symbol" aria-hidden="true">◎</span></button>
         </div>
-        <div class="map-legend"><span><b class="dot left"></b>L 左脚</span><span><b class="dot right"></b>R 右脚</span><span class="preview-key">四步预览</span></div>
+        <div class="map-legend"><span><b class="dot left"></b>L 左脚</span><span><b class="dot right"></b>R 右脚</span><span class="preview-key">双脚下一步</span></div>
         <div id="selection" class="selection mono" hidden></div>
         <div class="map-bottom"><span id="distance" class="mono">0 次计划落地</span><span id="scale" class="mono">0.5 m</span></div>
       </div>
@@ -112,11 +112,11 @@
       </details>
     </aside>
     <section class="queue-section">
-      <div class="section-heading"><h2>四步输入</h2><div class="segmented" id="frame-tabs"><button class="selected" data-frame="local">支撑参考系</button><button data-frame="world">世界系</button></div><span class="eyebrow">L1 · L2 · R1 · R2</span></div>
+      <div class="section-heading"><h2>脚印目标</h2><div class="segmented" id="frame-tabs"><button class="selected" data-frame="local">支撑参考系</button><button data-frame="world">世界系</button></div><span class="eyebrow">L support · R support · L next · R next</span></div>
       <div class="table-wrap"><table><thead><tr><th>槽位</th><th>目标 ID</th><th>X / m</th><th>Y / m</th><th>Yaw / °</th></tr></thead><tbody id="queue"></tbody></table></div>
     </section>
     <section class="event-section"><div class="section-heading"><h2>指令记录</h2><span id="seed-label" class="eyebrow">SEED 7</span></div><ol id="events"></ol></section>
   </main>
-  <footer><span>MIND YOUR STEPS / 四步预览适配</span><span>G1 · XY + YAW · 20 ms</span></footer>
+  <footer><span>双脚支撑基准 + 两步目标</span><span>G1 · XY + YAW · 20 ms</span></footer>
 </body>
 </html>

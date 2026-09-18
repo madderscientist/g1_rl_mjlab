@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from g1_lower_rl.footstep_phase import FootstepPhaseCfg
 
 DEFAULT_FOOT_WIDTH = 0.24
-"""Nominal stance width and default sampling centre; G1 zero-joint foot spacing is 0.23701291 m."""
+"""名义站距及默认采样中心，G1 全关节为零时的足间距为 0.23701291 米"""
 
 
 def ordered_range(name: str, bounds: tuple[float, float], *, positive: bool = False) -> None:
@@ -34,7 +34,7 @@ class FootstepSamplerCfg:
 
   @property
   def width_center(self) -> float:
-    """Centre of the symmetric lateral sampling interval, not a hard minimum."""
+    """对称横向采样区间的中心，不是硬性最小站距"""
     return (self.min_width + self.max_width) / 2
 
   def __post_init__(self) -> None:
@@ -58,6 +58,7 @@ class RandomCommandCfg:
 
   frequency_range: tuple[float, float] = (0.8, 1.8)
   initial_frequency: float = 1 / 0.6
+  initial_standing: bool = True
   frequency_rate_range: tuple[float, float] = (-0.3, 0.3)
   frequency_rate_interval_s: float = 2.0
   direction_range: tuple[float, float] = (-math.pi, math.pi)
@@ -78,6 +79,8 @@ class RandomCommandCfg:
       ordered_range(name, getattr(self, name), positive=True)
     if not self.frequency_range[0] <= self.initial_frequency <= self.frequency_range[1]:
       raise ValueError("initial_frequency must lie within frequency_range")
+    if not isinstance(self.initial_standing, bool):
+      raise ValueError("initial_standing must be boolean")
     if not self.frequency_rate_range[0] <= 0 <= self.frequency_rate_range[1]:
       raise ValueError("frequency_rate_range must include zero")
     if not math.isfinite(self.frequency_rate_interval_s) or self.frequency_rate_interval_s <= 0:
@@ -97,9 +100,8 @@ class FootstepManagerCfg:
   initial_frequency: float = 1 / 0.6
   frequency_slew_rate: float = 0.2
   hold_width: float = DEFAULT_FOOT_WIDTH
-  stop_deceleration: float = 0.3
-  stop_frequency_floor: float = 0.6
-  start_acceleration: float = 0.4
+  start_duration_s: float = 0.5
+  stop_duration_s: float = 0.5
   contact_confirm_steps: int = 2
   landing_timeout_s: float = 0.5
   require_contact_confirmation: bool = True
@@ -109,13 +111,13 @@ class FootstepManagerCfg:
     ordered_range("frequency_range", self.frequency_range, positive=True)
     if not self.sampler.min_width <= self.hold_width <= self.sampler.max_width:
       raise ValueError("hold_width must lie within the sampler width range")
-    for name in ("control_dt", "frequency_slew_rate", "stop_deceleration", "start_acceleration", "landing_timeout_s"):
+    for name in ("control_dt", "frequency_slew_rate", "start_duration_s", "stop_duration_s", "landing_timeout_s"):
       if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
         raise ValueError(f"{name} must be finite and positive")
     if not self.frequency_range[0] <= self.initial_frequency <= self.frequency_range[1]:
       raise ValueError("initial_frequency must lie within frequency_range")
-    if not 0 < self.stop_frequency_floor <= self.frequency_range[0]:
-      raise ValueError("stop_frequency_floor must be positive and no greater than the walking minimum")
+    if self.stop_duration_s * self.frequency_range[1] > 4.0:
+      raise ValueError("stop_duration_s must fit within the four committed footsteps")
     if not isinstance(self.contact_confirm_steps, int) or self.contact_confirm_steps < 1:
       raise ValueError("contact_confirm_steps must be a positive integer")
     width = self.phase.contact_half_width

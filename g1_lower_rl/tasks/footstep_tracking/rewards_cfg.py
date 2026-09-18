@@ -1,4 +1,4 @@
-"""Initial footstep reward rates; weights need locomotion validation before deployment."""
+"""脚步奖励率初值，部署前仍需通过行走训练验证权重"""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def make_rewards(
   *,
   phase_cfg: FootstepPhaseCfg | None = None,
 ) -> dict[str, RewardTermCfg]:
-  """Use exponential swing accuracy rewards and linear landing/support costs."""
+  """使用指数摆动精度奖励和线性落地、支撑代价"""
   phase_cfg = resolve_phase_cfg(stance_fraction, phase_cfg)
   terms = {
     name: RewardTermCfg(
@@ -64,7 +64,7 @@ def make_rewards(
       ),
       "lower_body_copper_proxy": RewardTermCfg(
         func=rewards.LowerBodyTorqueCost,
-        weight=-2.0,
+        weight=-1.0,
         params={
           "asset_cfg": SceneEntityCfg("robot", actuator_names=list(LOWER_BODY_JOINTS), preserve_order=True),
           "reference_torque": 100.0,
@@ -85,18 +85,18 @@ def make_rewards(
         },
       ),
       "torso_upright": RewardTermCfg(
-        func=mdp.body_orientation_l2,
+        func=rewards.body_tilt_angle_l2,
         weight=-0.5,
         params={"asset_cfg": SceneEntityCfg("robot", body_names=("torso_link",))},
       ),
-      "pelvis_height": RewardTermCfg(
-        func=rewards.pelvis_height_reward,
-        weight=2.0,
+      "head_height": RewardTermCfg(
+        func=rewards.head_height_reward,
+        weight=1.0,
         params={
-          "asset_cfg": SceneEntityCfg("robot", body_names=("pelvis",)),
+          "asset_cfg": SceneEntityCfg("robot", geom_names=("head_collision",)),
           "command_name": command_name,
           "sensor_name": sensor_name,
-          "height_cap": 0.78,
+          "height_cap": 1.254,
         },
       ),
       "pelvis_upright_filtered": RewardTermCfg(
@@ -127,7 +127,7 @@ def make_rewards(
 
 
 def make_terminations():
-  """Check current footstep distance in addition to the lower_body fall thresholds."""
+  """在下肢任务跌倒阈值之外增加当前脚步目标距离检查"""
   return {
     "footstep_distance": TerminationTermCfg(
       func=footstep_distance_exceeded,

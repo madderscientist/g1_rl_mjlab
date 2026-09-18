@@ -3,7 +3,7 @@
 // 按固定元素标识获取页面控件
 const byId = (name) => document.getElementById(name);
 const palette = { left: "#007f78", right: "#d76550", ink: "#25302e", muted: "#717976", grid: "#dfe5dc", amber: "#aa730a" };
-const modes = { walking: "行走", stopping: "收步中", standing: "站立", starting: "起步中" };
+const modes = { walking: "行走", stopping: "收步中", settling: "等待落地", standing: "站立", starting: "起步中" };
 let current = null;
 let session = null;
 let samples = [];
@@ -106,9 +106,9 @@ function render() {
   byId("mode").dataset.mode = current.mode;
   byId("contact-left").classList.toggle("on", current.contacts[0]);
   byId("contact-right").classList.toggle("on", current.contacts[1]);
-  byId("stop").disabled = ["standing", "stopping"].includes(current.mode);
+  byId("stop").disabled = ["standing", "stopping", "settling"].includes(current.mode);
   byId("start").disabled = current.mode !== "standing";
-  byId("pending").textContent = current.mode === "stopping" ? "等待收步 / 双支撑" : "";
+  byId("pending").textContent = current.mode === "settling" ? "等待双脚接触确认" : current.mode === "stopping" ? "等待收步 / 双支撑" : "";
   byId("automation").checked = current.automatic;
   byId("seed-label").textContent = `SEED ${current.seed}`;
   byId("distance").textContent = `${current.landings.length} 次计划落地`;
@@ -131,14 +131,15 @@ function render() {
   const poses = coordinateFrame === "local" ? current.footsteps : current.footsteps_w;
   byId("queue").replaceChildren(...poses.map((pose, index) => {
     const row = document.createElement("tr");
-    row.dataset.side = index < 2 ? "0" : "1";
-    row.classList.toggle("highlight", selectedId === current.future_ids[index]);
-    for (const value of [["L1", "L2", "R1", "R2"][index], `#${current.future_ids[index]}`, pose[0].toFixed(3), pose[1].toFixed(3), (pose[2] * 180 / Math.PI).toFixed(1)]) {
+    const side = current.goal_sides[index];
+    row.dataset.side = String(side);
+    row.classList.toggle("highlight", selectedId === current.goal_ids[index]);
+    for (const value of [["L support", "R support", "L next", "R next"][index], `#${current.goal_ids[index]}`, pose[0].toFixed(3), pose[1].toFixed(3), (pose[2] * 180 / Math.PI).toFixed(1)]) {
       const cell = document.createElement("td");
       cell.textContent = value;
       row.append(cell);
     }
-    row.onclick = () => selectFoot(current.future_ids[index], pose, index < 2 ? 0 : 1, true);
+    row.onclick = () => selectFoot(current.goal_ids[index], pose, side, true);
     return row;
   }));
   byId("events").replaceChildren(...current.events.toReversed().slice(0, 12).map((event) => {
@@ -171,7 +172,7 @@ function surface(id) {
   return { context, width: rect.width, height: rect.height };
 }
 
-// 在同一世界比例尺下绘制历史脚印、当前支撑、四步预览和共同参考系
+// 在同一世界比例尺下绘制历史脚印、双脚支撑基准、两步目标和共同参考系
 function drawMap() {
   const { context, width, height } = surface("map");
   context.fillStyle = "#f1f4ef";
@@ -179,7 +180,7 @@ function drawMap() {
   if (!current) return;
   camera.scale = camera.zoom;
   if (camera.follow) {
-    const poses = [...current.supports, ...current.footsteps_w];
+    const poses = current.footsteps_w;
     camera.x = poses.reduce((sum, pose) => sum + pose[0], 0) / poses.length;
     camera.y = poses.reduce((sum, pose) => sum + pose[1], 0) / poses.length;
     const spanX = Math.max(...poses.map((pose) => pose[0])) - Math.min(...poses.map((pose) => pose[0]));
@@ -212,7 +213,8 @@ function drawMap() {
   const trail = current.landings;
   context.strokeStyle = "#a7b7a7";context.lineWidth = 1.2;context.beginPath();
   trail.forEach((landing, index) => { const point = project(landing.pose); index ? context.lineTo(...point) : context.moveTo(...point); });context.stroke();
-  const future = current.footsteps_w.map((pose, index) => ({ pose, id: current.future_ids[index], side: index < 2 ? 0 : 1, slot: ["L1", "L2", "R1", "R2"][index] })).sort((first, second) => first.id - second.id);
+  const goals = current.footsteps_w.map((pose, index) => ({ pose, id: current.goal_ids[index], side: current.goal_sides[index], slot: ["L support", "R support", "L next", "R next"][index] }));
+  const future = goals.slice(2).sort((first, second) => first.id - second.id);
   context.setLineDash([4, 5]);context.strokeStyle = "#7f8e82";context.beginPath();
   if (trail.length) context.moveTo(...project(trail.at(-1).pose));
   future.forEach((foot, index) => { const point = project(foot.pose); index || trail.length ? context.lineTo(...point) : context.moveTo(...point); });
@@ -252,7 +254,7 @@ function drawMap() {
     if (id !== null) hitTargets.push({ x: screenX, y: screenY, pose, side, id });
   }
   trail.forEach((landing) => foot(landing.pose, landing.side, "history", "", landing.id));
-  current.supports.forEach((pose, side) => foot(pose, side, "support", "", null));
+  goals.slice(0, 2).forEach((item) => foot(item.pose, item.side, "support", `${item.slot} #${item.id}`, item.id));
   future.forEach((item) => foot(item.pose, item.side, "future", `${item.slot} #${item.id}`, item.id));
   const placed = [];
   for (const label of labels) {

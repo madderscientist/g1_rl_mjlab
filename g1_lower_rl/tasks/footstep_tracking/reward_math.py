@@ -1,4 +1,4 @@
-"""Tensor-only reward primitives with left/right ordering and cycle-based timing."""
+"""纯张量奖励原语，固定左右脚顺序并按完整步态周期计时"""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from g1_lower_rl.footstep_phase import FootstepPhaseCfg, resolve_phase_cfg
 def phase_windows(
   phase: torch.Tensor, stance_fraction: float | None = None, *, phase_cfg: FootstepPhaseCfg | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
-  """Return stance masks and swing progress from the shared contact schedule."""
+  """根据共用接触时序返回支撑掩码和摆动进度"""
   cfg = resolve_phase_cfg(stance_fraction, phase_cfg)
   contact_start = phase.new_tensor(cfg.contact_start_rad)
   stance_durations = phase.new_tensor(cfg.stance_fractions)
@@ -30,14 +30,14 @@ def phase_windows(
 
 
 def torque_square_cost(torques: torch.Tensor, weights: torch.Tensor, reference_torque: float = 100.0) -> torch.Tensor:
-  """Weighted torque squared, using one common scale rather than per-axis peak ratings."""
+  """用统一尺度计算加权力矩平方，不按各轴峰值额定力矩归一化"""
   if not math.isfinite(reference_torque) or reference_torque <= 0:
     raise ValueError("reference_torque must be finite and positive")
   return ((torques / reference_torque).square() * weights).sum(dim=-1)
 
 
 def joint_edge_cost(positions: torch.Tensor, limits: torch.Tensor, margin_fraction: float = 0.15) -> torch.Tensor:
-  """Zero in the interior, one per joint at a hard bound, increasing beyond it."""
+  """内部安全区为零，每个关节到达硬边界时代价为一，越界后继续增大"""
   if not 0.0 < margin_fraction < 0.5:
     raise ValueError("margin_fraction must lie in (0, 0.5)")
   lower, upper = limits.unbind(-1)
@@ -48,7 +48,7 @@ def joint_edge_cost(positions: torch.Tensor, limits: torch.Tensor, margin_fracti
 
 
 def footprint_errors(actual: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-  """Planar distance and wrapped yaw error for [..., left/right, x/y/yaw] poses."""
+  """计算按左右脚排列的 XY/yaw 位姿之间的平面距离和最短航向角差"""
   distance = torch.linalg.vector_norm(actual[..., :2] - target[..., :2], dim=-1)
   yaw_delta = actual[..., 2] - target[..., 2]
   yaw_error = torch.atan2(yaw_delta.sin(), yaw_delta.cos())
@@ -61,7 +61,7 @@ def footprint_accuracy_cost(
   position_scale: float,
   yaw_scale: float,
 ) -> torch.Tensor:
-  """Equal-weight linear position and shortest-angle error, without clipping."""
+  """等权组合线性位置误差与最短角差，不截断代价"""
   if not all(math.isfinite(value) and value > 0 for value in (position_scale, yaw_scale)):
     raise ValueError("Tracking scales must be finite and positive")
   wrapped_yaw = torch.atan2(yaw_error.sin(), yaw_error.cos())
@@ -69,12 +69,12 @@ def footprint_accuracy_cost(
 
 
 def swing_tracking_score(error: torch.Tensor, stance: torch.Tensor, std: float = 0.1) -> torch.Tensor:
-  """Exponential accuracy for the scheduled swing foot, without a progress ramp."""
+  """对计划摆动脚计算指数精度奖励，不乘摆动进度斜坡"""
   if not math.isfinite(std) or std <= 0:
     raise ValueError("Swing tracking std must be finite and positive")
   return (torch.exp(-(error / std).square()) * ~stance).sum(-1)
 
 
 def contact_schedule_score(required_contact: torch.Tensor, contact: torch.Tensor) -> torch.Tensor:
-  """Full credit requires all feet to follow the scheduled contact mode."""
+  """所有脚的实际接触都符合计划模式时才给满分"""
   return (required_contact == contact).all(dim=-1).to(torch.float32)

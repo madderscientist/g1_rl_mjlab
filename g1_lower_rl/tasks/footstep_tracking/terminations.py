@@ -1,4 +1,4 @@
-"""Termination checks against the completed footstep execution snapshot."""
+"""依据刚完成控制拍的脚步执行快照检查终止条件"""
 
 import math
 
@@ -8,7 +8,7 @@ from g1_lower_rl.tasks.footstep_tracking.reward_math import phase_windows
 
 
 def footstep_distance_exceeded(env, command_name: str = "footsteps", max_distance: float = 1.0) -> torch.Tensor:
-  """Terminate when any scheduled support foot is too far from its current XY goal."""
+  """任一计划支撑脚距当前执行目标的 XY 距离过大时终止"""
   if not math.isfinite(max_distance) or max_distance <= 0:
     raise ValueError("max_distance must be finite and positive")
   command = env.command_manager.get_term(command_name)

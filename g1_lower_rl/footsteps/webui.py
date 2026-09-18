@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from g1_lower_rl.footstep_contract import FOOTSTEP_SLOTS, PREVIEW_FORMAT
 from g1_lower_rl.footsteps import (
   FootstepCommand,
   FootstepManager,
@@ -115,7 +116,7 @@ class PreviewSession:
     self.random_frequency = True
     self.foot_geometry = load_footprint_geometry()
     feet = [[0.0, cfg.hold_width / 2, 0.0], [0.0, -cfg.hold_width / 2, 0.0]]
-    self.manager.reset(feet, self.source.reset(request=GaitRequest(frequency=initial)))
+    self.manager.reset(feet, self.source.reset(request=GaitRequest(frequency=initial, walking=False)))
     self.history: deque = deque(maxlen=9000)
     self.landings: deque = deque(maxlen=600)
     self.events: deque = deque(maxlen=200)
@@ -145,11 +146,16 @@ class PreviewSession:
     command = self.manager.command()
     cfg = self.manager.cfg
     maximum = cfg.sampler.distance_range[1]
+    support_ids = [next((landing["id"] for landing in reversed(self.landings) if landing["side"] == side), side)
+             for side in (0, 1)]
     return {
       **self.sample(command),
       "footsteps": command.footsteps.tolist(),
       "footsteps_w": command.footsteps_w.tolist(),
       "future_ids": command.future_ids.tolist(),
+      "future_sides": command.future_sides.tolist(),
+      "goal_ids": support_ids + command.future_ids.tolist(),
+      "goal_sides": [0, 1, 0, 1],
       "anchor_w": command.anchor_w.tolist(),
       "supports": self.manager.supports.tolist(),
       "foot_geometry": copy.deepcopy(self.foot_geometry),
@@ -174,14 +180,14 @@ class PreviewSession:
     count = integer(frames, "frames", 1, 100)
     samples = []
     for _ in range(count):
-      before = self.manager.command()
+      before_mode = self.manager.mode
+      pending = list(self.manager.queue)
       update = self.manager.advance()
       for side in update.landed_sides:
-        slot = side * 2
-        # 已消费目标必须从旧窗口读取，新窗口中的同槽位已经后移
-        pose = before.footsteps_w[slot].tolist()
-        self.landings.append({"time": self.manager.elapsed, "side": side, "pose": pose, "id": int(before.future_ids[slot])})
-      if before.mode != update.command.mode:
+        landed = next(step for step in pending if step.side == side)
+        self.landings.append({"time": self.manager.elapsed, "side": side,
+                              "pose": landed.pose_w.tolist(), "id": int(landed.target_id)})
+      if before_mode != update.command.mode:
         self.record_event(update.command.mode)
       request = self.source.advance(
         self.manager.cfg.control_dt,
@@ -234,7 +240,8 @@ class PreviewSession:
   def export(self) -> dict:
     """导出配置与保留范围内的轨迹记录，不承诺还原被截断的历史"""
     return {
-      "format": "footstep-preview-v2",
+      "format": PREVIEW_FORMAT,
+      "footstep_slots": list(FOOTSTEP_SLOTS),
       "planning_only": True,
       "seed": self.seed,
       "config": {"manager": asdict(self.manager.cfg), "source": asdict(self.source.cfg)},

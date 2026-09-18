@@ -22,7 +22,7 @@ def footstep_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       max_grad_norm=1.0,
     ),
     experiment_name="g1_footstep_tracking",
-    # 64拍覆盖慢频率下的一整个左右周期，保持默认32维GRU隐藏状态
+    # 64拍覆盖慢频率下的一整个左右周期
     num_steps_per_env=64,
     max_iterations=10001,
     save_interval=100,
