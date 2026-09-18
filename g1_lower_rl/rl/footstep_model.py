@@ -1,4 +1,4 @@
-"""Deployable full-body observations for a lower-body footstep GRU policy."""
+"""供下肢脚步 GRU 策略使用的可部署全身观测接口"""
 
 from __future__ import annotations
 
@@ -18,13 +18,9 @@ from tensordict import TensorDict
 from torch import nn
 
 from g1_lower_rl.assets import LOWER_BODY_JOINTS, WHOLE_BODY_JOINTS, get_robot_cfg
+from g1_lower_rl.footstep_contract import ACTION_DIM, CONTRACT_VERSION, ENCODED_OBS_DIM, FOOTSTEP_SLOTS, RAW_OBS_DIM
 from g1_lower_rl.footstep_phase import FootstepPhaseCfg, resolve_phase_cfg
 
-CONTRACT_VERSION = "g1_footstep_gru_v1"
-RAW_OBS_DIM = 84
-ENCODED_OBS_DIM = 89
-ACTION_DIM = 15
-FOOTSTEP_SLOTS = ("L1", "L2", "R1", "R2")
 OBSERVATION_LAYOUT = (
   ("joint_pos", 0, 29, "rad"),
   ("joint_vel", 29, 58, "rad/s"),
@@ -68,7 +64,7 @@ def nominal_action_parameters() -> dict[str, list[float]]:
 
 
 class FootstepObservationEncoder(nn.Module):
-  """Encode [..., 84] raw observations as [..., 89] continuous features."""
+  """将形状为 [..., 84] 的原始观测编码为 [..., 89] 的连续特征"""
 
   def __init__(self, default_joint_pos: Sequence[float] | None = None) -> None:
     super().__init__()
@@ -81,8 +77,8 @@ class FootstepObservationEncoder(nn.Module):
     self.register_buffer("default_joint_pos", defaults)
 
   def forward(self, obs: torch.Tensor) -> torch.Tensor:
-    if obs.shape[-1] != 84:
-      raise ValueError("Footstep observations must have exactly 84 raw features")
+    if obs.shape[-1] != RAW_OBS_DIM:
+      raise ValueError(f"Footstep observations must have exactly {RAW_OBS_DIM} raw features")
     footprints = obs[..., 72:84].unflatten(-1, (4, 3))
     headings = footprints[..., 2:3]
     encoded_footprints = torch.cat((footprints[..., :2], headings.sin(), headings.cos()), dim=-1).flatten(-2)
@@ -101,7 +97,7 @@ class FootstepObservationEncoder(nn.Module):
 
 
 class FootstepActor(RNNModel):
-  """rsl_rl recurrent actor with an explicit raw-observation deployment boundary."""
+  """以原始观测作为明确部署输入边界的 rsl_rl 循环策略网络"""
 
   def __init__(
     self,
@@ -109,12 +105,12 @@ class FootstepActor(RNNModel):
     obs_groups: dict[str, list[str]],
     obs_set: str,
     output_dim: int,
-    hidden_dims: tuple[int, ...] | list[int] = (256, 128),
+    hidden_dims: tuple[int, ...] | list[int] = (256, 256, 128),
     activation: str = "elu",
     obs_normalization: bool = True,
     distribution_cfg: dict | None = None,
     rnn_type: str = "gru",
-    rnn_hidden_dim: int = 32,
+    rnn_hidden_dim: int = 64,
     rnn_num_layers: int = 1,
     default_joint_pos: Sequence[float] | None = None,
     phase_cfg: FootstepPhaseCfg | dict | None = None,
@@ -195,13 +191,16 @@ class FootstepActor(RNNModel):
         "encoded_fields": ["dx", "dy", "sin(dtheta)", "cos(dtheta)"],
         "reference_frame": "one common frozen stance-foot heading frame; x forward, y left, z up",
         "heading": "foot sole yaw, positive counterclockwise about +z",
-        "preview": "two unconsumed future landings per foot; current support targets are external",
-        "coordinates": "all four targets relative to the same anchor, not chained deltas",
+        "support": "last planned landing per foot, initialized from reset-time measured feet; frozen during swing, never live foot poses",
+        "preview": "first unconsumed queued landing per foot, including the currently executing swing target; only two future steps",
+        "side_order": "fixed left/right within each pair; never chronological order",
+        "update": "liftoff leaves all world slots unchanged; at planned touchdown move that foot's next to support and advance its next goal",
+        "coordinates": "both support poses and both landing goals relative to the same frozen anchor, not chained deltas",
         "reanchor": "transform unchanged physical targets using an estimated new anchor",
         "requires_external_coordinate_conversion": True,
         "all_slots_required": True,
         "zero_progress": "repeat each foot's fixed landing pose; f>0 marches, f=0 holds double support",
-        "standing_slots": "at f=0 use [left_hold, left_hold, right_hold, right_hold] in the same frozen anchor",
+        "standing_slots": "at f=0 use [left_hold, right_hold, left_hold, right_hold]; holds do not follow measured foot drift",
       },
       "phase": {
         "raw_range_rad": [0.0, 2 * math.pi],
@@ -246,7 +245,7 @@ class FootstepActor(RNNModel):
 
 
 def export_footstep_policy(model: FootstepActor, path: str | Path) -> Path:
-  """Export deterministic ONNX and a matching JSON contract without changing the live actor."""
+  """导出确定性 ONNX 模型及配套 JSON 契约，不修改当前策略网络"""
   import onnx
 
   destination = Path(path)
@@ -276,11 +275,11 @@ def export_footstep_policy(model: FootstepActor, path: str | Path) -> Path:
 @dataclass
 class FootstepModelCfg(RslRlModelCfg):
   class_name: str = "g1_lower_rl.rl.footstep_model:FootstepActor"
-  hidden_dims: tuple[int, ...] = (256, 128)
+  hidden_dims: tuple[int, ...] = (256, 256, 128)
   activation: str = "elu"
   obs_normalization: bool = True
   rnn_type: str = "gru"
-  rnn_hidden_dim: int = 32
+  rnn_hidden_dim: int = 64
   rnn_num_layers: int = 1
   default_joint_pos: tuple[float, ...] | None = None
   phase_cfg: FootstepPhaseCfg = field(default_factory=FootstepPhaseCfg)

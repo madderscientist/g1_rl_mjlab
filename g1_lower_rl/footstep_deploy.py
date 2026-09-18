@@ -1,4 +1,4 @@
-"""CPU ONNX inference only; no simulator, phase scheduler, or hardware driver."""
+"""仅提供 CPU 上的 ONNX 推理，不包含仿真器、相位调度器或硬件驱动"""
 
 from __future__ import annotations
 
@@ -9,12 +9,13 @@ import numpy as np
 import onnxruntime as ort
 from numpy.typing import ArrayLike
 
+from g1_lower_rl.footstep_contract import ACTION_DIM, CONTRACT_VERSION, FOOTSTEP_SLOTS, RAW_OBS_DIM
 from g1_lower_rl.footstep_phase import FootstepPhaseCfg
 
 
 def validate_footstep_observation(obs: np.ndarray) -> None:
-  if obs.shape != (1, 84) or not np.isfinite(obs).all():
-    raise ValueError("Expected finite raw observations with shape (1, 84)")
+  if obs.shape != (1, RAW_OBS_DIM) or not np.isfinite(obs).all():
+    raise ValueError(f"Expected finite raw observations with shape (1, {RAW_OBS_DIM})")
   if not 0 <= obs[0, 70] < 2 * np.pi:
     raise ValueError("Phase must be wrapped into [0, 2*pi)")
   if obs[0, 71] < 0:
@@ -33,7 +34,7 @@ def pack_footstep_observation(
   frequency: float,
   footsteps: ArrayLike,
 ) -> np.ndarray:
-  """Pack calibrated raw sensors and [L1,L2,R1,R2] XY/yaw commands without normalization."""
+  """拼接原始传感器数据及按左支撑、右支撑、左下一落点、右下一落点排列的 XY/yaw 位姿"""
   parts = []
   for name, value, shape in (
     ("joint_pos", joint_pos, (29,)),
@@ -55,7 +56,7 @@ def pack_footstep_observation(
 
 
 class FootstepPolicy:
-  """One recurrent stream per robot, returning (normalized action, joint position target)."""
+  """为每台机器人维护独立循环状态，返回归一化动作和关节位置目标"""
 
   def __init__(self, path: str | Path) -> None:
     options = ort.SessionOptions()
@@ -66,8 +67,10 @@ class FootstepPolicy:
     if "footstep_contract" not in metadata:
       raise ValueError("ONNX has no footstep_contract metadata; use export_footstep_policy")
     self.contract = json.loads(metadata["footstep_contract"])
-    if self.contract.get("version") != "g1_footstep_gru_v1" or self.contract.get("dtype") != "float32":
+    if self.contract.get("version") != CONTRACT_VERSION or self.contract.get("dtype") != "float32":
       raise ValueError("Unsupported footstep policy contract")
+    if self.contract.get("footsteps", {}).get("slots") != list(FOOTSTEP_SLOTS):
+      raise ValueError("Expected fixed left/right support and next landing slots")
     schedule = self.contract.get("phase", {}).get("contact_schedule")
     if schedule is not None and schedule.get("parameterization") != "stance_centers_shared_half_width_v1":
       raise ValueError("Unsupported legacy phase-window metadata; re-export with the correct stance-center configuration")
@@ -94,8 +97,8 @@ class FootstepPolicy:
       raise ValueError("Expected obs/h_in inputs and actions/h_out outputs")
     hidden_shape = inputs["h_in"]
     if (
-      inputs["obs"] != [1, 84]
-      or outputs["actions"] != [1, 15]
+      inputs["obs"] != [1, RAW_OBS_DIM]
+      or outputs["actions"] != [1, ACTION_DIM]
       or outputs["h_out"] != hidden_shape
       or len(hidden_shape) != 3
       or hidden_shape[1] != 1

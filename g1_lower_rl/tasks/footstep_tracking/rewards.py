@@ -1,4 +1,4 @@
-"""mjlab reward terms; goals are supplied by a separate footstep command provider."""
+"""适配 mjlab 的奖励项，目标由独立脚步命令提供器发布"""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from g1_lower_rl.footstep_phase import FootstepPhaseCfg, resolve_phase_cfg
 from g1_lower_rl.tasks.footstep_tracking.reward_math import (
   contact_schedule_score,
   footprint_accuracy_cost,
-  footprint_errors,
   joint_edge_cost,
   phase_windows,
   swing_tracking_score,
@@ -29,7 +28,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class FootstepRewardState:
-  """Pre-queue-advance snapshot, ordered [left, right], in world coordinates."""
+  """队列推进前的世界系执行快照，固定按左脚、右脚排列"""
 
   phase: torch.Tensor
   targets_w: torch.Tensor
@@ -57,7 +56,7 @@ class FootstepRewardState:
 
 
 class LowerBodyTorqueCost:
-  """Sum of actual actuator torques squared over exactly the 15 controlled joints."""
+  """仅对15个受控关节对应的实际执行器力矩平方求和"""
 
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv) -> None:
     asset_cfg = cfg.params["asset_cfg"]
@@ -86,26 +85,36 @@ class LowerBodyTorqueCost:
     return torque_square_cost(torques, self.weights, reference_torque)
 
 
-def pelvis_height_reward(
+def body_tilt_angle_l2(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+  """计算相对竖直方向的弧度倾角平方，不受世界航向角影响"""
+  data = env.scene[asset_cfg.name].data
+  orientation = data.body_link_quat_w[:, asset_cfg.body_ids].squeeze(1)
+  gravity = quat_apply_inverse(orientation, data.gravity_vec_w)
+  angle = torch.atan2(torch.linalg.vector_norm(gravity[:, :2], dim=-1), -gravity[:, 2])
+  return angle.square()
+
+
+def head_height_reward(
   env: ManagerBasedRlEnv,
   asset_cfg: SceneEntityCfg,
   command_name: str = "footsteps",
   sensor_name: str = "feet_ground_contact",
-  height_cap: float = 0.78,
+  height_cap: float = 1.254,
 ) -> torch.Tensor:
-  """Increase with pelvis height above ground, capped and disabled in flight or on failure."""
+  """奖励头部几何体的离地高度，腾空或失败时不计奖励"""
   if not math.isfinite(height_cap) or height_cap <= 0:
     raise ValueError("height_cap must be finite and positive")
   state = env.command_manager.get_term(command_name).reward_state
-  pelvis_z = env.scene[asset_cfg.name].data.body_link_pos_w[:, asset_cfg.body_ids, 2].squeeze(-1)
-  height = pelvis_z - state.ground_height.mean(-1)
+  data = env.scene[asset_cfg.name].data
+  head_z = data.geom_pos_w[:, asset_cfg.geom_ids, 2].squeeze(-1)
+  height = head_z - state.ground_height.mean(-1)
   supported = (env.scene[sensor_name].data.found > 0).any(-1)
   valid = supported & ~env.termination_manager.terminated
   return (height / height_cap).clamp(0.0, 1.0) * valid
 
 
 class FilteredPelvisUpright:
-  """Penalize the low-pass pelvis gravity vector, adapting the filter to cycle frequency."""
+  """按步态频率调整低通滤波器，惩罚滤波后的骨盆重力向量偏斜"""
 
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv) -> None:
     asset_cfg = cfg.params["asset_cfg"]
@@ -139,22 +148,22 @@ class FilteredPelvisUpright:
     cutoff = torch.where(frequency > 0, frequency * cutoff_ratio, standing_cutoff_hz)
     alpha = -torch.expm1(-2 * math.pi * cutoff * env.step_dt)
     fresh = ~self.initialized
-    self.filtered_gravity[fresh] = gravity[fresh]
+    self.filtered_gravity.copy_(torch.where(fresh.unsqueeze(-1), gravity, self.filtered_gravity))
     update = self.last_step != env.common_step_counter
     filtered = self.filtered_gravity + alpha.unsqueeze(-1) * (gravity - self.filtered_gravity)
-    self.filtered_gravity[update] = filtered[update]
-    self.initialized[update] = True
-    self.last_step[update] = env.common_step_counter
+    self.filtered_gravity.copy_(torch.where(update.unsqueeze(-1), filtered, self.filtered_gravity))
+    self.initialized |= update
+    self.last_step.masked_fill_(update, env.common_step_counter)
     return self.filtered_gravity[:, :2].square().sum(-1)
 
 
 def joint_zero_l2(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-  """Absolute joint angle penalty; deliberately not relative to the default pose."""
+  """惩罚绝对关节角，不使用相对默认姿态的偏差"""
   return env.scene[asset_cfg.name].data.joint_pos[:, asset_cfg.joint_ids].square().sum(-1)
 
 
 class JointEdgeCost:
-  """Soft margin against the actual hard joint limits, not the nominal pose."""
+  """对实际关节硬限位设置软边缘代价，不约束名义姿态"""
 
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv) -> None:
     asset_cfg = cfg.params["asset_cfg"]
@@ -172,15 +181,16 @@ class JointEdgeCost:
 
 
 def fall_cost(env: ManagerBasedRlEnv) -> torch.Tensor:
-  """A terminal event cost, independent of dt; timeouts are not falls."""
+  """与控制步长无关的终止事件代价，时间上限截断不算跌倒"""
   return env.termination_manager.terminated.to(torch.float32) / env.step_dt
 
 
 class FootstepReward:
-  """Swing accuracy rewards and linear stance costs, including latched landing error."""
+  """锁存计划落脚误差，初始支撑只使用实时误差"""
 
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv) -> None:
-    if cfg.params["component"] not in {
+    self.component = cfg.params["component"]
+    if self.component not in {
       "landing", "support", "swing_position", "swing_yaw", "schedule", "clearance", "slip"
     }:
       raise ValueError("Unknown footstep reward component")
@@ -188,19 +198,25 @@ class FootstepReward:
     asset = env.scene[asset_cfg.name]
     if [asset.site_names[index] for index in asset_cfg.site_ids] != ["left_foot", "right_foot"]:
       raise ValueError("Foot sites must be ordered [left_foot, right_foot]")
+    if self.component != "landing":
+      return
     shape = (env.num_envs, 2)
     self.last_ids = torch.full(shape, -1, dtype=torch.long, device=env.device)
     self.saw_air = torch.zeros(shape, dtype=torch.bool, device=env.device)
     self.previous_contact = torch.ones_like(self.saw_air)
     self.landed = torch.zeros_like(self.saw_air)
+    self.landing_expected = torch.zeros_like(self.saw_air)
     self.landing_cost = torch.zeros(shape, device=env.device)
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if self.component != "landing":
+      return
     selected = slice(None) if env_ids is None else env_ids
     self.last_ids[selected] = -1
     self.saw_air[selected] = False
     self.previous_contact[selected] = True
     self.landed[selected] = False
+    self.landing_expected[selected] = False
     self.landing_cost[selected] = 0.0
 
   def __call__(
@@ -220,6 +236,8 @@ class FootstepReward:
     swing_yaw_std: float = 0.1,
     landing_miss_cost: float = 1.0,
   ) -> torch.Tensor:
+    if component != self.component:
+      raise ValueError("Reward component must match its construction config")
     state = env.command_manager.get_term(command_name).reward_state
     if not isinstance(state, FootstepRewardState):
       raise TypeError("Footstep command must publish a FootstepRewardState as reward_state")
@@ -228,30 +246,45 @@ class FootstepReward:
     if not math.isfinite(landing_miss_cost) or landing_miss_cost < 0:
       raise ValueError("landing_miss_cost must be finite and nonnegative")
     timing = resolve_phase_cfg(stance_fraction, phase_cfg)
+    contact = env.scene[sensor_name].data.found > 0
+    if contact.shape != (env.num_envs, 2):
+      raise ValueError("Contact sensor must provide [num_envs, 2] in left/right foot order")
+    data = env.scene[asset_cfg.name].data
+    if component == "slip":
+      speed = torch.linalg.vector_norm(data.site_lin_vel_w[:, asset_cfg.site_ids, :2], dim=-1)
+      yaw_rate = data.site_ang_vel_w[:, asset_cfg.site_ids, 2].abs()
+      return ((speed + 0.05 * yaw_rate) * contact).sum(-1)
     stance, swing_progress = phase_windows(state.phase, phase_cfg=timing)
     standing = state.frequency == 0
     stance = stance | standing.unsqueeze(-1)
-    swing_progress = torch.where(standing.unsqueeze(-1), 0.0, swing_progress)
-    contact = env.scene[sensor_name].data.found > 0
-    if contact.shape != stance.shape:
-      raise ValueError("Contact sensor must provide [num_envs, 2] in left/right foot order")
-    data = env.scene[asset_cfg.name].data
-    position = data.site_pos_w[:, asset_cfg.site_ids]
+    if component == "schedule":
+      return contact_schedule_score(stance, contact)
+    if component == "clearance":
+      position = data.site_pos_w[:, asset_cfg.site_ids]
+      swing_progress = torch.where(standing.unsqueeze(-1), 0.0, swing_progress)
+      target_height = clearance * torch.sin(torch.pi * swing_progress)
+      height = position[..., 2] - state.ground_height
+      return (((target_height - height).clamp_min(0) / clearance).square() * ~stance).sum(-1)
+    if component == "swing_position":
+      position = data.site_pos_w[:, asset_cfg.site_ids]
+      distance = torch.linalg.vector_norm(position[..., :2] - state.targets_w[..., :2], dim=-1)
+      return swing_tracking_score(distance, stance, swing_position_std)
     quaternion = data.site_quat_w[:, asset_cfg.site_ids]
     scalar, roll, pitch, yaw = quaternion.unbind(-1)
     foot_yaw = torch.atan2(2 * (scalar * yaw + roll * pitch), 1 - 2 * (pitch.square() + yaw.square()))
-    actual = torch.cat((position[..., :2], foot_yaw.unsqueeze(-1)), dim=-1)
-    distance, yaw_error = footprint_errors(actual, state.targets_w)
-
-    if component == "swing_position":
-      return swing_tracking_score(distance, stance, swing_position_std)
+    yaw_delta = foot_yaw - state.targets_w[..., 2]
+    yaw_error = torch.atan2(yaw_delta.sin(), yaw_delta.cos())
     if component == "swing_yaw":
       return swing_tracking_score(yaw_error, stance, swing_yaw_std)
+    position = data.site_pos_w[:, asset_cfg.site_ids]
+    distance = torch.linalg.vector_norm(position[..., :2] - state.targets_w[..., :2], dim=-1)
     if component == "landing":
       changed = (self.last_ids != state.target_ids) | standing.unsqueeze(-1)
-      self.landed[changed] = False
-      self.saw_air[changed] = False
-      self.landing_cost[changed] = 0.0
+      self.landing_expected.copy_(torch.where(changed, (self.last_ids >= 0) & ~standing.unsqueeze(-1), self.landing_expected))
+      self.landing_expected |= ~stance
+      self.landed &= ~changed
+      self.saw_air &= ~changed
+      self.landing_cost.masked_fill_(changed, 0.0)
       self.saw_air |= ~contact & ~stance
       first_contact = contact & ~self.previous_contact & self.saw_air & ~self.landed
       touchdown = state.phase.new_tensor([timing.left_stance_phase, timing.right_stance_phase])
@@ -263,26 +296,13 @@ class FootstepReward:
       )
       permitted = distance_to_touchdown <= allowed_window
       cost = footprint_accuracy_cost(distance, yaw_error, position_std, yaw_std)
-      self.landing_cost[first_contact] = (cost + ~permitted * landing_miss_cost)[first_contact]
+      self.landing_cost.copy_(torch.where(first_contact, cost + ~permitted * landing_miss_cost, self.landing_cost))
       self.landed |= first_contact
       self.previous_contact.copy_(contact)
       self.last_ids.copy_(state.target_ids)
-      landing_cost = torch.where(self.landed, self.landing_cost, cost + landing_miss_cost)
-      count = stance.sum(-1).clamp_min(1)
-      landing = (landing_cost * stance).sum(-1) / count
-      hold = (cost * stance).sum(-1) / count
-      return torch.where(standing, hold, landing)
+      landing_cost = torch.where(self.landed, self.landing_cost, cost + self.landing_expected * landing_miss_cost)
+      return (torch.where(standing.unsqueeze(-1), cost, landing_cost) * stance).sum(-1) / stance.sum(-1).clamp_min(1)
     if component == "support":
       cost = footprint_accuracy_cost(distance, yaw_error, position_std, yaw_std)
       return (cost * stance).sum(-1) / stance.sum(-1).clamp_min(1)
-    if component == "schedule":
-      return contact_schedule_score(stance, contact)
-    if component == "clearance":
-      target_height = clearance * torch.sin(torch.pi * swing_progress)
-      height = position[..., 2] - state.ground_height
-      return (((target_height - height).clamp_min(0) / clearance).square() * ~stance).sum(-1)
-    if component == "slip":
-      speed = torch.linalg.vector_norm(data.site_lin_vel_w[:, asset_cfg.site_ids, :2], dim=-1)
-      yaw_rate = data.site_ang_vel_w[:, asset_cfg.site_ids, 2].abs()
-      return ((speed + 0.05 * yaw_rate) * contact).sum(-1)
     raise ValueError(f"Unknown component {component}")

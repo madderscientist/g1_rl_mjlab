@@ -1,4 +1,4 @@
-"""单机器人四步预览、限速相位时钟与停走状态管理"""
+"""单机器人四步内部计划、双脚支撑基准加各一步目标及停走状态管理"""
 
 from __future__ import annotations
 
@@ -35,13 +35,14 @@ class ExecutionSnapshot:
 
 @dataclass(frozen=True)
 class FootstepCommand:
-  """下一控制拍的相位、频率及按 L1/L2/R1/R2 排列的四步输入"""
+  """四槽位固定为左支撑基准、右支撑基准、左下一落点、右下一落点"""
 
   phase: float
   frequency: float
   footsteps: np.ndarray
   footsteps_w: np.ndarray
   future_ids: np.ndarray
+  future_sides: np.ndarray
   anchor_w: np.ndarray
   required_contact: np.ndarray
   mode: str
@@ -82,7 +83,7 @@ class FootstepManager:
 
   def _new_step(self, side: int, previous: np.ndarray) -> Footstep:
     """分配新目标编号，行走时采样新落点，停止或站立时复用终止落点"""
-    if self.mode in ("stopping", "standing"):
+    if self.mode in ("stopping", "settling", "standing"):
       target = self.terminal_feet[side].copy()
     else:
       target = self.sampler.sample(previous, side)
@@ -108,31 +109,36 @@ class FootstepManager:
     feet_w: ArrayLike,
     request: GaitRequest | None = None,
   ) -> FootstepCommand:
-    """用左右足端位姿和统一意图重建四步，默认沿初始航向匀频行走"""
+    """用实测脚位重建站立目标，默认频率为零；显式意图可覆盖初态"""
     feet = pose_array(feet_w, (2, 3))
     feet[:, 2] = wrap_angle(feet[:, 2])
     heading = math.atan2(np.sin(feet[:, 2]).sum(), np.cos(feet[:, 2]).sum())
-    request = request or GaitRequest(heading, heading, self.cfg.initial_frequency)
+    request = request or GaitRequest(heading, heading, self.cfg.initial_frequency, walking=False)
     self._validate_request(request)
     self.request = request
     self.sampler.set_direction(request.movement_direction, request.foot_heading)
     standing = not request.walking
+    # 两个双支撑中心等概率覆盖，下一抬脚侧是该落地中心的异侧
+    stance_side = int(self.sampler.rng.random() >= 0.5) if standing else 1
     self.mode = "standing" if standing else "walking"
     self.frequency = 0.0 if standing else request.frequency
     self.elapsed = 0.0
-    self.phase = self.cfg.phase.right_stance_phase if standing else self.cfg.phase.liftoff_rad[0]
+    self.phase = (self.cfg.phase.left_stance_phase, self.cfg.phase.right_stance_phase)[stance_side] if standing else self.cfg.phase.liftoff_rad[0]
     self.supports = feet
     self.targets = feet.copy()
     self.target_ids = np.array([0, 1], dtype=np.int64)
     self.next_id = 2
     self.terminal_feet = feet.copy()
-    self.anchor = feet[1].copy()
+    self.anchor = feet[stance_side].copy()
     self.pending_anchor_side = None
     self.contact_count = 0
     self.stop_target_id = None
-    self.stop_floor = self.cfg.stop_frequency_floor
     self.stop_wait_started = None
-    self._fill_queue(0)
+    self.stop_phase = 0.0
+    self.stop_ramp_start = 0.0
+    self.stop_initial_frequency = 0.0
+    self.start_progress = 0.0
+    self._fill_queue(1 - stance_side)
     if not standing:
       self.targets[0] = self.queue[0].pose_w
       self.target_ids[0] = self.queue[0].target_id
@@ -163,23 +169,35 @@ class FootstepManager:
     self.apply_request(replace(self.request, movement_direction=movement_direction, foot_heading=foot_heading))
 
   def request_stop(self) -> None:
-    """保留承诺四步并规划收步，进入减速流程而非立即将频率置零"""
+    """保留承诺四步，末段减速对齐收脚相位，再冻结并等待双接触确认"""
     self._require_ready()
     self.request = replace(self.request, walking=False)
-    if self.mode in ("stopping", "standing"):
+    if self.mode in ("stopping", "settling", "standing"):
       return
-    self.terminal_feet = self.supports.copy()
-    for step in self.queue:
-      self.terminal_feet[step.side] = step.pose_w
     last = self.queue[-1]
+    self.terminal_feet = np.repeat(last.pose_w[None, :], 2, axis=0)
     closing_side = 1 - last.side
     sign = 1 if closing_side == 0 else -1
     self.terminal_feet[closing_side] = from_local([0.0, sign * self.cfg.hold_width, 0.0], last.pose_w)
     # 首个新追加目标负责收步，已经发布的四步仍按原计划执行
     self.stop_target_id = self.next_id
     self.stop_wait_started = None
-    self.stop_floor = min(self.frequency, self.cfg.stop_frequency_floor)
+    center = (self.cfg.phase.left_stance_phase, self.cfg.phase.right_stance_phase)[closing_side]
+    closing_touchdown = center + (math.floor((self.phase - center) / (2 * math.pi)) + 3) * (2 * math.pi)
+    self.stop_phase = closing_touchdown + 0.5 * self.cfg.phase.contact_half_width
+    self.stop_initial_frequency = self.frequency
+    self.stop_ramp_start = self.elapsed + (self.stop_phase - self.phase) / (2 * math.pi * self.frequency) - 0.5 * self.cfg.stop_duration_s
     self.mode = "stopping"
+    self.frequency = self._stop_frequency()
+
+  def _stop_frequency(self) -> float:
+    """计算下一控制拍内连续末段减速曲线的平均频率"""
+    duration, dt = self.cfg.stop_duration_s, self.cfg.control_dt
+    ramp_before = min(max(self.elapsed - self.stop_ramp_start, 0.0), duration)
+    ramp_after = min(max(self.elapsed + dt - self.stop_ramp_start, 0.0), duration)
+    coast = min(max(self.stop_ramp_start - self.elapsed, 0.0), dt)
+    ramp = (ramp_after - ramp_before) * (1.0 - (ramp_after + ramp_before) / (2 * duration))
+    return self.stop_initial_frequency * (coast + ramp) / dt
 
   def set_frequency(self, frequency: float) -> None:
     """设置正频率执行目标，随机与手动模式由外部指令源决定"""
@@ -187,7 +205,7 @@ class FootstepManager:
     self.apply_request(replace(self.request, frequency=frequency))
 
   def request_start(self) -> None:
-    """从站立恢复正频率并重建预览，保留冻结相位及起脚前的支撑目标"""
+    """从站立按固定时长升至请求频率，重建预览并保留相位及起脚前支撑目标"""
     self._require_ready()
     self.request = replace(self.request, walking=True)
     if self.mode != "standing":
@@ -199,7 +217,8 @@ class FootstepManager:
     touchdown_distance, first_side = min((distance if distance > 1e-10 else 2 * math.pi, side) for distance, side in candidates)
     liftoff_distance = (self.cfg.phase.liftoff_rad[first_side] - self.phase) % (2 * math.pi)
     self.mode = "starting"
-    self.frequency = min(self.cfg.start_acceleration * self.cfg.control_dt, self.cfg.initial_frequency)
+    self.start_progress = min(self.cfg.control_dt / self.cfg.start_duration_s, 1.0)
+    self.frequency = self.request.frequency * self.start_progress
     self.stop_target_id = None
     self.stop_wait_started = None
     # 若落地中心先于下一次起脚到来，必须保留原地目标而不是提前消费新步
@@ -208,17 +227,17 @@ class FootstepManager:
   def command(self) -> FootstepCommand:
     """返回当前命令副本，将世界队列统一转换到冻结参考系"""
     self._require_ready()
-    # 内部队列按时间排列，观测则将每只脚的两个未来目标放在一起
-    ordered = sorted(self.queue, key=lambda step: (step.side, step.target_id))
-    world = np.stack([step.pose_w for step in ordered])
+    ordered = [next(step for step in self.queue if step.side == side) for side in (0, 1)]
+    world = np.concatenate((self.supports, np.stack([step.pose_w for step in ordered])), axis=0)
     return FootstepCommand(
       phase=self.phase % (2 * math.pi),
       frequency=self.frequency,
       footsteps=to_local(world, self.anchor).astype(np.float32),
       footsteps_w=world,
       future_ids=np.array([step.target_id for step in ordered], dtype=np.int64),
+      future_sides=np.array([step.side for step in ordered], dtype=np.int64),
       anchor_w=self.anchor.copy(),
-      required_contact=np.ones(2, dtype=bool) if self.mode == "standing" else self._contacts_at(self.phase),
+      required_contact=np.ones(2, dtype=bool) if self.mode in ("settling", "standing") else self._contacts_at(self.phase),
       mode=self.mode,
     )
 
@@ -250,6 +269,8 @@ class FootstepManager:
     self.contact_count = self.contact_count + 1 if contact is not None and contact.all() else 0
     old_frequency = self.frequency
     end_phase = self.phase + 2 * math.pi * old_frequency * dt
+    if self.mode == "stopping" and self.elapsed + dt >= self.stop_ramp_start + self.cfg.stop_duration_s - 1e-10:
+      end_phase = self.stop_phase
     # 奖励属于刚结束的物理拍，快照必须早于落地或起脚引起的目标切换
     completed = ExecutionSnapshot(end_phase, old_frequency, self.targets.copy(), self.target_ids.copy())
     landed = []
@@ -270,7 +291,7 @@ class FootstepManager:
     self.phase = end_phase
     self.elapsed += dt
     if (
-      self.mode != "standing"
+      self.mode not in ("settling", "standing")
       and self.pending_anchor_side is not None
       and measured is not None
       and contact is not None
@@ -283,28 +304,32 @@ class FootstepManager:
     if self.mode == "standing":
       if self.request.walking:
         self.request_start()
-    elif self.mode == "stopping":
-      self.frequency = max(self.stop_floor, self.frequency - self.cfg.stop_deceleration * dt)
-      ready = self.queue[0].target_id > self.stop_target_id and self.frequency <= self.stop_floor
-      if ready and self.cfg.phase.in_double_support(self.phase):
-        if self.stop_wait_started is None:
+    elif self.mode in ("stopping", "settling"):
+      if self.mode == "stopping":
+        if self.elapsed >= self.stop_ramp_start + self.cfg.stop_duration_s - 1e-10:
+          self.mode = "settling"
+          self.frequency = 0.0
+          self.targets[:] = self.terminal_feet
+          self.pending_anchor_side = None
           self.stop_wait_started = self.elapsed
+        else:
+          self.frequency = self._stop_frequency()
+      if self.mode == "settling":
         confirmed = not self.cfg.require_contact_confirmation or self.contact_count >= self.cfg.contact_confirm_steps
         if confirmed:
           self.mode = "standing"
-          self.frequency = 0.0
-          self.targets[:] = self.terminal_feet
       if (
-        self.mode == "stopping"
+        self.mode == "settling"
         and self.stop_wait_started is not None
-        and self.elapsed - self.stop_wait_started >= self.cfg.landing_timeout_s
+        and self.elapsed - self.stop_wait_started >= self.cfg.landing_timeout_s - 1e-10
       ):
         self.mode = "fault"
         raise TimeoutError("Double support was not confirmed; stop hardware safely before resetting")
     elif self.mode == "starting":
       target = self.request.frequency
-      self.frequency = min(target, self.frequency + self.cfg.start_acceleration * dt)
-      if self.frequency >= target:
+      self.start_progress = min(1.0, self.start_progress + dt / self.cfg.start_duration_s)
+      self.frequency = target * self.start_progress
+      if self.start_progress >= 1.0:
         self.mode = "walking"
     else:
       limit = self.cfg.frequency_slew_rate * dt
