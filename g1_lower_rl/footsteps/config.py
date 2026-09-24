@@ -57,11 +57,12 @@ class RandomCommandCfg:
   """随机指令的分布和调度参数，不包含步态相位或脚印几何"""
 
   frequency_range: tuple[float, float] = (0.8, 1.8)
-  initial_frequency: float = 1 / 0.6
-  initial_standing: bool = True
+  initial_frequency: float | None = 1 / 0.6
+  initial_standing_probability: float = 1.0
   frequency_rate_range: tuple[float, float] = (-0.3, 0.3)
   frequency_rate_interval_s: float = 2.0
   direction_range: tuple[float, float] = (-math.pi, math.pi)
+  direction_change_range: tuple[float, float] = (-math.pi, math.pi)
   foot_heading_range: tuple[float, float] = (0.0, 0.0)
   command_interval_s: tuple[float, float] = (3.0, 8.0)
   stop_probability: float = 0.30
@@ -73,14 +74,16 @@ class RandomCommandCfg:
     """校验随机分布、重采样周期和概率，不引用执行器配置"""
     ordered_range("frequency_range", self.frequency_range, positive=True)
     ordered_range("frequency_rate_range", self.frequency_rate_range)
-    for name in ("direction_range", "foot_heading_range"):
+    for name in ("direction_range", "direction_change_range", "foot_heading_range"):
       ordered_range(name, getattr(self, name))
     for name in ("command_interval_s", "hold_time_s"):
       ordered_range(name, getattr(self, name), positive=True)
-    if not self.frequency_range[0] <= self.initial_frequency <= self.frequency_range[1]:
+    if self.initial_frequency is not None and not self.frequency_range[0] <= self.initial_frequency <= self.frequency_range[1]:
       raise ValueError("initial_frequency must lie within frequency_range")
-    if not isinstance(self.initial_standing, bool):
-      raise ValueError("initial_standing must be boolean")
+    if not 0 <= self.initial_standing_probability <= 1:
+      raise ValueError("initial_standing_probability must lie in [0,1]")
+    if not -math.pi <= self.direction_change_range[0] <= 0 <= self.direction_change_range[1] <= math.pi:
+      raise ValueError("direction_change_range must contain zero and fit within [-pi, pi]")
     if not self.frequency_rate_range[0] <= 0 <= self.frequency_rate_range[1]:
       raise ValueError("frequency_rate_range must include zero")
     if not math.isfinite(self.frequency_rate_interval_s) or self.frequency_rate_interval_s <= 0:

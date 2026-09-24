@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import math
+
 from mjlab.envs.mdp import dr
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -80,9 +82,15 @@ def make_events() -> dict[str, EventTermCfg]:
       mode="reset",
       params={
         "asset_cfg": joints(*ARM_JOINT_EXPR),
-        "ranges": ARM_TARGET_RANGES,
+        "limit_expansion": math.pi / 2,
         "write_state": True,
+        "ramp_duration_s": 5.0,
       },
+    ),
+    "arm_pose_ramp": EventTermCfg(
+      func=mdp.advance_arm_pose,
+      mode="step",
+      params={"reset_event_name": "reset_arm_pose"},
     ),
     # episode 中途让手臂真的摆起来。
     "arm_pose_drift": EventTermCfg(
@@ -95,6 +103,7 @@ def make_events() -> dict[str, EventTermCfg]:
         "write_state": False,
         "blend": ARM_DRIFT_LEVELS[0][1],  # 由课程逐档抬高。
         "scale_by_level": True,
+        "defer_during_ramp": "reset_arm_pose",
       },
     ),
     "arm_torque": EventTermCfg(
@@ -157,7 +166,7 @@ def make_events() -> dict[str, EventTermCfg]:
           "robot", geom_names=tuple(g for g in FOOT_GEOMS if g.startswith("left"))
         ),
         "operation": "abs",
-        "ranges": (0.3, 1.6),
+        "ranges": (0.5, 1.6),
         "shared_random": True,
       },
     ),
@@ -169,7 +178,7 @@ def make_events() -> dict[str, EventTermCfg]:
           "robot", geom_names=tuple(g for g in FOOT_GEOMS if g.startswith("right"))
         ),
         "operation": "abs",
-        "ranges": (0.3, 1.6),
+        "ranges": (0.5, 1.6),
         "shared_random": True,
       },
     ),

@@ -52,6 +52,8 @@ python scripts/disturb_video.py <run>/model_8800.pt out.mp4 20
 
 动作跟踪任务另有一组脚本，见 [`tasks/motion_tracking/README.md`](g1_lower_rl/tasks/motion_tracking/README.md)。
 
+自研脚步跟踪任务 `G1-Gloria-FootstepTracking` 的实现与训练入口见[任务说明](g1_lower_rl/tasks/footstep_tracking/README.md)。
+
 **全身动作跟踪最终成果**：GitHub Release `model-215787`。仓库内的
 `artifacts/final_model_215787/` 保留 manifest 和部署契约，checkpoint 与 ONNX 作为
 Release 资产发布。在 80 条 LAFAN1、8 env、250 s 无删失协议下，平均存活 **163.7 s**，
@@ -76,7 +78,7 @@ python scripts/train.py G1-Gloria-MotionTracking \
 
 ## 连杆质量随机化
 
-所有 G1 任务（下肢 MLP/GRU、站立、脚步、全身动作跟踪）的训练和回放配置，
+原有 G1 任务（下肢 MLP/GRU、站立、脚步、全身动作跟踪）的训练和回放配置，
 默认启用 `events["link_mass"]`。每个环境、每个机器人刚体独立均匀采样
 `scale ~ U(0.95, 1.05)`，每回合 reset 重采，回合内保持不变；左右连杆不共享系数。
 

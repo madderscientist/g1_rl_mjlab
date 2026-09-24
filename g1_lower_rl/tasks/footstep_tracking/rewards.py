@@ -12,8 +12,8 @@ from mjlab.utils.lab_api.math import quat_apply_inverse
 
 from g1_lower_rl.assets import LOWER_BODY_JOINTS
 from g1_lower_rl.footstep_phase import FootstepPhaseCfg, resolve_phase_cfg
+from g1_lower_rl.tasks.lower_body.mdp import soft_landing as velocity_soft_landing
 from g1_lower_rl.tasks.footstep_tracking.reward_math import (
-  contact_schedule_score,
   footprint_accuracy_cost,
   joint_edge_cost,
   phase_windows,
@@ -56,7 +56,7 @@ class FootstepRewardState:
 
 
 class LowerBodyTorqueCost:
-  """仅对15个受控关节对应的实际执行器力矩平方求和"""
+  """15轴实际执行器铜损，接近硬限位且继续向外施力时单独放大"""
 
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv) -> None:
     asset_cfg = cfg.params["asset_cfg"]
@@ -65,6 +65,10 @@ class LowerBodyTorqueCost:
     if len(names) != 15 or set(names) != set(LOWER_BODY_JOINTS):
       raise ValueError("Torque cost must select exactly the 15 leg and waist actuators")
     self.actuator_ids = list(asset_cfg.actuator_ids)
+    self.joint_ids = [asset.joint_names.index(name) for name in names]
+    self.at_lower_limit = None
+    self.at_upper_limit = None
+    self.pushing_limit = None
     coefficients = cfg.params.get("copper_weights")
     if coefficients is not None and set(coefficients) != set(names):
       raise ValueError("copper_weights must name every controlled actuator exactly once")
@@ -79,10 +83,31 @@ class LowerBodyTorqueCost:
     asset_cfg: SceneEntityCfg,
     reference_torque: float = 100.0,
     copper_weights: dict[str, float] | None = None,
+    command_name: str = "footsteps",
+    standing_scale: float = 1.0,
+    limit_scale: float = 1.0,
+    limit_margin: float = 0.0,
   ) -> torch.Tensor:
     del copper_weights
-    torques = env.scene[asset_cfg.name].data.actuator_force[:, self.actuator_ids]
-    return torque_square_cost(torques, self.weights, reference_torque)
+    if not math.isfinite(standing_scale) or standing_scale <= 0:
+      raise ValueError("Standing torque scale must be finite and positive")
+    if not math.isfinite(limit_scale) or limit_scale < 1.0:
+      raise ValueError("Limit torque scale must be finite and at least 1")
+    if not math.isfinite(limit_margin) or limit_margin < 0.0:
+      raise ValueError("Limit margin must be finite and nonnegative")
+    data = env.scene[asset_cfg.name].data
+    torques = data.actuator_force[:, self.actuator_ids]
+    positions = data.joint_pos[:, self.joint_ids]
+    limits = data.joint_pos_limits[:, self.joint_ids]
+    self.at_lower_limit = positions <= limits[..., 0] + limit_margin
+    self.at_upper_limit = positions >= limits[..., 1] - limit_margin
+    self.pushing_limit = (self.at_lower_limit & (torques < 0)) | (self.at_upper_limit & (torques > 0))
+    weights = self.weights * torch.where(self.pushing_limit, limit_scale, 1.0)
+    cost = torque_square_cost(torques, weights, reference_torque)
+    if standing_scale != 1.0:
+      frequency = env.command_manager.get_term(command_name).reward_state.frequency
+      cost = cost * torch.where(frequency == 0, standing_scale, 1.0)
+    return cost
 
 
 def body_tilt_angle_l2(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -94,6 +119,12 @@ def body_tilt_angle_l2(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> tor
   return angle.square()
 
 
+def _head_height_above_ground(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg, command_name: str) -> torch.Tensor:
+  state = env.command_manager.get_term(command_name).reward_state
+  data = env.scene[asset_cfg.name].data
+  return data.geom_pos_w[:, asset_cfg.geom_ids, 2].squeeze(-1) - state.ground_height.mean(-1)
+
+
 def head_height_reward(
   env: ManagerBasedRlEnv,
   asset_cfg: SceneEntityCfg,
@@ -101,16 +132,27 @@ def head_height_reward(
   sensor_name: str = "feet_ground_contact",
   height_cap: float = 1.254,
 ) -> torch.Tensor:
-  """奖励头部几何体的离地高度，腾空或失败时不计奖励"""
+  """线性奖励离地高度，腾空或失败时不计奖励"""
   if not math.isfinite(height_cap) or height_cap <= 0:
     raise ValueError("height_cap must be finite and positive")
-  state = env.command_manager.get_term(command_name).reward_state
-  data = env.scene[asset_cfg.name].data
-  head_z = data.geom_pos_w[:, asset_cfg.geom_ids, 2].squeeze(-1)
-  height = head_z - state.ground_height.mean(-1)
+  height = _head_height_above_ground(env, asset_cfg, command_name)
   supported = (env.scene[sensor_name].data.found > 0).any(-1)
   valid = supported & ~env.termination_manager.terminated
   return (height / height_cap).clamp(0.0, 1.0) * valid
+
+
+def head_height_shortfall(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg,
+  command_name: str = "footsteps",
+  minimum_height: float = 1.15,
+  height_scale: float = 0.2,
+) -> torch.Tensor:
+  """惩罚低于最低头高的线性缺口，不因失去脚部接触而免罚"""
+  if not all(math.isfinite(value) and value > 0 for value in (minimum_height, height_scale)):
+    raise ValueError("Minimum head height and scale must be finite and positive")
+  height = _head_height_above_ground(env, asset_cfg, command_name)
+  return (minimum_height - height).clamp_min(0.0) / height_scale
 
 
 class FilteredPelvisUpright:
@@ -157,6 +199,102 @@ class FilteredPelvisUpright:
     return self.filtered_gravity[:, :2].square().sum(-1)
 
 
+def standing_linear_velocity_reward(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg,
+  command_name: str = "footsteps",
+  std: float = math.sqrt(0.2),
+  z_penalty: float = 1.5,
+) -> torch.Tensor:
+  """仅零执行频率时跟踪身体零线速度，沿用下肢任务的瞬时指数核"""
+  if not math.isfinite(std) or std <= 0 or not math.isfinite(z_penalty) or z_penalty < 0:
+    raise ValueError("Velocity std must be positive and z penalty nonnegative; both must be finite")
+  state = env.command_manager.get_term(command_name).reward_state
+  velocity = env.scene[asset_cfg.name].data.root_link_lin_vel_b
+  error = velocity[:, :2].square().sum(-1) + z_penalty * velocity[:, 2].square()
+  return torch.exp(-error / std**2) * (state.frequency == 0)
+
+
+def standing_angular_velocity_reward(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg,
+  command_name: str = "footsteps",
+  std: float = 0.7,
+  xy_penalty: float = 0.05,
+) -> torch.Tensor:
+  """仅零执行频率时跟踪身体零角速度，不约束固定航向角"""
+  if not math.isfinite(std) or std <= 0 or not math.isfinite(xy_penalty) or xy_penalty < 0:
+    raise ValueError("Velocity std must be positive and xy penalty nonnegative; both must be finite")
+  state = env.command_manager.get_term(command_name).reward_state
+  velocity = env.scene[asset_cfg.name].data.root_link_ang_vel_b
+  error = velocity[:, 2].square() + xy_penalty * velocity[:, :2].square().sum(-1)
+  return torch.exp(-error / std**2) * (state.frequency == 0)
+
+
+def feet_hold_position_cost(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg,
+  command_name: str = "footsteps",
+  deadband: float = 0.03,
+  distance_scale: float = 0.1,
+) -> torch.Tensor:
+  """停脚时限制相对冻结目标的水平漂移，保留小幅平衡调整空间"""
+  if not math.isfinite(deadband) or deadband < 0 or not math.isfinite(distance_scale) or distance_scale <= 0:
+    raise ValueError("Hold deadband must be nonnegative and distance scale positive; both must be finite")
+  state = env.command_manager.get_term(command_name).reward_state
+  position = env.scene[asset_cfg.name].data.site_pos_w[:, asset_cfg.site_ids, :2]
+  distance = torch.linalg.vector_norm(position - state.targets_w[..., :2], dim=-1)
+  cost = ((distance - deadband).clamp_min(0.0) / distance_scale).square().mean(-1)
+  return cost * (state.frequency == 0)
+
+
+def feet_flatness_cost(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg,
+  command_name: str = "footsteps",
+  sensor_name: str = "feet_ground_contact",
+  phase_cfg: FootstepPhaseCfg | None = None,
+  angle_scale: float = math.pi / 12,
+) -> torch.Tensor:
+  """计划支撑或实际触地时约束脚掌法向，静止检查双脚，不限制航向角"""
+  if not math.isfinite(angle_scale) or angle_scale <= 0:
+    raise ValueError("Flatness angle scale must be finite and positive")
+  state = env.command_manager.get_term(command_name).reward_state
+  data = env.scene[asset_cfg.name].data
+  orientation = data.site_quat_w[:, asset_cfg.site_ids]
+  gravity = data.gravity_vec_w.unsqueeze(1).expand(-1, 2, -1)
+  local_gravity = quat_apply_inverse(orientation, gravity)
+  angle = torch.atan2(torch.linalg.vector_norm(local_gravity[..., :2], dim=-1), -local_gravity[..., 2])
+  stance, _ = phase_windows(state.phase, phase_cfg=phase_cfg)
+  contact = env.scene[sensor_name].data.found > 0
+  active = stance | contact | (state.frequency == 0).unsqueeze(-1)
+  cost = (angle / angle_scale).square()
+  return (cost * active).sum(-1) / active.sum(-1).clamp_min(1)
+
+
+def stance_knee_bend_cost(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg,
+  command_name: str = "footsteps",
+  phase_cfg: FootstepPhaseCfg | None = None,
+  standing_limit: float = math.pi / 6,
+  walking_limit: float = math.pi / 4,
+  angle_scale: float = math.pi / 4,
+) -> torch.Tensor:
+  """只惩罚计划支撑腿过度屈膝，停脚检查双腿，不限制摆动腿"""
+  if (not all(math.isfinite(value) and value >= 0 for value in (standing_limit, walking_limit))
+      or not math.isfinite(angle_scale) or angle_scale <= 0):
+    raise ValueError("Knee limits must be nonnegative and angle scale positive; all must be finite")
+  state = env.command_manager.get_term(command_name).reward_state
+  standing = state.frequency == 0
+  stance, _ = phase_windows(state.phase, phase_cfg=phase_cfg)
+  stance = stance | standing.unsqueeze(-1)
+  knee = env.scene[asset_cfg.name].data.joint_pos[:, asset_cfg.joint_ids]
+  limit = torch.where(standing, standing_limit, walking_limit).unsqueeze(-1)
+  cost = ((knee - limit).clamp_min(0.0) / angle_scale).square()
+  return (cost * stance).sum(-1) / stance.sum(-1).clamp_min(1)
+
+
 def joint_zero_l2(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
   """惩罚绝对关节角，不使用相对默认姿态的偏差"""
   return env.scene[asset_cfg.name].data.joint_pos[:, asset_cfg.joint_ids].square().sum(-1)
@@ -185,13 +323,20 @@ def fall_cost(env: ManagerBasedRlEnv) -> torch.Tensor:
   return env.termination_manager.terminated.to(torch.float32) / env.step_dt
 
 
+def soft_landing(env: ManagerBasedRlEnv, sensor_name: str, command_name: str = "footsteps") -> torch.Tensor:
+  """复用速度任务的首次触地冲击代价，以脚步频率判断运动状态"""
+  moving = env.command_manager.get_term(command_name).reward_state.frequency > 0
+  return velocity_soft_landing(env, sensor_name) * moving
+
+
 class FootstepReward:
-  """锁存计划落脚误差，初始支撑只使用实时误差"""
+  """每个目标仅在摆动离地后的首次触地评价落脚误差"""
 
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv) -> None:
     self.component = cfg.params["component"]
     if self.component not in {
-      "landing", "support", "swing_position", "swing_yaw", "schedule", "clearance", "slip"
+      "landing", "swing_position", "swing_yaw", "schedule", "clearance", "slip",
+      "slip_still", "air_time", "stationary", "swing_contact",
     }:
       raise ValueError("Unknown footstep reward component")
     asset_cfg = cfg.params["asset_cfg"]
@@ -205,8 +350,6 @@ class FootstepReward:
     self.saw_air = torch.zeros(shape, dtype=torch.bool, device=env.device)
     self.previous_contact = torch.ones_like(self.saw_air)
     self.landed = torch.zeros_like(self.saw_air)
-    self.landing_expected = torch.zeros_like(self.saw_air)
-    self.landing_cost = torch.zeros(shape, device=env.device)
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     if self.component != "landing":
@@ -216,8 +359,6 @@ class FootstepReward:
     self.saw_air[selected] = False
     self.previous_contact[selected] = True
     self.landed[selected] = False
-    self.landing_expected[selected] = False
-    self.landing_cost[selected] = 0.0
 
   def __call__(
     self,
@@ -229,80 +370,84 @@ class FootstepReward:
     stance_fraction: float | None = None,
     position_std: float = 0.08,
     yaw_std: float = 0.2,
-    landing_window: float = 0.25,
-    clearance: float = 0.08,
+    clearance: float = 0.11,
+    air_time_scale: float = 0.4,
     phase_cfg: FootstepPhaseCfg | None = None,
-    swing_position_std: float = 0.1,
+    swing_position_std: float = 0.2,
     swing_yaw_std: float = 0.1,
-    landing_miss_cost: float = 1.0,
+    swing_progress_power: float = 2.0,
   ) -> torch.Tensor:
     if component != self.component:
       raise ValueError("Reward component must match its construction config")
     state = env.command_manager.get_term(command_name).reward_state
     if not isinstance(state, FootstepRewardState):
       raise TypeError("Footstep command must publish a FootstepRewardState as reward_state")
-    if position_std <= 0 or yaw_std <= 0 or clearance <= 0 or not 0 < landing_window <= 1:
-      raise ValueError("Invalid tracking, clearance or landing-window parameters")
-    if not math.isfinite(landing_miss_cost) or landing_miss_cost < 0:
-      raise ValueError("landing_miss_cost must be finite and nonnegative")
+    if not all(math.isfinite(value) and value > 0 for value in (position_std, yaw_std, clearance)):
+      raise ValueError("Invalid tracking or clearance parameters")
     timing = resolve_phase_cfg(stance_fraction, phase_cfg)
-    contact = env.scene[sensor_name].data.found > 0
+    sensor = env.scene[sensor_name].data
+    contact = sensor.found > 0
     if contact.shape != (env.num_envs, 2):
       raise ValueError("Contact sensor must provide [num_envs, 2] in left/right foot order")
     data = env.scene[asset_cfg.name].data
-    if component == "slip":
+    moving = state.frequency > 0
+    if component == "stationary":
+      in_contact = sensor.current_contact_time > 0
+      return (~in_contact).float().sum(-1) * ~moving
+    if component in {"slip", "slip_still"}:
       speed = torch.linalg.vector_norm(data.site_lin_vel_w[:, asset_cfg.site_ids, :2], dim=-1)
-      yaw_rate = data.site_ang_vel_w[:, asset_cfg.site_ids, 2].abs()
-      return ((speed + 0.05 * yaw_rate) * contact).sum(-1)
+      if component == "slip":
+        return (speed.square() * contact).sum(-1) * moving
+      return (speed * contact).sum(-1) * ~moving
     stance, swing_progress = phase_windows(state.phase, phase_cfg=timing)
     standing = state.frequency == 0
     stance = stance | standing.unsqueeze(-1)
-    if component == "schedule":
-      return contact_schedule_score(stance, contact)
-    if component == "clearance":
+    if component in {"schedule", "air_time"}:
+      in_contact = sensor.current_contact_time > 0
+      matched = (stance == contact).all(-1) & (stance == in_contact).all(-1)
+      if component == "schedule":
+        return matched.to(torch.float32) * moving
+      if not math.isfinite(air_time_scale) or air_time_scale <= 0:
+        raise ValueError("Air-time scale must be finite and positive")
+      single_support = stance.sum(-1) == 1
+      held_time = torch.where(stance, sensor.current_contact_time, sensor.current_air_time).min(dim=-1).values
+      swing_fractions = state.frequency.new_tensor([1 - fraction for fraction in timing.stance_fractions])
+      normalized = held_time.unsqueeze(-1) * state.frequency.unsqueeze(-1) / swing_fractions
+      credit = torch.minimum(normalized.clamp(0.0, 1.0), swing_progress)
+      return air_time_scale * (credit * ~stance).sum(-1) * matched * single_support * moving
+    if component in {"swing_contact", "clearance"}:
+      lift_profile = torch.sin(math.pi * swing_progress).square()
+      if component == "swing_contact":
+        return (contact * ~stance * lift_profile).sum(-1)
       position = data.site_pos_w[:, asset_cfg.site_ids]
-      swing_progress = torch.where(standing.unsqueeze(-1), 0.0, swing_progress)
-      target_height = clearance * torch.sin(torch.pi * swing_progress)
       height = position[..., 2] - state.ground_height
-      return (((target_height - height).clamp_min(0) / clearance).square() * ~stance).sum(-1)
-    if component == "swing_position":
+      target = clearance * lift_profile * ~stance
+      return ((height - target).abs() / clearance).sum(-1)
+    if component != "swing_yaw":
       position = data.site_pos_w[:, asset_cfg.site_ids]
       distance = torch.linalg.vector_norm(position[..., :2] - state.targets_w[..., :2], dim=-1)
-      return swing_tracking_score(distance, stance, swing_position_std)
-    quaternion = data.site_quat_w[:, asset_cfg.site_ids]
-    scalar, roll, pitch, yaw = quaternion.unbind(-1)
-    foot_yaw = torch.atan2(2 * (scalar * yaw + roll * pitch), 1 - 2 * (pitch.square() + yaw.square()))
-    yaw_delta = foot_yaw - state.targets_w[..., 2]
-    yaw_error = torch.atan2(yaw_delta.sin(), yaw_delta.cos())
-    if component == "swing_yaw":
-      return swing_tracking_score(yaw_error, stance, swing_yaw_std)
-    position = data.site_pos_w[:, asset_cfg.site_ids]
-    distance = torch.linalg.vector_norm(position[..., :2] - state.targets_w[..., :2], dim=-1)
+    if component != "swing_position":
+      quaternion = data.site_quat_w[:, asset_cfg.site_ids]
+      scalar, roll, pitch, yaw = quaternion.unbind(-1)
+      foot_yaw = torch.atan2(2 * (scalar * yaw + roll * pitch), 1 - 2 * (pitch.square() + yaw.square()))
+      yaw_delta = foot_yaw - state.targets_w[..., 2]
+      yaw_error = torch.atan2(yaw_delta.sin(), yaw_delta.cos())
+    if component in {"swing_position", "swing_yaw"}:
+      error, std = (distance, swing_position_std) if component == "swing_position" else (yaw_error, swing_yaw_std)
+      score = swing_tracking_score(error, stance, std,
+                                   swing_progress=swing_progress, progress_power=swing_progress_power)
+      return score * (contact & stance).any(-1)
     if component == "landing":
+      if not math.isfinite(env.step_dt) or env.step_dt <= 0:
+        raise ValueError("Landing event cost requires a positive finite control step")
       changed = (self.last_ids != state.target_ids) | standing.unsqueeze(-1)
-      self.landing_expected.copy_(torch.where(changed, (self.last_ids >= 0) & ~standing.unsqueeze(-1), self.landing_expected))
-      self.landing_expected |= ~stance
       self.landed &= ~changed
       self.saw_air &= ~changed
-      self.landing_cost.masked_fill_(changed, 0.0)
       self.saw_air |= ~contact & ~stance
       first_contact = contact & ~self.previous_contact & self.saw_air & ~self.landed
-      touchdown = state.phase.new_tensor([timing.left_stance_phase, timing.right_stance_phase])
-      phase_error = state.phase.unsqueeze(-1) - touchdown
-      distance_to_touchdown = torch.atan2(phase_error.sin(), phase_error.cos()).abs() / (2 * math.pi)
-      swing_duration = 1.0 - state.phase.new_tensor(timing.stance_fractions)
-      allowed_window = torch.maximum(
-        landing_window * swing_duration, state.phase.new_tensor(timing.contact_half_width / (2 * math.pi))
-      )
-      permitted = distance_to_touchdown <= allowed_window
       cost = footprint_accuracy_cost(distance, yaw_error, position_std, yaw_std)
-      self.landing_cost.copy_(torch.where(first_contact, cost + ~permitted * landing_miss_cost, self.landing_cost))
       self.landed |= first_contact
       self.previous_contact.copy_(contact)
       self.last_ids.copy_(state.target_ids)
-      landing_cost = torch.where(self.landed, self.landing_cost, cost + self.landing_expected * landing_miss_cost)
-      return (torch.where(standing.unsqueeze(-1), cost, landing_cost) * stance).sum(-1) / stance.sum(-1).clamp_min(1)
-    if component == "support":
-      cost = footprint_accuracy_cost(distance, yaw_error, position_std, yaw_std)
-      return (cost * stance).sum(-1) / stance.sum(-1).clamp_min(1)
+      return (cost * first_contact).sum(-1) / env.step_dt
     raise ValueError(f"Unknown component {component}")

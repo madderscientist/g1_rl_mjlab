@@ -14,6 +14,7 @@
 | `TensorFootstepManager` | 训练用设备驻留批量调度/执行器，对齐 NumPy 参考实现的行为 |
 
 Web UI 和独立调用组合 NumPy 对象；训练使用 Tensor 后端，库不反向依赖训练环境；cfg 只保存参数，不执行生成
+训练轮数和课程阶段归任务层管理，本目录不导入任务、奖励、mjlab或rsl_rl；Tensor后端只接受设备上的采样区间
 
 ## 算法
 
@@ -57,7 +58,8 @@ support重置时取实测脚位，此后仅在计划落地时更新；整个摆�
 - 每个控制拍结束调用一次 `advance()`，用上一拍发布的 f 积分相位，理论落地时消费队头并补一目标
 - f 是完整左右周期 Hz，总步频为2f；频率与几何距离范围独立
 - 默认左右理论落地中心为90°、270°，双支撑窗口为72°–108°、252°–288°，均为左闭右开
-- 默认 reset 发布站立命令：f=0，等概率选择90°或270°双支撑中心并冻结，四槽位为 `[L_hold,R_hold,L_hold,R_hold]`，保持位姿取自重置时的实测脚位；训练和 Viser 保持2–5秒后再用半秒斜坡起步
+- 独立调用默认reset发布站立命令：f=0，等概率选择90°或270°双支撑中心并冻结，四槽位为 `[L_hold,R_hold,L_hold,R_hold]`，保持位姿取自重置时的实测脚位
+- 训练和Viser设置站立概率0.5，每次reset独立混合站立与直接行走；站立组保持2–5秒后半秒起步，行走组直接使用正目标频率并从随机选中脚的抬脚边界开始
 - 90°之后右脚先抬，270°之后左脚先抬；队头为下一抬脚侧，参考系取异侧实测脚位。起步不重置相位，抬脚时切换到该侧首个生成目标，理论落地时消费对应队头
 - NumPy 与 Tensor 后端均在每次站立重置时重新抽取中心；训练和演示使用同一规则，局部重置不改变其他环境。双支撑步相是计划要求，不保证物理初态已接地或旧策略能站稳
 - 请求停止后保留承诺四步，前段恒频、最后0.5秒线性减速，对齐最后收脚后的双支撑窗口内部；每拍用频率区间平均值积分，终拍准确冻结相位并发布 f=0
@@ -84,8 +86,8 @@ Tensor后端的 `future_world` 仅保存两个next；其14维 `command` 包含�
 | `direction_noise` / `yaw_noise` | ±40° / ±30° | 移动方向和脚掌朝向扰动 |
 | `max_yaw_change` | 30° | 相对前一个异侧目标的转角上限 |
 | `control_dt` | 0.02 s | 固定控制拍长 |
-| `frequency_range` / `initial_frequency` | 0.8–1.8 / 1.667 Hz | 正常行走范围/起步目标；默认重置实际频率为0 |
-| `initial_standing` | true | 指令源默认站立开局；显式行走意图或设为false可覆盖，供独立控制及测试使用 |
+| `frequency_range` / `initial_frequency` | 0.8–1.8 / 1.667 Hz | 独立调用默认起步目标；source设为None时每次reset均匀采样，站立组执行频率为0，行走组直接使用目标 |
+| `initial_standing_probability` | 1.0 | 站立开局概率，0为全行走、1为全站立，任务配置为0.5；显式GaitRequest可覆盖 |
 | `frequency_rate_range` / `frequency_rate_interval_s` | ±0.3 Hz/s / 2 s | 随机变化率及保持时间，触边反向 |
 | `frequency_slew_rate` | 0.2 Hz/s | manager 在正常行走时对频率目标的执行限速 |
 | `start_duration_s` | 0.5 s | 从静止起步的线性升频时长，取代固定起步加速度 |
@@ -93,8 +95,14 @@ Tensor后端的 `future_world` 仅保存两个next；其14维 `command` 包含�
 | `command_interval_s` / `stop_probability` | 3–8 s / 30% | 每次行走指令重采样时抽一次停止概率 |
 | `hold_time_s` | 2–5 s | 自动再起步前的站立保持时间 |
 | `direction_range` / `foot_heading_range` | ±180° / 0° | source 的整体方向范围，不是逐脚扰动 |
+| `direction_change_range` | ±180° | 回合内相对当前移动方向的均匀增量范围，设为[0,0]保持方向 |
 
 `hold_width` 属于 manager；整体方向范围、随机变化率、重采样间隔和自动开关属于 source
+`direction_range` 在reset时采样初始方向；之后用 `direction_change_range` 抽取方向增量，脚掌名义朝向仍按初始航向采样
+令 `direction_change_range` 和 `frequency_rate_range` 都为[0,0]即可固定回合内目标，不需要单独模式开关
+`source.initial_frequency=None` 时自动再起步沿用停止前的目标步频，只有reset重新抽取初始步频
+旧布尔参数 `initial_standing` 已由站立概率替代；混合模式与左右起脚独立抽样，局部reset不影响其他环境的随机流
+训练任务自行将变化区间分档放开，独立Web预览没有训练课程，默认参数仍为本表数值
 关闭自动模式的独立 Web 预览同样从站立开始，需手动起步或启用自动模式，不会自动跳到固定行走频率。
 旧 `stop_deceleration`、`stop_frequency_floor`、`start_acceleration` 已移除；旧实验快照仍使用当时的参数与停走逻辑。
 `stop_duration_s*frequency_range[1]` 不得超过4，保证完整减速段能安排在已承诺的四步与收脚范围内。

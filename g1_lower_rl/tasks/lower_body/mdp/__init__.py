@@ -30,6 +30,9 @@ from g1_lower_rl.tasks.lower_body.mdp.curriculums import (
   tightening_height_std as tightening_height_std,
 )
 from g1_lower_rl.tasks.lower_body.mdp.events import (
+  advance_arm_pose as advance_arm_pose,
+)
+from g1_lower_rl.tasks.lower_body.mdp.events import (
   arm_torque_impulse as arm_torque_impulse,
 )
 from g1_lower_rl.tasks.lower_body.mdp.events import (

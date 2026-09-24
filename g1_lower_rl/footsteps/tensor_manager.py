@@ -10,6 +10,7 @@ FootstepCommand 在正向运动学后调用 reset，在物理步之后、奖励�
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import torch
 
@@ -35,6 +36,10 @@ class TensorFootstepManager:
     self.device = torch.device(device)
     self.num_envs = num_envs
     self.sampler = TensorFootstepSampler(cfg.sampler)
+    self.sampler_parameters = self.sampler.parameters(device)
+    self.yaw_noise_range = torch.tensor(cfg.sampler.yaw_noise, device=device, dtype=torch.float64)
+    self.initial_direction_range = torch.tensor(source.direction_range, device=device, dtype=torch.float64)
+    self.change_ranges = torch.tensor((source.direction_change_range, source.frequency_rate_range), device=device, dtype=torch.float64)
     if not cfg.frequency_range[0] <= source.frequency_range[0] <= source.frequency_range[1] <= cfg.frequency_range[1]:
       raise ValueError("Source frequency range must fit the manager execution range")
     self.state = {}
@@ -78,6 +83,15 @@ class TensorFootstepManager:
     self._step = torch.compile(self._advance, fullgraph=True) if compiled else self._advance
     self._reset_step = torch.compile(self._reset, fullgraph=True) if compiled else self._reset
 
+  def set_sampling_ranges(self, distance_range, width_range, *, yaw_noise=None):
+    """更新未来采样范围，保留已发布目标、队列、相位和随机流"""
+    cfg = replace(self.cfg.sampler, distance_range=distance_range,
+                  min_width=width_range[0], max_width=width_range[1],
+                  yaw_noise=self.cfg.sampler.yaw_noise if yaw_noise is None else yaw_noise)
+    self.sampler_parameters.copy_(TensorFootstepSampler(cfg).parameters(self.device))
+    if yaw_noise is not None:
+      self.yaw_noise_range.copy_(self.yaw_noise_range.new_tensor(yaw_noise))
+
   def _put(self, name, mask, value):
     """原地更新选中环境，保持对外暴露的张量引用不变"""
     target = self.state[name]
@@ -104,7 +118,8 @@ class TensorFootstepManager:
   def _sample(self, previous, side, uniform):
     """追加行走落点，停止计划确定后则重复双脚终止落点"""
     state = self.state
-    sampled = self.sampler.sample(previous, side, state["direction"], state["heading"], uniform)
+    sampled = self.sampler.sample(previous, side, state["direction"], state["heading"], uniform,
+                    self.sampler_parameters, self.yaw_noise_range)
     terminal = self._choose(state["terminal_feet"], side)
     return torch.where(((state["mode"] == STOPPING) | (state["mode"] == SETTLING) | (state["mode"] == STANDING))[:, None], terminal, sampled)
 
@@ -126,11 +141,13 @@ class TensorFootstepManager:
     self._put("next_id", mask, state["next_id"] + 4)
     self._put("first_side", mask, first_side)
 
-  def _directions(self, uniform):
-    """相对重置时的双脚平均航向采样移动方向和脚掌朝向"""
+  def _directions(self, uniform, current_direction=None):
+    """重置时采样整体方向，回合内按张量区间采样方向增量，脚掌朝向仍相对初始航向"""
     cfg = self.source_cfg
     origin = self.state["heading_origin"]
-    return (wrap(origin + cfg.direction_range[0] + uniform[:, 0] * (cfg.direction_range[1] - cfg.direction_range[0])),
+    lower, upper = (self.initial_direction_range if current_direction is None else self.change_ranges[0]).unbind()
+    direction_origin = origin if current_direction is None else current_direction
+    return (wrap(direction_origin + lower + uniform[:, 0] * (upper - lower)),
             wrap(origin + cfg.foot_heading_range[0] + uniform[:, 1] * (cfg.foot_heading_range[1] - cfg.foot_heading_range[0])))
 
   def _contacts(self):
@@ -163,15 +180,18 @@ class TensorFootstepManager:
     heading_origin = torch.atan2(feet[:, :, 2].sin().sum(-1), feet[:, :, 2].cos().sum(-1))
     self._put("heading_origin", mask, heading_origin)
     direction, heading = self._directions(uniform)
-    standing = self.source_cfg.initial_standing
-    # 用尚未占用的随机数选择两个双支撑中心之一，不改变其他采样的取值位置
-    first_side = (uniform[:, 31] < 0.5).long() if standing else torch.zeros_like(state["first_side"])
+    standing = uniform[:, 29] < self.source_cfg.initial_standing_probability
+    lower, upper = self.source_cfg.frequency_range
+    frequency = (lower + uniform[:, 30] * (upper - lower) if self.source_cfg.initial_frequency is None
+                 else torch.full_like(state["frequency"], self.source_cfg.initial_frequency))
+    # 模式与起脚侧各用独立分位数，局部重置只推进选中环境的随机流
+    first_side = (uniform[:, 31] < 0.5).long()
     for name, value in (
-      ("direction", direction), ("heading", heading), ("frequency", 0.0 if standing else self.source_cfg.initial_frequency),
-      ("request_frequency", self.source_cfg.initial_frequency), ("request_walking", not standing),
-      ("phase", self.centers[1 - first_side] if standing else self.cfg.phase.liftoff_rad[0]),
-      ("mode", STANDING if standing else WALKING), ("elapsed", 0.0),
-      ("supports", feet), ("targets", feet), ("target_ids", self.sides), ("next_id", 6 if standing else 2),
+      ("direction", direction), ("heading", heading), ("frequency", torch.where(standing, 0.0, frequency)),
+      ("request_frequency", frequency), ("request_walking", ~standing),
+      ("phase", torch.where(standing, self.centers[1 - first_side], self.liftoff[first_side])),
+      ("mode", torch.where(standing, STANDING, WALKING)), ("elapsed", 0.0),
+      ("supports", feet), ("targets", feet), ("target_ids", self.sides), ("next_id", torch.where(standing, 6, 2)),
       ("terminal_feet", feet), ("anchor", self._choose(feet, 1 - first_side)), ("pending_anchor", -1), ("contact_count", 0),
       ("stop_target_id", -1), ("stop_wait", -1.0), ("start_progress", 0.0),
       ("stop_phase", 0.0), ("stop_ramp_start", 0.0), ("stop_initial_frequency", 0.0),
@@ -179,16 +199,17 @@ class TensorFootstepManager:
       ("command_at", self.source_cfg.command_interval_s[0] + uniform[:, 2] * (self.source_cfg.command_interval_s[1] - self.source_cfg.command_interval_s[0])),
     ):
       self._put(name, mask, value)
-    if standing:
-      # 站立直接重复实测脚位，不生成随后会被丢弃的随机落点
+    if self.source_cfg.initial_standing_probability > 0.0:
+      # 站立环境直接重复实测脚位作为原地目标
       sides = (first_side[:, None] + self.reset_queue_ids) % 2
-      self._put("queue", mask, feet.gather(1, sides[:, :, None].expand(-1, -1, 3)))
-      self._put("queue_ids", mask, self.reset_queue_ids)
-      self._put("first_side", mask, first_side)
-    else:
-      self._fill_queue(mask, first_side, torch.zeros_like(mask), uniform[:, 3:15])
-      self._put("targets", mask, torch.stack((state["queue"][:, 0], feet[:, 1]), dim=1))
-      self._put("target_ids", mask, torch.stack((state["queue_ids"][:, 0], torch.ones_like(state["next_id"])), dim=1))
+      self._put("queue", mask & standing, feet.gather(1, sides[:, :, None].expand(-1, -1, 3)))
+      self._put("queue_ids", mask & standing, self.reset_queue_ids)
+      self._put("first_side", mask & standing, first_side)
+    if self.source_cfg.initial_standing_probability < 1.0:
+      self._fill_queue(mask & ~standing, first_side, torch.zeros_like(mask), uniform[:, 3:15])
+      swinging = (~standing & mask)[:, None] & (self.sides == first_side[:, None])
+      state["targets"].copy_(torch.where(swinging[:, :, None], state["queue"][:, 0, None], state["targets"]))
+      state["target_ids"].copy_(torch.where(swinging, state["queue_ids"][:, 0, None], state["target_ids"]))
     for name, source in (("completed_phase", "phase"), ("completed_frequency", "frequency"),
                          ("completed_targets", "targets"), ("completed_ids", "target_ids")):
       self._put(name, mask, state[source])
@@ -251,17 +272,19 @@ class TensorFootstepManager:
     active = standing & ~state["request_walking"] & cfg.automatic_restart
     self._put("restart_at", active & (state["restart_at"] < 0), state["elapsed"] + cfg.hold_time_s[0] + uniform[:, 0] * (cfg.hold_time_s[1] - cfg.hold_time_s[0]))
     restart = active & (state["elapsed"] + 1e-10 >= state["restart_at"])
-    direction, heading = self._directions(uniform[:, 1:3])
+    self._put("request_walking", restart, True)
+    self._put("restart_at", ~standing, -1.0)
+    direction, heading = self._directions(uniform[:, 1:3], state["direction"])
     self._put("direction", restart, direction)
     self._put("heading", restart, heading)
-    self._put("request_walking", restart, True)
-    self._put("request_frequency", restart, cfg.initial_frequency)
+    if cfg.initial_frequency is not None:
+      self._put("request_frequency", restart, cfg.initial_frequency)
     interval = cfg.command_interval_s[0] + uniform[:, 3] * (cfg.command_interval_s[1] - cfg.command_interval_s[0])
     self._put("command_at", restart, state["elapsed"] + interval)
-    self._put("restart_at", ~standing, -1.0)
     walking = (state["mode"] == WALKING) & state["request_walking"]
     new_rate = walking & (state["rate_remaining"] <= 1e-10)
-    self._put("rate", new_rate, cfg.frequency_rate_range[0] + uniform[:, 4] * (cfg.frequency_rate_range[1] - cfg.frequency_rate_range[0]))
+    lower_rate, upper_rate = self.change_ranges[1].unbind()
+    self._put("rate", new_rate, lower_rate + uniform[:, 4] * (upper_rate - lower_rate))
     self._put("rate_remaining", new_rate, cfg.frequency_rate_interval_s)
     lower, upper = cfg.frequency_range
     if upper == lower:

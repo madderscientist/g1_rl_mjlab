@@ -68,13 +68,18 @@ def footprint_accuracy_cost(
   return 0.5 * distance / position_scale + 0.5 * wrapped_yaw.abs() / yaw_scale
 
 
-def swing_tracking_score(error: torch.Tensor, stance: torch.Tensor, std: float = 0.1) -> torch.Tensor:
-  """对计划摆动脚计算指数精度奖励，不乘摆动进度斜坡"""
+def swing_tracking_score(
+  error: torch.Tensor,
+  stance: torch.Tensor,
+  std: float = 0.1,
+  *,
+  swing_progress: torch.Tensor | None = None,
+  progress_power: float = 2.0,
+) -> torch.Tensor:
+  """计算摆动指数精度，默认用平方斜坡，允许初期配置选择线性斜坡"""
   if not math.isfinite(std) or std <= 0:
     raise ValueError("Swing tracking std must be finite and positive")
-  return (torch.exp(-(error / std).square()) * ~stance).sum(-1)
-
-
-def contact_schedule_score(required_contact: torch.Tensor, contact: torch.Tensor) -> torch.Tensor:
-  """所有脚的实际接触都符合计划模式时才给满分"""
-  return (required_contact == contact).all(dim=-1).to(torch.float32)
+  if not math.isfinite(progress_power) or progress_power < 1:
+    raise ValueError("Swing progress power must be finite and at least one")
+  weight = 1.0 if swing_progress is None else swing_progress.clamp(0.0, 1.0).pow(progress_power)
+  return (torch.exp(-(error / std).square()) * ~stance * weight).sum(-1)

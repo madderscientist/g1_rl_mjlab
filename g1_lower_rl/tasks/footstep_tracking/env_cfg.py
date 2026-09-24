@@ -11,7 +11,9 @@ from mjlab.utils.lab_api.math import quat_apply_inverse
 from mjlab.utils.noise import NoiseModelWithAdditiveBiasCfg
 
 from g1_lower_rl.assets import WHOLE_BODY_JOINTS
+from g1_lower_rl.footsteps import RandomCommandCfg
 from g1_lower_rl.tasks.footstep_tracking.commands import FootstepCommandCfg, footstep_execution_failed
+from g1_lower_rl.tasks.footstep_tracking.curriculum import DIRECTION_CHANGE_STAGES, FREQUENCY_RATE_STAGES, arm_target_scale, make_curriculum
 from g1_lower_rl.tasks.footstep_tracking.rewards_cfg import make_rewards, make_terminations
 from g1_lower_rl.tasks.lower_body.cfg.env_cfg import make_lower_body_env_cfg
 from g1_lower_rl.tasks.lower_body.cfg.observations import make_observations as lower_body_observations
@@ -48,7 +50,11 @@ def footstep_env_cfg(play: bool = False):
   """复用基础 G1 平地场景，替换速度和高度任务的命令、观测、奖励与课程"""
   cfg = make_lower_body_env_cfg()
   cfg.scene.num_envs = 1 if play else 64
-  cfg.commands = {"footsteps": FootstepCommandCfg(debug_vis=play)}
+  cfg.commands = {"footsteps": FootstepCommandCfg(debug_vis=play, source=RandomCommandCfg(
+    initial_frequency=None, initial_standing_probability=0.5,
+    direction_change_range=DIRECTION_CHANGE_STAGES[0][1],
+    frequency_rate_range=FREQUENCY_RATE_STAGES[0][1],
+  ))}
   joints = SceneEntityCfg("robot", joint_names=WHOLE_BODY_JOINTS, preserve_order=True)
   reference = lower_body_observations()["actor"].terms
   # 契约：29角度、29速度、两组IMU各6维、相位/频率及双脚支撑基准与两步目标共14维
@@ -88,8 +94,9 @@ def footstep_env_cfg(play: bool = False):
   cfg.rewards = make_rewards(phase_cfg=cfg.commands["footsteps"].manager.phase)
   # mjlab 默认在奖励之后更新 command，首个终止项负责提前推进并冻结本拍奖励快照
   cfg.terminations = {"footstep_fault": TerminationTermCfg(func=footstep_execution_failed), **make_terminations()}
-  cfg.curriculum = {}
+  cfg.curriculum = make_curriculum()
   cfg.metrics = {}
+  cfg.events["reset_arm_pose"].params["target_scale"] = arm_target_scale(0)
   cfg.events.pop("gait_phase")
   cfg.events.pop("push_robot")
   cfg.episode_length_s = 60.0

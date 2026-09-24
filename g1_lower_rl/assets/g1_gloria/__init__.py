@@ -137,7 +137,7 @@ WHOLE_BODY_ACTION_SCALE: dict[str, float] = {
 
 WHOLE_BODY_ACTUATOR_EXPR: tuple[str, ...] = tuple(WHOLE_BODY_ACTION_SCALE)
 
-# 上肢扰动事件写进去的手臂 PD 目标的采样范围。
+# 回合内手臂目标漂移使用的 PD 目标范围；reset 改由硬限位两侧扩展生成。
 #
 # 这些是**目标**，而手臂执行器很软（kp=14.3），重力会把实际位姿往下拽 30-40 度，
 # 挂上 0-2 kg 夹爪负载后更多。解静力平衡 kp*(ctrl - q) = qfrc_bias(q)，以 shoulder_pitch 为例：

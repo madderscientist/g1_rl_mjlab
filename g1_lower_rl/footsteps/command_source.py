@@ -38,12 +38,12 @@ class RandomCommandSource:
     self.rng = np.random.default_rng(np.random.SeedSequence(seed).spawn(2)[0])
     self.initialized = False
 
-  def _directions(self) -> tuple[float, float]:
-    """相对 reset 航向独立采样两个整体方向，逐脚扰动仍由采样器负责"""
-    return tuple(
-      float(wrap_angle(self.heading_origin + self.rng.uniform(*bounds)))
-      for bounds in (self.cfg.direction_range, self.cfg.foot_heading_range)
-    )
+  def _directions(self, current_direction: float | None = None) -> tuple[float, float]:
+    """重置时采样整体方向，回合内采样方向增量，脚掌朝向始终相对初始航向"""
+    origin = self.heading_origin if current_direction is None else current_direction
+    bounds = self.cfg.direction_range if current_direction is None else self.cfg.direction_change_range
+    return (float(wrap_angle(origin + self.rng.uniform(*bounds))),
+            float(wrap_angle(self.heading_origin + self.rng.uniform(*self.cfg.foot_heading_range))))
 
   def reset(self, heading_origin: float = 0.0, request: GaitRequest | None = None) -> GaitRequest:
     """清空调度时钟，可从外部意图接续随机模式，避免切换时突变"""
@@ -52,7 +52,15 @@ class RandomCommandSource:
     if request is not None and not self.cfg.frequency_range[0] <= request.frequency <= self.cfg.frequency_range[1]:
       raise ValueError("Request frequency outside source range")
     self.heading_origin = heading_origin
-    self.request = request or GaitRequest(*self._directions(), self.cfg.initial_frequency, walking=not self.cfg.initial_standing)
+    if request is None:
+      direction, heading = self._directions()
+      frequency = self.cfg.initial_frequency
+      if frequency is None:
+        frequency = self.rng.uniform(*self.cfg.frequency_range)
+      probability = self.cfg.initial_standing_probability
+      standing = probability == 1.0 or (probability > 0.0 and self.rng.random() < probability)
+      request = GaitRequest(direction, heading, frequency, walking=not standing)
+    self.request = request
     self.elapsed = 0.0
     self.rate = 0.0
     self.rate_remaining = 0.0
@@ -98,8 +106,8 @@ class RandomCommandSource:
         if self.restart_at is None:
           self.restart_at = self.elapsed + self.rng.uniform(*self.cfg.hold_time_s)
         if self.elapsed + 1e-10 >= self.restart_at:
-          target = self.cfg.initial_frequency if random_frequency else self.request.frequency
-          self.request = GaitRequest(*self._directions(), target, True)
+          target = self.cfg.initial_frequency if random_frequency and self.cfg.initial_frequency is not None else self.request.frequency
+          self.request = GaitRequest(*self._directions(self.request.movement_direction), target, True)
           self.command_at = self.elapsed + self.rng.uniform(*self.cfg.command_interval_s)
       return self.request
     self.restart_at = None
@@ -130,7 +138,7 @@ class RandomCommandSource:
       if self.rng.random() < self.cfg.stop_probability:
         self.request = replace(self.request, walking=False)
       else:
-        direction, heading = self._directions()
+        direction, heading = self._directions(self.request.movement_direction)
         self.request = replace(self.request, movement_direction=direction, foot_heading=heading)
     return self.request
 

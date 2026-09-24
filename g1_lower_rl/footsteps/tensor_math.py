@@ -44,9 +44,27 @@ class TensorFootstepSampler:
     if lower != upper and self.probability_high <= self.probability_low:
       raise ValueError("Truncated normal interval has insufficient numerical probability")
 
-  def sample(self, previous, side, direction, heading, uniform):
+  def parameters(self, device):
+    """返回可原地更新的距离分布及站距参数，不包含任务课程"""
     cfg = self.cfg
-    if cfg.distance_range[0] == cfg.distance_range[1]:
+    return torch.tensor((*cfg.distance_range, cfg.distance_mean, cfg.distance_std,
+                         self.probability_low, self.probability_high, float(self.reflect),
+                         cfg.min_width, cfg.max_width), dtype=torch.float64, device=device)
+
+  def sample(self, previous, side, direction, heading, uniform, parameters=None, yaw_noise=None):
+    cfg = self.cfg
+    minimum_width, maximum_width, maximum_distance = cfg.min_width, cfg.max_width, cfg.distance_range[1]
+    width_center = cfg.width_center
+    if parameters is not None:
+      lower, upper, mean, std, probability_low, probability_high, reflect, minimum_width, maximum_width = parameters.unbind()
+      probability = probability_low + uniform[..., 0] * (probability_high - probability_low)
+      probability = probability.clamp(torch.finfo(probability.dtype).tiny, 1 - torch.finfo(probability.dtype).eps)
+      sampled = torch.special.ndtri(probability) * std + mean
+      sampled = torch.where(reflect > 0, 2 * mean - sampled, sampled)
+      distance = torch.where(lower == upper, lower, sampled)
+      maximum_distance = upper
+      width_center = (minimum_width + maximum_width) / 2
+    elif cfg.distance_range[0] == cfg.distance_range[1]:
       distance = torch.full_like(direction, cfg.distance_range[0])
     else:
       probability = self.probability_low + uniform[..., 0] * (self.probability_high - self.probability_low)
@@ -56,9 +74,10 @@ class TensorFootstepSampler:
         distance = 2 * cfg.distance_mean - distance
     angle = direction + cfg.direction_noise[0] + uniform[..., 1] * (cfg.direction_noise[1] - cfg.direction_noise[0]) - previous[..., 2]
     sign = 1 - 2 * side
-    lateral = sign * (cfg.width_center + sign * distance * angle.sin()).clamp(cfg.min_width, cfg.max_width)
-    forward_limit = (cfg.distance_range[1] ** 2 - lateral.square()).clamp_min(0).sqrt()
+    lateral = sign * (width_center + sign * distance * angle.sin()).clamp(minimum_width, maximum_width)
+    forward_limit = (maximum_distance ** 2 - lateral.square()).clamp_min(0).sqrt()
     forward = (distance * angle.cos()).clamp(-forward_limit, forward_limit)
-    yaw = heading + cfg.yaw_noise[0] + uniform[..., 2] * (cfg.yaw_noise[1] - cfg.yaw_noise[0])
+    yaw_lower, yaw_upper = cfg.yaw_noise if yaw_noise is None else yaw_noise.unbind()
+    yaw = heading + yaw_lower + uniform[..., 2] * (yaw_upper - yaw_lower)
     delta_yaw = wrap(yaw - previous[..., 2]).clamp(-cfg.max_yaw_change, cfg.max_yaw_change)
     return from_local(torch.stack((forward, lateral, delta_yaw), dim=-1), previous)

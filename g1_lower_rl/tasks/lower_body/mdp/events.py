@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -237,9 +238,7 @@ class scaled_body_impulse(apply_body_impulse):
 class hold_arm_pose:
   """把手臂保持在一个随机采样的 PD 目标上。
 
-  用两次：一次 ``mode="reset"`` 且 ``write_state=True``，让 episode 直接从采样位姿开始而
-  不是猛地弹过去；另一次 ``mode="interval"`` 且 ``write_state=False``，让手臂在 episode 中
-  真的摆起来。
+  reset可从零位渐变到扩展目标；interval使用原范围，且可等待reset渐变完成。
   """
 
   def __init__(self, cfg: EventTermCfg, env: ManagerBasedRlEnv):
@@ -247,26 +246,68 @@ class hold_arm_pose:
     asset: Entity = env.scene[asset_cfg.name]
     ids, names = asset.find_joints(asset_cfg.joint_names)
     self.joint_ids = torch.tensor(ids, device=env.device)
-    _, _, ranges = resolve_matching_names_values(cfg.params["ranges"], names)
-    self.lower = torch.tensor([r[0] for r in ranges], device=env.device)
-    self.upper = torch.tensor([r[1] for r in ranges], device=env.device)
+    ranges = cfg.params.get("ranges")
+    expansion = cfg.params.get("limit_expansion")
+    if (ranges is None) == (expansion is None):
+      raise ValueError("Specify exactly one of ranges or limit_expansion")
+    self.lower = self.upper = None
+    if ranges is not None:
+      _, _, bounds = resolve_matching_names_values(ranges, names)
+      self.lower = torch.tensor([bound[0] for bound in bounds], device=env.device)
+      self.upper = torch.tensor([bound[1] for bound in bounds], device=env.device)
+    self.ramp_duration_s = cfg.params.get("ramp_duration_s", 0.0)
+    if not math.isfinite(self.ramp_duration_s) or self.ramp_duration_s < 0:
+      raise ValueError("Ramp duration must be finite and nonnegative")
+    self.ramp_targets = torch.zeros(env.num_envs, len(ids), device=env.device)
+    self.ramp_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    self.ramp_last_steps = torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device)
+    self.ramp_active = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    if self.ramp_duration_s > 0:
+      if not cfg.params.get("write_state", False):
+        raise ValueError("Arm ramp requires a reset state write")
+      limits = asset.data.joint_pos_limits[:, self.joint_ids]
+      if ((limits[..., 0] > 0) | (limits[..., 1] < 0)).any():
+        raise ValueError("Zero arm start must be inside every selected joint limit")
 
   def __call__(
     self,
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor | None,
     asset_cfg: SceneEntityCfg,
-    ranges: dict[str, tuple[float, float]],
+    ranges: dict[str, tuple[float, float]] | None = None,
     write_state: bool = False,
     blend: float = 1.0,
     scale_by_level: bool = False,
+    limit_expansion: float | None = None,
+    clip_reset_state: bool = False,
+    ramp_duration_s: float = 0.0,
+    defer_during_ramp: str | None = None,
+    target_scale: float = 1.0,
   ) -> None:
     del ranges  # 已在 __init__ 里消费。
+    if ramp_duration_s != self.ramp_duration_s:
+      raise ValueError("Ramp duration must match the event configuration")
+    if not math.isfinite(target_scale) or not 0.0 <= target_scale <= 1.0:
+      raise ValueError("Target scale must be finite and between 0 and 1")
     asset: Entity = env.scene[asset_cfg.name]
     ids = _env_ids(env, env_ids)
+    if defer_during_ramp is not None:
+      ramp = env.event_manager.get_term_cfg(defer_during_ramp).func
+      ids = ids[~ramp.ramp_active[ids]]
+      if len(ids) == 0:
+        return
+    if limit_expansion is not None:
+      if not math.isfinite(limit_expansion) or limit_expansion < 0:
+        raise ValueError("Limit expansion must be finite and nonnegative")
+      limits = asset.data.joint_pos_limits[ids.unsqueeze(1), self.joint_ids]
+      lower, upper = limits[..., 0] - limit_expansion, limits[..., 1] + limit_expansion
+    else:
+      if self.lower is None or self.upper is None:
+        raise ValueError("Limit expansion is required for this event")
+      lower, upper = self.lower, self.upper
     target = sample_uniform(
-      self.lower, self.upper, (len(ids), len(self.joint_ids)), env.device
-    )
+      lower, upper, (len(ids), len(self.joint_ids)), env.device
+    ) * target_scale
     # 直接下标写：set_joint_position_target() 会把 env_ids 和 joint_ids 广播在一起，
     # 只有写全部环境时才对。
     current = asset.data.joint_pos_target[ids.unsqueeze(1), self.joint_ids]
@@ -276,14 +317,45 @@ class hold_arm_pose:
     if scale_by_level:
       weight = weight * disturbance_level(env)[ids].unsqueeze(1)
     target = current + weight * (target - current)
+    if ramp_duration_s > 0:
+      self.ramp_targets[ids] = target
+      self.ramp_steps[ids] = 0
+      self.ramp_last_steps[ids] = env.common_step_counter
+      self.ramp_active[ids] = True
+      target = torch.zeros_like(target)
     asset.data.joint_pos_target[ids.unsqueeze(1), self.joint_ids] = target
     if write_state:
+      position = target
+      if clip_reset_state:
+        limits = asset.data.joint_pos_limits[ids.unsqueeze(1), self.joint_ids]
+        position = target.clamp(min=limits[..., 0], max=limits[..., 1])
       asset.write_joint_state_to_sim(
-        target,
+        position,
         torch.zeros_like(target),
         env_ids=ids,
         joint_ids=self.joint_ids,
       )
+
+  def advance(self, env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> None:
+    if self.ramp_duration_s == 0:
+      return
+    update = self.ramp_active & (self.ramp_last_steps != env.common_step_counter)
+    self.ramp_steps += update.long()
+    self.ramp_last_steps.masked_fill_(update, env.common_step_counter)
+    elapsed = self.ramp_steps * env.step_dt
+    fraction = (elapsed / self.ramp_duration_s).clamp(0.0, 1.0)
+    asset = env.scene[asset_cfg.name]
+    current = asset.data.joint_pos_target[:, self.joint_ids]
+    target = self.ramp_targets * fraction.unsqueeze(-1)
+    asset.data.joint_pos_target[:, self.joint_ids] = torch.where(self.ramp_active[:, None], target, current)
+    self.ramp_active &= fraction < 1.0
+
+
+def advance_arm_pose(env: ManagerBasedRlEnv, env_ids=None, reset_event_name: str = "reset_arm_pose") -> None:
+  """在控制拍末更新下一拍手臂目标，不改实际关节状态或已完成的渐变"""
+  del env_ids
+  cfg = env.event_manager.get_term_cfg(reset_event_name)
+  cfg.func.advance(env, cfg.params["asset_cfg"])
 
 
 class arm_torque_impulse:

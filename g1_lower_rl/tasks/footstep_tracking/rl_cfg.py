@@ -3,6 +3,7 @@
 from mjlab.rl import RslRlModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 
 from g1_lower_rl.rl.footstep_model import FootstepModelCfg
+from g1_lower_rl.tasks.footstep_tracking.curriculum import NUM_STEPS_PER_ENV
 
 
 def footstep_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
@@ -23,7 +24,7 @@ def footstep_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
     ),
     experiment_name="g1_footstep_tracking",
     # 64拍覆盖慢频率下的一整个左右周期
-    num_steps_per_env=64,
+    num_steps_per_env=NUM_STEPS_PER_ENV,
     max_iterations=10001,
     save_interval=100,
     logger="tensorboard",

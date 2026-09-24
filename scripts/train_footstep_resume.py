@@ -11,7 +11,7 @@ import re
 import signal
 import sys
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -83,6 +83,7 @@ class FootstepResumeRunner(MjlabOnPolicyRunner):
       "stop_probability": env.command_manager.get_term("footsteps").cfg.source.stop_probability,
       "link_mass_scale_range": list(env.event_manager.get_term_cfg("link_mass").params["scale_range"]),
       "source_root": str(ROOT),
+      "profile": os.environ.get("FOOTSTEP_PROFILE", "tracking"),
     }
     write_json(Path(self.logger.log_dir) / f"resume_rank_{self.gpu_global_rank}.json", receipt)
     print("RESUME_VERIFIED " + json.dumps(receipt), flush=True)
@@ -100,6 +101,7 @@ class FootstepResumeRunner(MjlabOnPolicyRunner):
         "rank": rank, "pid": os.getpid(), "from_scratch": True, "checkpoint": None,
         "first_iteration": first_iteration, "optimizer_state_entries": len(self.alg.optimizer.state),
         "learning_rate": self.alg.learning_rate, "source_root": str(ROOT),
+        "profile": os.environ.get("FOOTSTEP_PROFILE", "tracking"),
         "reward_weights": {name: self.env.unwrapped.reward_manager.get_term_cfg(name).weight
                            for name in self.env.unwrapped.reward_manager.active_terms},
         "compile_backend": self.env.unwrapped.command_manager.get_term("footsteps").cfg.compile_backend,
@@ -199,7 +201,8 @@ def main():
   parser.add_argument("--reset-optimizer", action="store_true", help="Restore models but keep the newly initialized optimizer and configured learning rate")
   parser.add_argument("--run-root", type=Path, help="Parent experiment directory for a new run")
   parser.add_argument("--envs-per-rank", type=int, default=128)
-  parser.add_argument("--max-updates", type=int, help="Finite validation run; omitted means train until stopped")
+  parser.add_argument("--profile", choices=("tracking", "walk-first"), default="tracking")
+  parser.add_argument("--max-updates", type=int, help="Maximum PPO updates; omitted means train until stopped")
   parser.add_argument("--tag", default="swing_linear_continuous")
   args = parser.parse_args()
   if args.from_scratch == (args.checkpoint is not None):
@@ -214,6 +217,7 @@ def main():
   os.environ["MUJOCO_GL"] = "egl"
   os.environ["FOOTSTEP_CONTINUOUS"] = "1" if args.max_updates is None else "0"
   os.environ["FOOTSTEP_RESET_OPTIMIZER"] = "1" if args.reset_optimizer else "0"
+  os.environ["FOOTSTEP_PROFILE"] = args.profile
   checkpoint = None if args.from_scratch else args.checkpoint.resolve(strict=True)
   first_iteration = 0
   if checkpoint is not None:
@@ -221,6 +225,10 @@ def main():
     first_iteration = int(saved["iter"]) + 1
     del saved
   cfg = replace(train.TrainConfig.from_task(train.FOOTSTEP_TASK), gpu_ids=[0, 1], enable_nan_guard=True)
+  if args.profile == "walk-first":
+    from g1_lower_rl.tasks.footstep_tracking.walk_first import walk_first_env_cfg
+
+    cfg = replace(cfg, env=walk_first_env_cfg())
   cfg.env.scene.num_envs = args.envs_per_rank
   cfg.agent.seed = 42
   cfg.agent.resume = checkpoint is not None
@@ -230,23 +238,11 @@ def main():
   cfg.agent.max_iterations = args.max_updates if args.max_updates is not None else 10000
   cfg.agent.save_interval = 100
   cfg.agent.run_name = args.tag
-  expected_tracking = {
-    "footstep_swing_position": 5.0, "footstep_swing_yaw": 5.0,
-    "footstep_landing": -4.0, "footstep_support": -1.0,
-  }
-  assert len(cfg.env.rewards) == 18
-  for name, weight in expected_tracking.items():
-    assert cfg.env.rewards[name].weight == weight
-  assert "footstep_distance" not in cfg.env.rewards and "footstep_approach" not in cfg.env.rewards
-  assert cfg.env.rewards["lower_body_copper_proxy"].weight == -1.0
-  assert cfg.env.rewards["head_height"].weight == 1.0
-  assert "pelvis_height" not in cfg.env.rewards and "torso_height" not in cfg.env.rewards
-  assert cfg.env.commands["footsteps"].source.stop_probability == 0.3
-  assert cfg.env.events["link_mass"].params["scale_range"] == (0.95, 1.05)
   run_root = args.run_root or (checkpoint.parent.parent if checkpoint else ROOT / "logs/rsl_rl" / cfg.agent.experiment_name)
   log_dir = run_root.resolve() / (datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_" + args.tag)
   log_dir.mkdir(parents=True, exist_ok=False)
   setup = {
+    "profile": args.profile,
     "checkpoint": str(checkpoint) if checkpoint else None, "from_scratch": args.from_scratch,
     "reset_optimizer": args.reset_optimizer, "configured_learning_rate": cfg.agent.algorithm.learning_rate,
     "run_dir": str(log_dir), "source_root": str(ROOT),
@@ -254,6 +250,9 @@ def main():
     "rollout_steps": cfg.agent.num_steps_per_env, "samples_per_update": 2 * args.envs_per_rank * cfg.agent.num_steps_per_env,
     "first_iteration": first_iteration, "max_updates": args.max_updates, "continuous": args.max_updates is None,
     "save_interval": cfg.agent.save_interval, "reward_weights": {name: term.weight for name, term in cfg.env.rewards.items()},
+    "command_config": {"manager": asdict(cfg.env.commands["footsteps"].manager),
+                       "source": asdict(cfg.env.commands["footsteps"].source)},
+    "curriculum_config": {name: term.params for name, term in cfg.env.curriculum.items()},
   }
   write_json(log_dir / "launch.json", setup)
   print("FOOTSTEP_RESUME_RUN " + json.dumps(setup), flush=True)

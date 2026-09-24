@@ -118,12 +118,13 @@ class FootstepManager:
     self.request = request
     self.sampler.set_direction(request.movement_direction, request.foot_heading)
     standing = not request.walking
-    # 两个双支撑中心等概率覆盖，下一抬脚侧是该落地中心的异侧
-    stance_side = int(self.sampler.rng.random() >= 0.5) if standing else 1
+    # 两种开局均等概率选择支撑侧，行走组从异侧抬脚边界开始
+    stance_side = int(self.sampler.rng.random() >= 0.5)
+    first_side = 1 - stance_side
     self.mode = "standing" if standing else "walking"
     self.frequency = 0.0 if standing else request.frequency
     self.elapsed = 0.0
-    self.phase = (self.cfg.phase.left_stance_phase, self.cfg.phase.right_stance_phase)[stance_side] if standing else self.cfg.phase.liftoff_rad[0]
+    self.phase = (self.cfg.phase.left_stance_phase, self.cfg.phase.right_stance_phase)[stance_side] if standing else self.cfg.phase.liftoff_rad[first_side]
     self.supports = feet
     self.targets = feet.copy()
     self.target_ids = np.array([0, 1], dtype=np.int64)
@@ -138,10 +139,10 @@ class FootstepManager:
     self.stop_ramp_start = 0.0
     self.stop_initial_frequency = 0.0
     self.start_progress = 0.0
-    self._fill_queue(1 - stance_side)
+    self._fill_queue(first_side)
     if not standing:
-      self.targets[0] = self.queue[0].pose_w
-      self.target_ids[0] = self.queue[0].target_id
+      self.targets[first_side] = self.queue[0].pose_w
+      self.target_ids[first_side] = self.queue[0].target_id
     self.initialized = True
     return self.command()
 
