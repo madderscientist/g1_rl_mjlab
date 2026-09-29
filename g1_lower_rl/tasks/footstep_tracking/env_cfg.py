@@ -14,6 +14,7 @@ from g1_lower_rl.assets import WHOLE_BODY_JOINTS
 from g1_lower_rl.footsteps import RandomCommandCfg
 from g1_lower_rl.tasks.footstep_tracking.commands import FootstepCommandCfg, footstep_execution_failed
 from g1_lower_rl.tasks.footstep_tracking.curriculum import DIRECTION_CHANGE_STAGES, FREQUENCY_RATE_STAGES, arm_target_scale, make_curriculum
+from g1_lower_rl.tasks.footstep_tracking.numerical_safety import NumericalSafety
 from g1_lower_rl.tasks.footstep_tracking.rewards_cfg import make_rewards, make_terminations
 from g1_lower_rl.tasks.lower_body.cfg.env_cfg import make_lower_body_env_cfg
 from g1_lower_rl.tasks.lower_body.cfg.observations import make_observations as lower_body_observations
@@ -49,6 +50,9 @@ def critic_state(env) -> torch.Tensor:
 def footstep_env_cfg(play: bool = False):
   """复用基础 G1 平地场景，替换速度和高度任务的命令、观测、奖励与课程"""
   cfg = make_lower_body_env_cfg()
+  cfg.sim.mujoco.timestep = 0.0025
+  cfg.decimation = 8
+  cfg.sim.njmax = 1024
   cfg.scene.num_envs = 1 if play else 64
   cfg.commands = {"footsteps": FootstepCommandCfg(debug_vis=play, source=RandomCommandCfg(
     initial_frequency=None, initial_standing_probability=0.5,
@@ -93,10 +97,20 @@ def footstep_env_cfg(play: bool = False):
   }
   cfg.rewards = make_rewards(phase_cfg=cfg.commands["footsteps"].manager.phase)
   # mjlab 默认在奖励之后更新 command，首个终止项负责提前推进并冻结本拍奖励快照
-  cfg.terminations = {"footstep_fault": TerminationTermCfg(func=footstep_execution_failed), **make_terminations()}
+  cfg.terminations = {
+    "footstep_fault": TerminationTermCfg(func=footstep_execution_failed),
+    **make_terminations(),
+    "numerical_safety": TerminationTermCfg(func=NumericalSafety, params={
+      "joint_speed_limit": 120., "root_speed_limit": 20., "root_angular_limit": 80.,
+    }),
+  }
   cfg.curriculum = make_curriculum()
   cfg.metrics = {}
   cfg.events["reset_arm_pose"].params["target_scale"] = arm_target_scale(0)
+  cfg.events["arm_pose_drift"].interval_range_s = (8.0, 12.0)
+  cfg.events["arm_pose_drift"].params.update(
+    interpolate=True, blend=1.0, scale_by_level=False, target_scale=arm_target_scale(0),
+  )
   cfg.events.pop("gait_phase")
   cfg.events.pop("push_robot")
   cfg.episode_length_s = 60.0

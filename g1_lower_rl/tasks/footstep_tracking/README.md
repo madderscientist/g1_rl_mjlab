@@ -1,6 +1,18 @@
-# 脚步跟踪训练
+# 两阶段脚步跟踪
 
 任务：`G1-Gloria-FootstepTracking`，平地脚印跟随，控制12腿轴和3腰轴，手臂由独立PD驱动。
+
+先用 `walk-first` 学习行走，再从已有检查点切换到 `precision` 精确跟踪；两阶段保持同一策略接口、1.2Hz请求步频和脚印课程，第二阶段只收紧精度引导并渐入落脚代价。阶段切换由训练命令显式指定。
+
+| 设置 | 第一阶段 `walk-first` | 第二阶段 `precision` |
+| --- | --- | --- |
+| XY引导：权重 / 核宽 | 1 / 0.40m | 5 / 0.20m |
+| yaw引导：权重 / 核宽 | 0.5 / 0.30rad | 5 / 0.10rad |
+| 摆动进度权重 | s | s² |
+| 落脚事件权重 | 关闭 | 0渐入至-0.1，默认2000轮 |
+| 位置 / yaw代价尺度 | 不适用 | 0.05m / 0.20rad，无免罚区 |
+
+`tracking` 是独立的默认配置：请求步频0.8–1.8Hz，落脚事件权重-1；第二阶段使用 `precision`。
 
 ## 策略接口
 
@@ -10,42 +22,38 @@
 - Critic：104维，额外观测线速度、接触和上一拍动作，使用MLP(256,128)。
 - 控制周期0.02s，PPO每轮64拍，回合60s。契约为 `g1_footstep_gru_v4`。
 
+物理步长0.0025s，每控制拍8个子步，约束容量1024。子步数值保护在关节速度超过120rad/s、根线速度超过20m/s、根角速度超过80rad/s或状态非有限时隔离对应环境，记录现场并按失败终止后reset；正常倒地仍使用概率终止。首10次事件保存状态、控制、外力与随机化模型字段，后续持续记录摘要。
+
 部署布局与导出见[模型契约](../../../FOOTSTEP_TRACKING.md)，生成器见[脚步模块](../../footsteps/README.md)。
 
-## 启动
+## 训练与续训
 
-以下命令在仓库根目录的 `mj` 环境运行。
+以下命令在仓库根目录运行，`WALK_CHECKPOINT` 指向第一阶段检查点，`PRECISION_CHECKPOINT` 指向第二阶段检查点。
 
 ```bash
-# 默认tracking配置，单GPU
-micromamba run -n mj python scripts/train.py G1-Gloria-FootstepTracking \
-  --gpu-ids '[0]' --env.scene.num-envs 64
-
-# walk-first从零训练，双GPU、每卡128环境；持续至停止请求
+# 第一阶段：双GPU、每卡128环境，从零学习行走
 OMP_NUM_THREADS=1 micromamba run -n mj python scripts/train_footstep_resume.py \
   --profile walk-first --from-scratch --envs-per-rank 128 \
-  --run-root logs/rsl_rl/footstep_walk_first --tag walk_first
+  --run-root logs/rsl_rl/footstep_walk_first --tag walk_first --save-interval 1000
 
-# 从19490续训，使用当前walk-first配置
+# 第二阶段：保留模型、优化器及课程，追加2000轮精度训练
 OMP_NUM_THREADS=1 micromamba run -n mj python scripts/train_footstep_resume.py \
-  logs/rsl_rl/split_mys_ours_15h_20260923/ours_gpu1/model_19490.pt --profile walk-first
+  "$WALK_CHECKPOINT" --profile precision --max-updates 2000 \
+  --save-interval 1000 --tag precision
+
+# 长时续训：双GPU、每卡128环境，固定预算，故障后从完整检查点恢复
+OMP_NUM_THREADS=1 micromamba run -n mj python scripts/train_footstep_supervised.py \
+  "$PRECISION_CHECKPOINT" --run-root logs/rsl_rl/footstep_precision_continuation \
+  --hours 48 --save-interval 1000 --max-restarts 3
 ```
 
-续训入口默认双GPU、每卡128环境，每100轮保存。恢复actor、critic、Adam、学习率及全局计数，从下一轮、新episode开始。
-`--max-updates N` 限定追加轮数；`--reset-optimizer` 保留模型并重建Adam。
-运行目录中的 `STOP` 文件或worker的SIGTERM请求会在完整更新后保存退出。
-回放已有模型应使用对应源码快照及profile；专用ONNX导出使用 `export_footstep_policy`。
+- **状态恢复**：actor、critic、归一化、Adam、学习率和全局计数精确恢复，从下一轮、新episode开始；`--reset-optimizer` 才会重建Adam。`precision_stage` 保存落脚渐入起点和时长，后续续训不重新渐入；首次切换默认从检查点计数开始，`--landing-ramp-updates` 可覆盖时长。
+- **预算与保存**：直接入口支持 `--max-updates N` 或 `--hours H`，二者互斥；都不指定则持续训练。默认每100轮保存，上例改为累计整千轮保存；停止时额外保存最终模型。
+- **监督运行**：固定 `precision`，检查点必须包含第二阶段元数据；新建独立run-root，自动引用旧检查点。初始化和故障恢复均计入预算，重试不延长截止时间；300秒无进度触发恢复。以 `supervisor.json` 为准，拒绝覆盖已有监督状态。
+- **正常停止**：直接入口在运行目录创建 `STOP` 或向worker发送SIGTERM。监督入口应向 `supervisor.json` 的 `pid` 发送SIGTERM，由它协调保存退出；仅停止worker会被当成需要恢复的中断。
+- **复现与回放**：每次改配置后冻结源码到独立目录并从该目录启动；回放使用对应快照与profile。`launch.json` 记录启动参数，`resume_rank_*.json` 验证恢复，`status_rank_*.json` 记录进度；日志与模型不入库。导出使用 `export_footstep_policy`。
 
-## 配置与课程
-
-| 设置 | tracking（默认） | walk-first（19490训练使用） |
-| --- | --- | --- |
-| XY引导：权重 / 核宽 | 5 / 0.20m | 1 / 0.40m |
-| yaw引导：权重 / 核宽 | 5 / 0.10rad | 0.5 / 0.30rad |
-| 摆动进度权重 | s² | s |
-| 落脚事件代价 | -1 | 关闭 |
-| 请求步频 | 每回合0.8–1.8Hz，变化率课程 | 1.2Hz |
-| 奖励项数 | 28 | 27 |
+## 指令课程
 
 **共同调度：** reset时50%站立、50%直接行走，随机起脚侧；指令每3–8s更新，停止概率30%，站立保持2–5s。
 起停渐变各0.5s；停脚后连续2拍双接触确认，等待超过0.5s判故障。频率f表示完整左右周期/s，f=0为站立。
@@ -57,50 +65,25 @@ OMP_NUM_THREADS=1 micromamba run -n mj python scripts/train_footstep_resume.py \
 课程按 `common_step_counter // 64` 在reset时选档，作用于后续采样的目标。
 walk-first配置见 [walk_first/env_cfg.py](walk_first/env_cfg.py)，阶段表见 [walk_first/curriculum.py](walk_first/curriculum.py)；共享课程见 [curriculum.py](curriculum.py)。
 
-## 奖励
+## 第二阶段约束
 
 常规项每拍贡献为 `weight * raw_value * 0.02`；落脚和非超时终止按事件计分。
-下表列出默认tracking配置，walk-first仅覆盖上表中的跟踪项。
 
-| 项 | 权重 | 定义 |
-| --- | ---: | --- |
-| `footstep_swing_position` | +5 | 摆动脚XY指数精度，核宽0.20m，乘s²；要求计划支撑脚实际接触 |
-| `footstep_swing_yaw` | +5 | 最短yaw角差指数精度，核宽0.10rad，门控同上 |
-| `footstep_landing` | -1/事件 | 每目标摆动离地后首次触地扣 `0.5*d/0.08 + 0.5*abs(yaw_error)/0.20`，f=0关闭 |
-| `contact_schedule` | +1 | 实测双脚接触模式与计划完全匹配，f>0启用 |
-| `foot_air_time` | +3.2 | 正确侧单支撑时长按摆动时长归一化，受摆动进度限制，原始值最高0.4 |
-| `swing_clearance` | -0.5 | 双脚足高绝对误差除以0.11m；摆动目标为 `0.11*sin(pi*s)^2`，支撑目标为地面 |
-| `swing_contact` | -0.5 | 计划摆动脚触地乘sin²相位权重 |
-| `foot_slip` | -2 | 接触脚水平速度平方和，f>0启用 |
-| `feet_slip_still` | -4 | 接触脚水平速度模长之和，f=0启用 |
-| `stand_still_feet` | -0.5 | 未接触脚数，f=0启用 |
-| `feet_hold_position` | -0.2 | f=0时脚位偏离冻结目标超过3cm的部分，按10cm归一化后平方、双脚平均 |
-| `feet_flatness` | -0.2 | 计划支撑或实际触地脚的法向倾角按15°归一化后平方、按脚平均 |
-| `soft_landing` | -0.002 | 首次触地力模长之和，f>0启用 |
-| `lower_body_copper_proxy` | -0.25 | 15轴实际执行器力矩平方和，共用100Nm尺度；f=0乘2，向外顶限位的关节乘10 |
-| `waist_yaw_zero` | -0.4 | 腰yaw绝对角平方 |
-| `waist_roll_pitch_edges` | -2 | 腰roll/pitch硬限位两侧各15%行程的边缘平方代价 |
-| `torso_upright` | -0.5 | 躯干相对竖直倾角平方 |
-| `body_ang_vel` | -0.05 | 躯干世界系X/Y角速度平方和 |
-| `head_height` | +0.4 | `clip(h/1.254,0,1)`；至少一脚接触且未终止时启用 |
-| `head_height_low` | -1 | `relu(1.15-h)/0.2`，h为头部几何中心离地高度 |
-| `stance_knee_bend` | -0.2 | 支撑膝超限角按45°归一化后平方、按腿平均；站立阈值30°，行走45° |
-| `pelvis_upright_filtered` | -1 | 低通后的骨盆重力XY平方和；截止频率为f/4，站立为0.2Hz |
-| `stand_still_linear_velocity` | +2 | f=0时 `exp(-(vx²+vy²+1.5*vz²)/0.2)` |
-| `stand_still_angular_velocity` | +0.5 | f=0时 `exp(-(wz²+0.05*(wx²+wy²))/0.49)` |
-| `action_rate` | -0.02 | 相邻动作差平方和 |
-| `controlled_joint_acc` | -2.5e-7 | 15轴实测加速度平方和 |
-| `self_collisions` | -2 | 腿间接触力超过10N的物理子步数 |
-| `fall` | -10/次 | 非超时终止事件 |
+- **落脚精度**：每目标离地后首次触地扣 `0.1 * (0.5*d/0.05 + 0.5*abs(yaw_error)/0.20)`，渐入结束后使用完整系数；不按支撑时长重复收费，f=0关闭。
+- **站定**：脚位相对冻结目标超过3cm才计罚；所有脚的XYZ速度超过0.02m/s计罚，包含离地脚；零速度正奖励乘 `1 / (1 + mean(d²)/0.10²)`，限制碎步漂移。
+- **关节姿态**：髋yaw归零-0.1、腰yaw归零-0.4；六对腿关节EMA对称项-0.1，允许正常交替摆动。站姿和对称项为两阶段共享。
+- **平衡与能耗**：保留接触节拍、足高、躯干/骨盆直立、头高、膝弯、足底平放、动作平滑和铜损。铜损基础权重-0.25，站立乘2；硬限位附近0.1°且力矩向外的关节乘10。
 
-铜损的限位容差为0.1°，只有接近或越过硬限位且力矩继续向外时放大；站立倍率与限位倍率相乘。
-腰yaw项约束相对骨盆的扭腰角。奖励配置与公式见 [rewards_cfg.py](rewards_cfg.py)、[rewards.py](rewards.py)。
+完整30项定义见[奖励契约](../../../FOOTSTEP_TRACKING.md#10-训练奖励契约)，工厂与公式见 [rewards_cfg.py](rewards_cfg.py)、[rewards.py](rewards.py)。第一阶段不含落脚事件，共29项。
+
+腿部对称项：pitch/knee取左减右，roll/yaw取左加右；先EMA再计算代价。时间常数为 `min(1/f, 2s)`，f=0时为1秒，新样本权重为 `1-exp(-dt/tau)`。仅稳定行走且计划移动方向与脚朝向相差不超过15°时启用；站定时要求两脚目标的前后错位不超过5cm。两种模式均要求目标脚yaw相对计划朝向的镜像和偏差不超过30°。起停和不符合条件时清空历史；reset、重新启用或意图变更时按当前偏差初始化并重新渐入1秒。同拍重复计算不推进滤波，局部reset不影响其他环境。实现见 [leg_symmetry.py](leg_symmetry.py)。
 
 ## 初始化与随机化
 
 - 手臂14轴实际角度、速度和初始PD目标设为0。最终目标独立采样 `U(lower-pi/2, upper+pi/2) * target_scale`，每个环境在reset后5秒内线性渐变到终点。
-- `target_scale` 在0–800轮为0.2，随后线性升至1500轮0.5、2000轮1.0；只影响后续reset。渐变期间暂停目标漂移。越界目标及渐变路径可能产生限位力矩或自碰撞。
-- 基础随机化复用 [lower_body事件](../lower_body/cfg/events.py)，包括连杆质量、夹爪负载、脚底摩擦、编码器偏置和质心偏移。主动手臂力矩、目标漂移与身体平移推力处于初始档，身体冲量仍含±2Nm力矩。
+- 每个环境每8–12秒从 `ARM_TARGET_RANGES` 采样新姿势并乘 `target_scale`，从当前PD目标线性插值5秒；过渡期间不重采样，不改实际关节角和速度。
+- `target_scale` 在0–800轮为0.2，随后线性升至1500轮0.5、2000轮1.0；只影响后续reset和定时采样。越界目标及渐变路径可能产生限位力矩或自碰撞。
+- 基础随机化复用 [lower_body事件](../lower_body/cfg/events.py)，包括连杆质量、夹爪负载、脚底摩擦、编码器偏置和质心偏移。主动手臂力矩与身体平移推力处于初始档，身体冲量仍含±2Nm力矩；定时手臂目标插值独立启用。
 - 训练actor使用高斯观测噪声：关节角0.006rad、关节速度0.87rad/s、IMU角速度0.115rad/s、重力分量0.029；IMU偏置每回合采样。critic和play关闭观测噪声，编码器偏置仍保留；观测延迟为0。
 
 ## 终止与时序
@@ -116,7 +99,10 @@ walk-first配置见 [walk_first/env_cfg.py](walk_first/env_cfg.py)，阶段表�
 
 ```bash
 OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python -m pytest -q \
-  tests/test_footstep_*.py tests/test_tensor_footsteps.py tests/test_single_duration.py
+  tests/test_footstep_precision.py tests/test_footstep_resume.py tests/test_footstep_supervised.py \
+  tests/test_footstep_tracking_objectives.py tests/test_footstep_still_velocity.py \
+  tests/test_footstep_leg_symmetry.py tests/test_footstep_numerical_safety.py \
+  tests/test_arm_reset_ranges.py tests/test_footstep_arm_curriculum.py
 ```
 
 评测关注XY/yaw误差、存活时间、起停成功率、力矩与接触冲击。测试和仿真回放不能代替实机安全验证。

@@ -11,6 +11,7 @@ from mjlab.managers.termination_manager import TerminationTermCfg
 from g1_lower_rl.assets import LOWER_BODY_JOINTS
 from g1_lower_rl.footstep_phase import FootstepPhaseCfg, resolve_phase_cfg
 from g1_lower_rl.tasks.footstep_tracking import rewards
+from g1_lower_rl.tasks.footstep_tracking.leg_symmetry import LEG_JOINTS, LegSymmetryEMA
 from g1_lower_rl.tasks.footstep_tracking.terminations import footstep_distance_exceeded
 from g1_lower_rl.tasks.lower_body import mdp
 from g1_lower_rl.tasks.lower_body.cfg.terminations import make_terminations as lower_body_terminations
@@ -24,7 +25,7 @@ def make_rewards(
   command_name: str = "footsteps",
   sensor_name: str = "feet_ground_contact",
   stance_fraction: float | None = None,
-  position_std: float = 0.08,
+  position_std: float = 0.05,
   yaw_std: float = 0.2,
   copper_weights: dict[str, float] | None = None,
   *,
@@ -59,30 +60,33 @@ def make_rewards(
       ("swing_clearance", "clearance", -0.5),
       ("swing_contact", "swing_contact", -0.5),
       ("foot_slip", "slip", -2.0),
-      ("feet_slip_still", "slip_still", -4.0),
+      ("feet_slip_still", "slip_still", -1.0),
       ("stand_still_feet", "stationary", -0.5),
     )
   }
+  terms["feet_slip_still"].params["still_speed_deadband"] = 0.02
   terms.update(
     {
       "stand_still_linear_velocity": RewardTermCfg(
         func=rewards.standing_linear_velocity_reward,
         weight=2.0,
         params={
-          "asset_cfg": SceneEntityCfg("robot"),
+          "asset_cfg": SceneEntityCfg("robot", site_names=("left_foot", "right_foot"), preserve_order=True),
           "command_name": command_name,
           "std": math.sqrt(0.2),
           "z_penalty": 1.5,
+          "position_scale": 0.1,
         },
       ),
       "stand_still_angular_velocity": RewardTermCfg(
         func=rewards.standing_angular_velocity_reward,
         weight=0.5,
         params={
-          "asset_cfg": SceneEntityCfg("robot"),
+          "asset_cfg": SceneEntityCfg("robot", site_names=("left_foot", "right_foot"), preserve_order=True),
           "command_name": command_name,
           "std": 0.7,
           "xy_penalty": 0.05,
+          "position_scale": 0.1,
         },
       ),
       "feet_flatness": RewardTermCfg(
@@ -136,6 +140,29 @@ def make_rewards(
           "limit_margin": math.radians(0.1),
         },
       ),
+      "leg_symmetry_ema": RewardTermCfg(
+        func=LegSymmetryEMA,
+        weight=-0.1,
+        params={
+          "asset_cfg": SceneEntityCfg("robot", joint_names=LEG_JOINTS, preserve_order=True),
+          "command_name": command_name,
+          "cycles": 1.0,
+          "standing_tau_s": 1.0,
+          "max_tau_s": 2.0,
+          "deadband": math.radians(3),
+          "direction_tolerance": math.radians(15),
+          "target_yaw_tolerance": math.radians(30),
+          "standing_fore_aft_tolerance": 0.05,
+          "ramp_s": 1.0,
+        },
+      ),
+      "hip_yaw_zero": RewardTermCfg(
+        func=rewards.joint_zero_l2,
+        weight=-0.1,
+        params={
+          "asset_cfg": SceneEntityCfg("robot", joint_names=("left_hip_yaw_joint", "right_hip_yaw_joint"), preserve_order=True),
+        },
+      ),
       "waist_yaw_zero": RewardTermCfg(
         func=rewards.joint_zero_l2,
         weight=-0.4,
@@ -151,7 +178,7 @@ def make_rewards(
       ),
       "torso_upright": RewardTermCfg(
         func=rewards.body_tilt_angle_l2,
-        weight=-0.5,
+        weight=-1.0,
         params={"asset_cfg": SceneEntityCfg("robot", body_names=("torso_link",))},
       ),
       "body_ang_vel": RewardTermCfg(

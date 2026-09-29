@@ -61,6 +61,7 @@ class FootstepCommand(CommandTerm):
     self.future_world = self.batch.state["future_world"]
     self.future_sides = self.batch.state["future_sides"]
     self.support_world = self.batch.state["supports"]
+    self.symmetry_state = {name: self.batch.state[name].clone() for name in ("mode", "direction", "heading")}
     self.reward_state = FootstepRewardState(
       phase=torch.zeros(self.num_envs, device=self.device),
       frequency=torch.zeros(self.num_envs, device=self.device),
@@ -102,6 +103,8 @@ class FootstepCommand(CommandTerm):
     if not self._needs_reset:
       return
     self.batch.reset(foot_poses(self.robot.data, self.site_ids), self.pending_reset)
+    for name, value in self.symmetry_state.items():
+      value.copy_(torch.where(self.pending_reset, self.batch.state[name], value))
     self.pending_reset.zero_()
     self._needs_reset = False
     self._publish()
@@ -156,6 +159,8 @@ class FootstepCommand(CommandTerm):
     self._env.sim.forward()
     feet = foot_poses(self.robot.data, self.site_ids)
     contact = self._env.scene[self.cfg.sensor_name].data.found > 0
+    for name, value in self.symmetry_state.items():
+      value.copy_(self.batch.state[name])
     self.batch.advance(feet, contact)
     self.last_step = self._env.common_step_counter
     self._publish()

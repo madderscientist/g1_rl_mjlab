@@ -238,7 +238,7 @@ class scaled_body_impulse(apply_body_impulse):
 class hold_arm_pose:
   """把手臂保持在一个随机采样的 PD 目标上。
 
-  reset可从零位渐变到扩展目标；interval使用原范围，且可等待reset渐变完成。
+  reset可从零位渐变到扩展目标；interval可复用reset的渐变器平滑换姿势。
   """
 
   def __init__(self, cfg: EventTermCfg, env: ManagerBasedRlEnv):
@@ -258,6 +258,7 @@ class hold_arm_pose:
     self.ramp_duration_s = cfg.params.get("ramp_duration_s", 0.0)
     if not math.isfinite(self.ramp_duration_s) or self.ramp_duration_s < 0:
       raise ValueError("Ramp duration must be finite and nonnegative")
+    self.ramp_starts = torch.zeros(env.num_envs, len(ids), device=env.device)
     self.ramp_targets = torch.zeros(env.num_envs, len(ids), device=env.device)
     self.ramp_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
     self.ramp_last_steps = torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device)
@@ -283,16 +284,25 @@ class hold_arm_pose:
     ramp_duration_s: float = 0.0,
     defer_during_ramp: str | None = None,
     target_scale: float = 1.0,
+    interpolate: bool = False,
   ) -> None:
     del ranges  # 已在 __init__ 里消费。
     if ramp_duration_s != self.ramp_duration_s:
       raise ValueError("Ramp duration must match the event configuration")
     if not math.isfinite(target_scale) or not 0.0 <= target_scale <= 1.0:
       raise ValueError("Target scale must be finite and between 0 and 1")
+    if interpolate and (defer_during_ramp is None or write_state):
+      raise ValueError("Interpolated drift requires a ramp event and no state write")
     asset: Entity = env.scene[asset_cfg.name]
     ids = _env_ids(env, env_ids)
+    ramp = self
     if defer_during_ramp is not None:
-      ramp = env.event_manager.get_term_cfg(defer_during_ramp).func
+      ramp_cfg = env.event_manager.get_term_cfg(defer_during_ramp)
+      ramp = ramp_cfg.func
+      if interpolate and (ramp.ramp_duration_s <= 0
+                          or ramp_cfg.params["asset_cfg"].name != asset_cfg.name
+                          or not torch.equal(ramp.joint_ids, self.joint_ids)):
+        raise ValueError("Interpolated drift requires a positive ramp on the same joints")
       ids = ids[~ramp.ramp_active[ids]]
       if len(ids) == 0:
         return
@@ -317,12 +327,14 @@ class hold_arm_pose:
     if scale_by_level:
       weight = weight * disturbance_level(env)[ids].unsqueeze(1)
     target = current + weight * (target - current)
-    if ramp_duration_s > 0:
-      self.ramp_targets[ids] = target
-      self.ramp_steps[ids] = 0
-      self.ramp_last_steps[ids] = env.common_step_counter
-      self.ramp_active[ids] = True
-      target = torch.zeros_like(target)
+    if ramp_duration_s > 0 or interpolate:
+      ramp = ramp if interpolate else self
+      ramp.ramp_starts[ids] = torch.zeros_like(current) if write_state else current
+      ramp.ramp_targets[ids] = target
+      ramp.ramp_steps[ids] = 0
+      ramp.ramp_last_steps[ids] = env.common_step_counter
+      ramp.ramp_active[ids] = True
+      target = ramp.ramp_starts[ids]
     asset.data.joint_pos_target[ids.unsqueeze(1), self.joint_ids] = target
     if write_state:
       position = target
@@ -346,7 +358,7 @@ class hold_arm_pose:
     fraction = (elapsed / self.ramp_duration_s).clamp(0.0, 1.0)
     asset = env.scene[asset_cfg.name]
     current = asset.data.joint_pos_target[:, self.joint_ids]
-    target = self.ramp_targets * fraction.unsqueeze(-1)
+    target = torch.lerp(self.ramp_starts, self.ramp_targets, fraction.unsqueeze(-1))
     asset.data.joint_pos_target[:, self.joint_ids] = torch.where(self.ramp_active[:, None], target, current)
     self.ramp_active &= fraction < 1.0
 

@@ -3,10 +3,22 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 
 import torch
 
 from g1_lower_rl.footstep_phase import FootstepPhaseCfg, resolve_phase_cfg
+
+
+@lru_cache(maxsize=32)
+def _phase_constants(cfg: FootstepPhaseCfg, device: torch.device, dtype: torch.dtype):
+  with torch.inference_mode(False):
+    contact_start = torch.tensor(cfg.contact_start_rad, device=device, dtype=dtype)
+    stance_durations = torch.tensor(cfg.stance_fractions, device=device, dtype=dtype)
+    wrapped_start = torch.remainder(contact_start, 2 * math.pi)
+    liftoff = torch.remainder(torch.tensor(cfg.liftoff_rad, device=device, dtype=dtype), 2 * math.pi)
+    return (contact_start, stance_durations, wrapped_start, liftoff,
+            1.0 - stance_durations, liftoff > wrapped_start)
 
 
 def phase_windows(
@@ -14,18 +26,16 @@ def phase_windows(
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """根据共用接触时序返回支撑掩码和摆动进度"""
   cfg = resolve_phase_cfg(stance_fraction, phase_cfg)
-  contact_start = phase.new_tensor(cfg.contact_start_rad)
-  stance_durations = phase.new_tensor(cfg.stance_fractions)
+  contact_start, stance_durations, wrapped_start, liftoff, swing_durations, non_wrapping = _phase_constants(
+    cfg, phase.device, phase.dtype)
   progress = torch.remainder(phase.unsqueeze(-1) - contact_start, 2 * math.pi) / (2 * math.pi)
   wrapped = torch.remainder(phase, 2 * math.pi).unsqueeze(-1)
-  contact_start = torch.remainder(contact_start, 2 * math.pi)
-  liftoff = torch.remainder(phase.new_tensor(cfg.liftoff_rad), 2 * math.pi)
   stance = torch.where(
-    liftoff > contact_start,
-    (wrapped >= contact_start) & (wrapped < liftoff),
-    (wrapped >= contact_start) | (wrapped < liftoff),
+    non_wrapping,
+    (wrapped >= wrapped_start) & (wrapped < liftoff),
+    (wrapped >= wrapped_start) | (wrapped < liftoff),
   )
-  swing_progress = ((progress - stance_durations) / (1.0 - stance_durations)).clamp(0.0, 1.0)
+  swing_progress = ((progress - stance_durations) / swing_durations).clamp(0.0, 1.0)
   return stance, swing_progress
 
 

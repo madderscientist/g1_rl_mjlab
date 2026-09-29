@@ -6,8 +6,8 @@ from g1_lower_rl.tasks.footstep_tracking.env_cfg import footstep_env_cfg
 from g1_lower_rl.tasks.footstep_tracking.walk_first.curriculum import make_walk_first_curriculum
 
 
-def walk_first_env_cfg(play: bool = False):
-  """保留脚步观测、起停和物理设置，只降低初始任务难度"""
+def _staged_env_cfg(play: bool):
+  """两阶段共用固定请求步频和逐步扩展的脚印课程"""
   cfg = footstep_env_cfg(play=play)
   command = cfg.commands["footsteps"]
   sampler = replace(
@@ -26,6 +26,12 @@ def walk_first_env_cfg(play: bool = False):
     direction_change_range=(0.0, 0.0), foot_heading_range=(0.0, 0.0),
   )
   cfg.curriculum = make_walk_first_curriculum()
+  return cfg
+
+
+def walk_first_env_cfg(play: bool = False):
+  """第一阶段用宽容的精度引导学习行走"""
+  cfg = _staged_env_cfg(play)
   cfg.rewards.pop("footstep_landing")
   for name, weight, parameter, width in (
     ("footstep_swing_position", 1.0, "swing_position_std", 0.4),

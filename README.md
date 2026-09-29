@@ -1,8 +1,17 @@
 # g1_lower_rl
 
-Unitree G1 + 双 Gloria-M 夹爪的**下肢行走**强化学习任务，基于 [mjlab](https://github.com/mujocolab/mjlab) 1.5.x。
+Unitree G1 + 双 Gloria-M 夹爪的强化学习项目，包含下肢行走、两阶段脚步跟踪和全身动作跟踪，基于 [mjlab](https://github.com/mujocolab/mjlab) 1.5.x。
 
-从 `unitree_rl_mjlab`（mjlab 1.2.0）迁移而来，只保留下肢任务，并重整了项目结构。
+## 两阶段脚步跟踪
+
+`G1-Gloria-FootstepTracking` 控制12腿轴和3腰轴，手臂由独立PD驱动。使用同一GRU策略分两阶段训练：
+
+1. **walk-first：先学行走。** 固定请求步频1.2Hz，使用宽容的落点引导，逐步扩大脚印方向、步距、站距和yaw范围。
+2. **precision：再学精确跟踪。** 恢复第一阶段的actor、critic、Adam和课程计数，保持指令分布，收紧XY/yaw引导并渐入落脚事件代价；支持定时保存、固定预算续训和故障恢复。
+
+当前配置包含5cm落脚位置尺度、站定防碎步、髋yaw弱正则、步频自适应腿部对称约束和定时手臂插值。数值保护用于隔离不稳定仿真环境，不代表实机安全保证。
+
+训练命令、阶段参数与验证见[脚步任务说明](g1_lower_rl/tasks/footstep_tracking/README.md)；输入布局、导出及奖励公式见[脚步模型契约](FOOTSTEP_TRACKING.md)。日志和模型保存在 `logs/`，不随源码提交。
 
 ## 环境
 
@@ -18,7 +27,7 @@ conda-forge 的 `libicui18n` 需要比系统更新的 `libstdc++`，不加的话
 `import mjlab` 会在 `sqlite3` 处以 `CXXABI_1.3.15 not found` 失败。
 **所以必须先 `micromamba activate mj`，不要直接调 `envs/mj/bin/python`。**
 
-## 用法
+## 其他任务
 
 ```bash
 # 列出任务
@@ -51,8 +60,6 @@ python scripts/disturb_video.py <run>/model_8800.pt out.mp4 20
 ```
 
 动作跟踪任务另有一组脚本，见 [`tasks/motion_tracking/README.md`](g1_lower_rl/tasks/motion_tracking/README.md)。
-
-自研脚步跟踪任务 `G1-Gloria-FootstepTracking` 的实现与训练入口见[任务说明](g1_lower_rl/tasks/footstep_tracking/README.md)。
 
 **全身动作跟踪最终成果**：GitHub Release `model-215787`。仓库内的
 `artifacts/final_model_215787/` 保留 manifest 和部署契约，checkpoint 与 ONNX 作为

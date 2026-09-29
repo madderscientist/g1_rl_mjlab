@@ -60,10 +60,11 @@ def arm_target_scale(iteration: int) -> float:
 
 
 def arm_pose_amplitude(env, env_ids, num_steps_per_env=NUM_STEPS_PER_ENV):
-  """只更新后续reset采样的最终角度系数，不改变进行中的五秒渐变"""
+  """只更新后续reset和定时采样的角度系数，不改变进行中的五秒渐变"""
   del env_ids
   scale = arm_target_scale(env.common_step_counter // num_steps_per_env)
   env.event_manager.get_term_cfg("reset_arm_pose").params["target_scale"] = scale
+  env.event_manager.get_term_cfg("arm_pose_drift").params["target_scale"] = scale
   return {"target_scale": scale}
 
 

@@ -4,13 +4,12 @@
 
 当前输入为 `[L_support,R_support,L_next,R_next]`：双脚上一次支撑落点，加双脚各自下一落点，仅预览未来两步。
 原始84维、编码89维保持不变，但槽位语义不兼容；v1/v2/v3 ONNX不得换标签复用。
-默认GRU隐藏维度64，MLP为256→256→128。当前采用50%站立、50%直接行走开局；此前全站立试跑已停止并删除结果。
+默认GRU隐藏维度64，MLP为256→256→128；reset时50%站立、50%直接行走。
 
 已实现模型、输入编码、PPO 模型配置、TorchScript/ONNX 导出、CPU 推理封装，以及训练奖励和防摔终止配置。
 另已实现独立的 NumPy 脚印采样、四步管理及频率停走调度模块。
-已接入 `G1-Gloria-FootstepTracking` 环境，完成walk-first的15小时训练；目前仅保留最终19490所属的完整训练及源码快照，回放命令见[训练说明](g1_lower_rl/tasks/footstep_tracking/README.md#保留的训练)。
-最终19490已通过500步无窗口回放；定量跟踪精度、大规模吞吐和硬件安全仍须独立验证，不能直接用于机器人。
-训练入口、参数和时序见 [训练说明](g1_lower_rl/tasks/footstep_tracking/README.md)
+训练采用两阶段：`walk-first`学习行走，`precision`保持指令课程并收紧精度奖励，完整恢复模型与优化器后续训。定量精度、存活和硬件安全须分别评估，不能直接将仿真模型用于机器人。
+训练入口、参数和时序见[训练说明](g1_lower_rl/tasks/footstep_tracking/README.md)。本文件定义部署接口和奖励公式，不记录运行中的轮号或机器路径。
 
 实现位置：
 
@@ -267,7 +266,7 @@ actions, q_des = policy.step(obs)
 真正闭环运行前，还必须把独立脚步管理器接入控制时序，提供坐标估计、传感器过期检测、推理超时、
 电机限位/力矩保护和安全接管。控制长时间中断时不能简单跳过多个脚印继续推理。
 
-## 9. 验证与后续训练设计
+## 9. 验证
 
 ```bash
 OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_model.py tests/test_tensor_footsteps.py -q
@@ -277,17 +276,13 @@ OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_mode
 多拍动作/隐状态对齐、旧契约拒绝及真实环境支撑基准输入与完成拍执行奖励的分离。
 规划器测试覆盖NumPy/编译GPU状态一致性、摆动期间基准冻结、计划落地更新和仅预览最近两步及局部重置；不验证策略已学会行走。
 
-下一轮训练遵循落点/脚掌朝向/节拍跟踪和不摔倒的目标；2026-09-21铜损权重调整为-0.25，
-腰 yaw 靠近零、腰 roll/pitch 临近限位惩罚；加入头部高度单调封顶奖励，但不增加身体高度指令。
-当前先保持抗扰动初始档，不增加上肢摆动或外力难度；指令课程只按已约定阶段放开。
-没有电机电阻/力矩常数/传动标定时，力矩平方仅称为铜损代理。
-脚印范围和频率参数已有可调实现初值，仍需验证可行性；阶段范围和训练预算仍须结合实际训练评估。
-奖励初始权重见下一节，训练中需根据分项指标调节，不代表已经验证的最优权重。
+评测分别报告实际首次落脚XY/yaw误差、存活时间、起停成功率、力矩和关节对称性，不用不同配方的总奖励直接比较优劣。
+第二阶段保留手臂幅度课程及8–12秒换姿势、5秒插值；参数和阈值仍需训练验证。力矩平方仅称为铜损代理，不等于标定后的能耗。
 
 ## 10. 训练奖励契约
 
 训练端加速实现见 [批量管理器](g1_lower_rl/footsteps/tensor_manager.py) 和
-[训练适配与基准说明](g1_lower_rl/tasks/footstep_tracking/README.md#设备驻留批量脚步后端)。
+[训练适配与验证](g1_lower_rl/tasks/footstep_tracking/README.md#验证)。
 加速不改变本节奖励定义，也不修复已观察到的短回合/频繁跌倒问题；部署观测及动作契约不变。
 
 入口为 `make_rewards(command_name="footsteps", sensor_name="feet_ground_contact")`。
@@ -297,29 +292,36 @@ OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_mode
 
 ### 10.1 当前奖励表
 
+下表是默认 `tracking` 工厂。两阶段复用这些姿态和稳定性项：`walk-first`关闭落脚事件、放宽摆动奖励；`precision`保留精确摆动奖励，将落脚事件权重按保存的课程从0渐入至-0.1。阶段对照见[训练说明](g1_lower_rl/tasks/footstep_tracking/README.md)。
+
 | 名称 | 权重 | 意图/原始值 |
 | --- | --- | --- |
 | `footstep_landing` | -1.0/事件 | 每目标在计划摆动中离地后的首次触地评价一次XY/yaw误差；无漏落或时序附加罚；f=0关闭 |
 | `footstep_swing_position` | +5.0 | 计划摆动脚 `s^2*exp(-(XY_distance/0.20)^2)`，须有计划支撑脚实际接触 |
-| `footstep_swing_yaw` | +5.0 | 计划摆动脚 `exp(-(wrapped_yaw_error/0.10)^2)`，阶段门控同上 |
+| `footstep_swing_yaw` | +5.0 | 计划摆动脚 `s^2*exp(-(wrapped_yaw_error/0.10)^2)`，阶段门控同上 |
 | `contact_schedule` | +1.0 | 双脚实测接触模式完全匹配计划才得1，任一脚不符得0，f=0关闭 |
 | `foot_air_time` | +3.2 | 仅计划正确侧单支撑，时长按当前计划摆动时长归一化并受摆动进度限制，原始值最高0.4 |
 | `swing_clearance` | -0.5 | 双脚计划足高绝对误差除以0.11m后求和；摆动峰值0.11m，支撑及停脚为0 |
 | `swing_contact` | -0.5 | 计划摆动脚实际触地的sin平方相位加权代价；起落边界为0、中点为1 |
 | `foot_slip` | -2.0 | 实际触地脚的 XY 速度平方和，f>0启用 |
-| `feet_slip_still` | -4.0 | 实际触地脚的 XY 速度模长之和，f=0启用 |
+| `feet_slip_still` | -1.0 | 双脚世界系XYZ速度模长超过0.02m/s的部分求和，包含离地脚，f=0启用 |
 | `stand_still_feet` | -0.5 | 未接触脚数，f=0启用 |
 | `feet_hold_position` | -0.2 | 仅f=0，双脚相对冻结停脚目标的XY距离超过3cm部分按10cm归一化平方后取平均 |
+| `feet_flatness` | -0.2 | 计划支撑或实测接触脚的法向倾角，按15°归一化平方后按脚平均；f=0约束双脚 |
 | `soft_landing` | -0.002 | 首次触地接触力模长惩罚，f>0启用，持续支撑不收费 |
 | `lower_body_copper_proxy` | -0.25（基础） | 15个受控腿腰执行器的实际力矩统一尺度平方和；f=0乘2，有效权重-0.5 |
+| `hip_yaw_zero` | -0.1 | 左右 `hip_yaw_joint` 绝对角度（rad）的平方和，目标是 0 rad，站立和行走均启用 |
+| `leg_symmetry_ema` | -0.1 | 六对腿关节镜像偏差先EMA，超过3°的部分平方后平均；直行/对称站姿门控及1秒渐入 |
 | `waist_yaw_zero` | -0.4 | `waist_yaw_joint` 绝对角度平方，目标是 0 rad，不是默认姿态偏差 |
 | `waist_roll_pitch_edges` | -2.0 | 两个腰轴靠近硬限位的边缘平方惩罚，内部区域为零 |
-| `torso_upright` | -0.5 | torso 相对竖直倾角的平方（弧度），`theta=atan2(norm(g_b.xy),-g_b.z)`，不约束世界 yaw，不控制身体高度 |
+| `torso_upright` | -1.0 | torso 相对竖直倾角的平方（弧度），`theta=atan2(norm(g_b.xy),-g_b.z)`，不约束世界 yaw，不控制身体高度 |
 | `body_ang_vel` | -0.05 | `torso_link` 实际世界系X/Y角速度平方和，站立和行走均启用，不罚Z轴转向 |
 | `head_height` | +0.4 | `clip((head_z-ground_z)/1.254,0,1)`，直接取 `head_collision` 几何体中心，至少一脚接触且未失败时启用 |
 | `head_height_low` | -1.0 | `relu(1.15-head_height_above_ground)/0.2`，站立和行走均启用，不因腾空免罚 |
 | `stance_knee_bend` | -0.2 | 计划支撑腿过度屈膝平方代价，停脚容许30度、行走支撑45度，尺度45度；摆动腿不罚 |
 | `pelvis_upright_filtered` | -1.0 | 随f调整的一阶低通骨盆重力向量XY分量平方和，不罚步频摆动的原始幅度 |
+| `stand_still_linear_velocity` | +2.0 | f=0时根机体系零线速度指数奖励，乘冻结站定脚位系数 |
+| `stand_still_angular_velocity` | +0.5 | f=0时根机体系零角速度指数奖励，乘相同站定脚位系数 |
 | `action_rate` | -0.02 | 15 维动作相邻拍差的平方和 |
 | `controlled_joint_acc` | -2.5e-7 | 仅 15 轴关节加速度平方和，不罚外部控制的手臂/夹爪 |
 | `self_collisions` | -2.0 | 复用 lower_body 的腿间自碰撞传感器，统计控制拍内超过 10 N 的接触子步数 |
@@ -337,7 +339,7 @@ OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_mode
 按计划摆动阶段启用，且至少一只计划支撑脚必须实际接触；双支撑及f=0时关闭。
 XY/yaw引导不要求摆动脚已经离地，但只有摆动脚接触或双脚腾空时不给逼近奖励；另以swing_contact对计划摆动触地收费。
 进度平方使起脚边界奖励从0增长，避免一起脚就能获得终点满分；这不保证足速或物理稳定性，需要重训验证。
-默认工厂参数 `position_std=0.08 m`、`yaw_std=0.20 rad` 保留名称，但用于落脚线性代价尺度。
+默认工厂参数 `position_std=0.05 m`、`yaw_std=0.20 rad` 保留名称，但用于落脚线性代价尺度。
 这些尺度不是容许误差上界或已实现的实机精度。
 
 ```text
@@ -351,7 +353,9 @@ reward_landing_per_step = -1 * raw_landing * step_dt
 
 线性代价不截断，XY整体距离与yaw各占50%，不把X和Y拆开。
 旧 `footstep_approach`、`footstep_distance`、旧指数落地/支撑原语及 `distance_penalty` 参数已删除。
-默认配置28项（7正、21负），独立walk-first配置27项（移除落脚事件代价）；铜损行走-0.25、f=0时-0.5。
+默认配置30项（7正、23负），独立walk-first配置29项（移除落脚事件代价）；铜损行走-0.25、f=0时-0.5。
+
+`leg_symmetry_ema` 对pitch/knee计算左减右、对roll/yaw计算左加右。EMA时间常数为 `min(1/f,2s)`，站立1秒，按控制步计算 `alpha=1-exp(-dt/tau)`。门控使用完成拍的计划意图而非实际速度：稳定行走需方向与脚朝向差不超过15°；站定需两目标脚在朝向系内前后差不超过5cm；目标yaw镜像和偏差均需不超过30°。不满足时清空滤波，重新启用/意图变化后从当前误差初始化、1秒渐入。六对均值使用rad平方，腰/手臂不计入；无需修改GRU或观测契约。
 历史A/B脚本须使用对应源码快照，不能直接调用当前奖励工厂。
 持续续训入口为 `scripts/train_footstep_resume.py`，支持双卡精确恢复及更新结束后同步保存退出。
 比较run需使用原始XY/yaw误差和存活率，不能通过不同定义下的总奖励判断效果。
@@ -362,16 +366,18 @@ reward_landing_per_step = -1 * raw_landing * step_dt
 不惩罚世界Z轴转向，不替代原torso倾角项或静止骨盆零角速度奖励，也不直接改变手臂PD或物理阻尼。
 需重新训练后评估torso晃动，历史冻结模型不自动采用。
 
-静止零速度约束沿用lower_body瞬时零指令指数核，读取根刚体机体系实际速度：
+静止零速度正奖励读取根刚体机体系实际速度，并乘双脚相对冻结站定目标的XY位置系数：
 
 ```text
-stand_still_linear_velocity = 2.0 * exp(-(vx^2 + vy^2 + 1.5*vz^2) / 0.2) * (f == 0)
-stand_still_angular_velocity = 0.5 * exp(-(wz^2 + 0.05*(wx^2 + wy^2)) / 0.49) * (f == 0)
+P_hold = 1 / (1 + mean(d_left^2, d_right^2) / 0.10^2)
+stand_still_linear_velocity = 2.0 * exp(-(vx^2 + vy^2 + 1.5*vz^2) / 0.2) * P_hold * (f == 0)
+stand_still_angular_velocity = 0.5 * exp(-(wz^2 + 0.05*(wx^2 + wy^2)) / 0.49) * P_hold * (f == 0)
+feet_slip_still = -sum_feet(max(norm(foot_velocity_world_xyz) - 0.02, 0)) * (f == 0)
 ```
 
 门控使用本拍冻结执行频率，精确f=0（包括settling）启用，任意正频率关闭。
-这是静止满分、移动扣减的正奖励率，不约束固定朝向，不依赖实际接触，不添加历史状态。
-不增加平均速度、骨盆漂移或静止动作差分项；行走精度、课程和其他奖励不变，需训练后验证碎步改善。
+双脚在目标处且身体静止时正奖励满分，双脚均偏离10cm时减半、30cm时剩10%；不依赖实际接触，不改变冻结目标。
+脚速代价覆盖触地和离地运动，保留0.02m/s容差。两项均为连续奖励率；当前参数需通过站立漂移和再起步测试验证，已有冻结训练保持其原配置。
 
 两只脚的 yaw 均为 `left_foot/right_foot` site 的世界 yaw，使用 wxyz 四元数转换，并将角差 wrap。
 默认单脚支撑占一个完整周期的 0.6，摆动占 0.4，总双支撑占 0.2；

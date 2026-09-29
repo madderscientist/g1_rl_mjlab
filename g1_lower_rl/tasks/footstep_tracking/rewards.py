@@ -199,20 +199,32 @@ class FilteredPelvisUpright:
     return self.filtered_gravity[:, :2].square().sum(-1)
 
 
+def _standing_position_score(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg,
+                             command_name: str, position_scale: float) -> torch.Tensor:
+  if not math.isfinite(position_scale) or position_scale <= 0:
+    raise ValueError("Standing position scale must be finite and positive")
+  state = env.command_manager.get_term(command_name).reward_state
+  position = env.scene[asset_cfg.name].data.site_pos_w[:, asset_cfg.site_ids, :2]
+  error = (position - state.targets_w[..., :2]).square().sum(-1).mean(-1)
+  return (1.0 + error / position_scale**2).reciprocal()
+
+
 def standing_linear_velocity_reward(
   env: ManagerBasedRlEnv,
   asset_cfg: SceneEntityCfg,
   command_name: str = "footsteps",
   std: float = math.sqrt(0.2),
   z_penalty: float = 1.5,
+  position_scale: float = 0.1,
 ) -> torch.Tensor:
-  """仅零执行频率时跟踪身体零线速度，沿用下肢任务的瞬时指数核"""
+  """零执行频率时奖励身体低线速度，并按双脚偏离冻结目标的距离衰减"""
   if not math.isfinite(std) or std <= 0 or not math.isfinite(z_penalty) or z_penalty < 0:
     raise ValueError("Velocity std must be positive and z penalty nonnegative; both must be finite")
   state = env.command_manager.get_term(command_name).reward_state
   velocity = env.scene[asset_cfg.name].data.root_link_lin_vel_b
   error = velocity[:, :2].square().sum(-1) + z_penalty * velocity[:, 2].square()
-  return torch.exp(-error / std**2) * (state.frequency == 0)
+  position_score = _standing_position_score(env, asset_cfg, command_name, position_scale)
+  return torch.exp(-error / std**2) * position_score * (state.frequency == 0)
 
 
 def standing_angular_velocity_reward(
@@ -221,14 +233,16 @@ def standing_angular_velocity_reward(
   command_name: str = "footsteps",
   std: float = 0.7,
   xy_penalty: float = 0.05,
+  position_scale: float = 0.1,
 ) -> torch.Tensor:
-  """仅零执行频率时跟踪身体零角速度，不约束固定航向角"""
+  """零执行频率时奖励身体低角速度，并按双脚偏离冻结目标的距离衰减"""
   if not math.isfinite(std) or std <= 0 or not math.isfinite(xy_penalty) or xy_penalty < 0:
     raise ValueError("Velocity std must be positive and xy penalty nonnegative; both must be finite")
   state = env.command_manager.get_term(command_name).reward_state
   velocity = env.scene[asset_cfg.name].data.root_link_ang_vel_b
   error = velocity[:, 2].square() + xy_penalty * velocity[:, :2].square().sum(-1)
-  return torch.exp(-error / std**2) * (state.frequency == 0)
+  position_score = _standing_position_score(env, asset_cfg, command_name, position_scale)
+  return torch.exp(-error / std**2) * position_score * (state.frequency == 0)
 
 
 def feet_hold_position_cost(
@@ -343,6 +357,7 @@ class FootstepReward:
     asset = env.scene[asset_cfg.name]
     if [asset.site_names[index] for index in asset_cfg.site_ids] != ["left_foot", "right_foot"]:
       raise ValueError("Foot sites must be ordered [left_foot, right_foot]")
+    self._air_time_constants = None
     if self.component != "landing":
       return
     shape = (env.num_envs, 2)
@@ -368,7 +383,7 @@ class FootstepReward:
     asset_cfg: SceneEntityCfg,
     component: str,
     stance_fraction: float | None = None,
-    position_std: float = 0.08,
+    position_std: float = 0.05,
     yaw_std: float = 0.2,
     clearance: float = 0.11,
     air_time_scale: float = 0.4,
@@ -376,6 +391,9 @@ class FootstepReward:
     swing_position_std: float = 0.2,
     swing_yaw_std: float = 0.1,
     swing_progress_power: float = 2.0,
+    landing_start_step: int | None = None,
+    landing_ramp_steps: int = 1,
+    still_speed_deadband: float = 0.02,
   ) -> torch.Tensor:
     if component != self.component:
       raise ValueError("Reward component must match its construction config")
@@ -394,11 +412,14 @@ class FootstepReward:
     if component == "stationary":
       in_contact = sensor.current_contact_time > 0
       return (~in_contact).float().sum(-1) * ~moving
-    if component in {"slip", "slip_still"}:
+    if component == "slip_still":
+      if not math.isfinite(still_speed_deadband) or still_speed_deadband < 0:
+        raise ValueError("Standing speed deadband must be finite and nonnegative")
+      speed = torch.linalg.vector_norm(data.site_lin_vel_w[:, asset_cfg.site_ids], dim=-1)
+      return (speed - still_speed_deadband).clamp_min(0.0).sum(-1) * ~moving
+    if component == "slip":
       speed = torch.linalg.vector_norm(data.site_lin_vel_w[:, asset_cfg.site_ids, :2], dim=-1)
-      if component == "slip":
-        return (speed.square() * contact).sum(-1) * moving
-      return (speed * contact).sum(-1) * ~moving
+      return (speed.square() * contact).sum(-1) * moving
     stance, swing_progress = phase_windows(state.phase, phase_cfg=timing)
     standing = state.frequency == 0
     stance = stance | standing.unsqueeze(-1)
@@ -411,7 +432,13 @@ class FootstepReward:
         raise ValueError("Air-time scale must be finite and positive")
       single_support = stance.sum(-1) == 1
       held_time = torch.where(stance, sensor.current_contact_time, sensor.current_air_time).min(dim=-1).values
-      swing_fractions = state.frequency.new_tensor([1 - fraction for fraction in timing.stance_fractions])
+      constant_key = (timing, state.frequency.device, state.frequency.dtype)
+      if self._air_time_constants is None or self._air_time_constants[0] != constant_key:
+        with torch.inference_mode(False):
+          swing_fractions = state.frequency.new_tensor([1 - fraction for fraction in timing.stance_fractions])
+        self._air_time_constants = constant_key, swing_fractions
+      else:
+        swing_fractions = self._air_time_constants[1]
       normalized = held_time.unsqueeze(-1) * state.frequency.unsqueeze(-1) / swing_fractions
       credit = torch.minimum(normalized.clamp(0.0, 1.0), swing_progress)
       return air_time_scale * (credit * ~stance).sum(-1) * matched * single_support * moving
@@ -440,6 +467,8 @@ class FootstepReward:
     if component == "landing":
       if not math.isfinite(env.step_dt) or env.step_dt <= 0:
         raise ValueError("Landing event cost requires a positive finite control step")
+      if landing_start_step is not None and (landing_start_step < 0 or landing_ramp_steps <= 0):
+        raise ValueError("Landing ramp start must be nonnegative and duration positive")
       changed = (self.last_ids != state.target_ids) | standing.unsqueeze(-1)
       self.landed &= ~changed
       self.saw_air &= ~changed
@@ -449,5 +478,8 @@ class FootstepReward:
       self.landed |= first_contact
       self.previous_contact.copy_(contact)
       self.last_ids.copy_(state.target_ids)
-      return (cost * first_contact).sum(-1) / env.step_dt
+      scale = 1.0 if landing_start_step is None else min(
+        1.0, max(0.0, (env.common_step_counter - 1 - landing_start_step) / landing_ramp_steps)
+      )
+      return scale * (cost * first_contact).sum(-1) / env.step_dt
     raise ValueError(f"Unknown component {component}")
