@@ -4,10 +4,10 @@
 
 | 阅读目的 | 文档 |
 | --- | --- |
-| 启动单步或连续步Viser | [回放准备与启动命令](g1_lower_rl/tasks/footstep_tracking/README.md#viser-回放) |
-| 训练阶段、首次初始化、完整恢复 | [训练与回放说明](g1_lower_rl/tasks/footstep_tracking/README.md) |
-| 单步时序、完成判定与专属奖励 | [单步场景规则](g1_lower_rl/tasks/footstep_tracking/STEP_EPISODE.md) |
-| 独立脚印规划器与停走调度 | [脚步模块](g1_lower_rl/footsteps/README.md) |
+| 启动单步或连续步Viser | [回放准备与启动命令](README.md#viser-回放) |
+| 训练阶段、首次初始化、完整恢复 | [训练与回放说明](README.md) |
+| 单步时序、完成判定与专属奖励 | [单步场景规则](step_episode/README.md) |
+| 独立脚印规划器与停走调度 | [脚步模块](../../footsteps/README.md) |
 
 ## 契约概览
 
@@ -21,14 +21,14 @@
 
 ### 实现位置
 
-- [共享契约](g1_lower_rl/footstep_contract.py)：版本、槽位及维度常量；模型、部署和预览共用，不依赖训练库。
-- [独立脚步模块](g1_lower_rl/footsteps/README.md)：Mind Your Steps 风格采样、四步队列、慢变频率和概率停走。
-- [模型和导出](g1_lower_rl/rl/footstep_model.py)：`FootstepActor`、`FootstepModelCfg`、`export_footstep_policy`。
-- [部署输入和推理](g1_lower_rl/footstep_deploy.py)：`pack_footstep_observation`、`FootstepPolicy`。
-- [相位配置](g1_lower_rl/footstep_phase.py)：`FootstepPhaseCfg`，奖励与模型导出共用的理论双支撑窗口。
-- [测试](tests/test_footstep_model.py)：输入布局、编码、网络容量、环境时序、导出和连续推理。
-- [奖励配置](g1_lower_rl/tasks/footstep_tracking/rewards_cfg.py)：`make_rewards`、`make_terminations`。
-- [奖励实现](g1_lower_rl/tasks/footstep_tracking/rewards.py)及[测试](tests/test_footstep_tracking_objectives.py)：摆动指数奖励、落地锁定线性代价与计划接触节拍。
+- [共享契约](../../footstep_contract.py)：版本、槽位及维度常量；模型、部署和预览共用，不依赖训练库。
+- [独立脚步模块](../../footsteps/README.md)：Mind Your Steps 风格采样、四步队列、慢变频率和概率停走。
+- [模型和导出](../../rl/footstep_model.py)：`FootstepActor`、`FootstepModelCfg`、`export_footstep_policy`。
+- [部署输入和推理](../../footstep_deploy.py)：`pack_footstep_observation`、`FootstepPolicy`。
+- [相位配置](../../footstep_phase.py)：`FootstepPhaseCfg`，奖励与模型导出共用的理论双支撑窗口。
+- [测试](../../../tests/test_footstep_model.py)：输入布局、编码、网络容量、环境时序、导出和连续推理。
+- [奖励配置](rewards_cfg.py)：`make_rewards`、`make_terminations`。
+- [奖励实现](rewards.py)及[测试](../../../tests/test_footstep_tracking_objectives.py)：摆动指数奖励、落地锁定线性代价与计划接触节拍。
 
 ## 1. 任务边界
 
@@ -193,7 +193,7 @@ f=0 单独表示双支撑站立，不作为行走随机游走的下界。正频�
 偏置在episode内固定、reset重新采样而非累加，随机延迟关闭；重力加噪后不再归一化
 critic与play关闭此观测噪声，但既有startup编码器偏置U[-0.015,0.015]rad仍保留
 IMU在环境中拆成四个3维项以兼容噪声reset，最终84维排列不变，脚印/相位/频率不加噪声
-详见[初始化与随机化](g1_lower_rl/tasks/footstep_tracking/README.md#初始化与随机化)。
+详见[初始化与随机化](README.md#初始化与随机化)。
 
 ## 7. 构造、保存和导出
 
@@ -219,12 +219,12 @@ export_footstep_policy(actor, "export/footstep/policy.onnx")
 训练已绑定奖励与104维 MLP critic 观测；不继承旧速度任务的课程，默认tracking的方向变化与频率变化率分别注册为独立课程
 默认tracking每回合reset随机初始方向和0.8–1.8Hz目标步频，并独立抽取站立/行走模式及左右起脚
 方向变化在1500/2500/4000次逐档放开，频率变化率从±0.01Hz/s开始，在800/2000次放开至±0.15/±0.3Hz/s
-阶段表见[指令课程](g1_lower_rl/tasks/footstep_tracking/README.md#指令课程)，独立脚步库不依赖课程或训练轮数
-独立 `--profile walk-first` 使用 [walking/curriculum.py](g1_lower_rl/tasks/footstep_tracking/walking/curriculum.py#L10)：
+阶段表见[指令课程](README.md#指令课程)，独立脚步库不依赖课程或训练轮数
+独立 `--profile walk-first` 使用 [walking/curriculum.py](walking/curriculum.py#L10)：
 0–1499轮固定向前；1500/1750/2000/2250轮分别开放初始方向±30/60/120/180度，2500轮前回合内方向不变。
 1500轮起同步放宽站距到0.21–0.27m，使侧移可行；候选距离仍固定0.27m。
 2500/3000/3500/4000轮逐档放宽候选步距到0.24–0.30/0.20–0.36/0.16–0.40/0.12–0.48m，
-回合内指令方向增量到±15/30/60/180度。完整站距范围和采样语义见[指令课程](g1_lower_rl/tasks/footstep_tracking/README.md#指令课程)。
+回合内指令方向增量到±15/30/60/180度。完整站距范围和采样语义见[指令课程](README.md#指令课程)。
 保持1.2Hz请求步频、固定名义脚掌朝向和原有宽容XY/yaw奖励，不加入精准落脚惩罚。
 4500/5000/5500轮继续开放每个新脚印独立的yaw随机量±10/20/30度；4500前为0，逐脚方向噪声保持0。
 yaw相对初始名义脚掌朝向，不跟随行进方向；仍保留相邻脚印yaw变化限幅。
@@ -289,8 +289,8 @@ OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_mode
 
 ## 10. 训练奖励契约
 
-训练端加速实现见 [批量管理器](g1_lower_rl/footsteps/tensor_manager.py) 和
-[训练适配与验证](g1_lower_rl/tasks/footstep_tracking/README.md#验证)。
+训练端加速实现见 [批量管理器](../../footsteps/tensor_manager.py) 和
+[训练适配与验证](README.md#验证)。
 加速不改变本节奖励定义，也不修复已观察到的短回合/频繁跌倒问题；部署观测及动作契约不变。
 
 入口为 `make_rewards(command_name="footsteps", sensor_name="feet_ground_contact")`。
@@ -300,7 +300,7 @@ OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_mode
 
 ### 10.1 当前奖励表
 
-下表以当前连续场景`precision`为准，落脚项按检查点保存的起点和时长渐入至-0.1，已经完成的渐入不重新开始。`walk-first`关闭落脚项、放宽摆动奖励；兼容基础配方`tracking`的落脚权重为-1，不用于当前联合连续场景。阶段对照见[训练说明](g1_lower_rl/tasks/footstep_tracking/README.md)。
+下表以当前连续场景`precision`为准，落脚项按检查点保存的起点和时长渐入至-0.1，已经完成的渐入不重新开始。`walk-first`关闭落脚项、放宽摆动奖励；兼容基础配方`tracking`的落脚权重为-1，不用于当前联合连续场景。阶段对照见[训练说明](README.md)。
 
 | 名称 | 权重 | 意图/原始值 |
 | --- | --- | --- |
@@ -343,7 +343,7 @@ OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_mode
 | `standing_joint_velocity` | -0.2 | 零步频时15轴速度平方均值，原始值封顶4，0.3秒渐入 |
 | `standing_action_change` | -0.04 | 零步频时动作差分平方和，原始值封顶25，0.3秒渐入；与全程-0.02项叠加 |
 
-规则、保持时长与完成判据见[单步说明](g1_lower_rl/tasks/footstep_tracking/STEP_EPISODE.md)。当前连续30项、单步33项；共同姿态和限位倍率不因任务切换改变。
+规则、保持时长与完成判据见[单步说明](step_episode/README.md)。当前连续30项、单步33项；共同姿态和限位倍率不因任务切换改变。
 
 这是带权 RL 目标，而非保证不摔的约束优化或安全证明。以可达脚印下的落地精度和存活为主要目标，
 再降低能耗。能耗项过重可能导致不愿迈步，过轻则可能动作剧烈，需要结合实际训练调权。

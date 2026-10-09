@@ -1,17 +1,26 @@
 # g1_lower_rl
 
-Unitree G1 + 双 Gloria-M 夹爪的强化学习项目，包含下肢行走、两阶段脚步跟踪和全身动作跟踪，基于 [mjlab](https://github.com/mujocolab/mjlab) 1.5.x。
+Unitree G1 + 双 Gloria-M 夹爪的强化学习项目，包含下肢行走、分阶段脚步跟踪和全身动作跟踪，基于 [mjlab](https://github.com/mujocolab/mjlab) 1.5.x。
 
-## 两阶段脚步跟踪
+## 脚步跟踪
 
-`G1-Gloria-FootstepTracking` 控制12腿轴和3腰轴，手臂由独立PD驱动。使用同一GRU策略分两阶段训练：
+控制12腿轴和3腰轴，手臂由独立PD驱动。策略的演进路线为：
 
-1. **walk-first：先学行走。** 固定请求步频1.2Hz，使用宽容的落点引导，逐步扩大脚印方向、步距、站距和yaw范围。
-2. **precision：再学精确跟踪。** 恢复第一阶段的actor、critic、Adam和课程计数，保持指令分布，收紧XY/yaw引导并渐入落脚事件代价；支持定时保存、固定预算续训和故障恢复。
+1. **基础行走 `walk-first`**：固定请求步频1.2Hz，以宽容引导建立步态，再通过课程扩展方向、步距、站距和脚朝向。
+2. **扩展与精度 `precision`**：完整恢复已有状态，保留空间课程，启用0.8–1.8Hz步频游走、精确摆动引导和落脚事件代价。
+3. **联合训练，当前方案**：一个共享actor、连续行走与单步两个私有critic；actor梯度按40/60合并。首次初始化可直接使用精度检查点，不必单独预训练单步；续训完整保留两套Adam与环境计数，只从最新完整联合检查点恢复，不回滚、不重置。
 
-当前配置包含5cm落脚位置尺度、站定防碎步、髋yaw弱正则、步频自适应腿部对称约束和定时手臂插值。数值保护用于隔离不稳定仿真环境，不代表实机安全保证。
+**可选的单步预训练 `step-episode`**：先站1秒，执行单步或双脚收齐，再保持站立，可独立训练和评测单步能力。当前联合初始化只采用该分支的critic与环境计数，不采用它的actor或Adam；共享actor始终来自连续行走检查点。两个critic即使初值相同，也各自独立学习，不要求预先训练成不同参数。
 
-训练命令、阶段参数与验证见[脚步任务说明](g1_lower_rl/tasks/footstep_tracking/README.md)；输入布局、导出及奖励公式见[脚步模型契约](FOOTSTEP_TRACKING.md)。日志和模型保存在 `logs/`，不随源码提交。
+当前共享姿态权重为躯干竖直-2、腰yaw-0.8；全部15轴顶硬限位继续向外施力时铜损倍率50，站立再乘2。actor仅使用编码器、IMU和脚步指令，不增加root平移真值。数值保护和奖励不代表实机安全保证。
+
+文档按用途分工：
+
+- [训练与回放](g1_lower_rl/tasks/footstep_tracking/README.md)：[单步/连续步Viser启动命令](g1_lower_rl/tasks/footstep_tracking/README.md#viser-回放)、阶段配方、初始化与完整续训、自动化验证。
+- [单步场景规则](g1_lower_rl/tasks/footstep_tracking/step_episode/README.md)：回合时序、脚印目标、单步专属奖励与预览差异。
+- [模型与部署契约](g1_lower_rl/tasks/footstep_tracking/MODEL_CONTRACT.md)：输入布局、网络、ONNX、执行器与奖励公式。
+
+日志和模型保存在 `logs/`，不随源码提交。
 
 ## 环境
 
@@ -138,6 +147,17 @@ g1_lower_rl/
 │                              （执行器与碰撞定义直接复用 mjlab 自带的 G1 资产）
 ├── tasks/
 │   ├── __init__.py            注册任务
+│   ├── footstep_tracking/     分阶段脚步跟踪，阶段总览见该目录 README
+│   │   ├── __init__.py        统一profile配置入口，兼容已有检查点名称
+│   │   ├── env_cfg.py         共享场景、观测和命令适配
+│   │   ├── MODEL_CONTRACT.md  模型、部署接口与奖励公式
+│   │   ├── walking/           基础行走、空间课程及precision配置
+│   │   ├── step_episode/      单步场景
+│   │   │   ├── README.md      单步规则、奖励与预览差异
+│   │   │   ├── env_cfg.py     单步配方
+│   │   │   ├── commands.py    完成判定、保持计时与统计
+│   │   │   └── rewards.py     单步失败、落脚奖金与站立防抖
+│   │   └── rewards_cfg.py     共享奖励权重；公式在rewards.py
 │   └── lower_body/
 │       ├── mdp/               MDP 项的**实现**
 │       │   ├── rewards/       ← 奖励按主题拆开
