@@ -4,7 +4,8 @@ from mjlab.tasks.registry import register_mjlab_task
 
 from g1_lower_rl.rl import GloriaOnPolicyRunner
 from g1_lower_rl.tasks.footstep_tracking.env_cfg import footstep_env_cfg
-from g1_lower_rl.tasks.footstep_tracking.rl_cfg import footstep_ppo_runner_cfg
+from g1_lower_rl.tasks.footstep_tracking.rl_cfg import footstep_ppo_runner_cfg, step_episode_ppo_runner_cfg
+from g1_lower_rl.tasks.footstep_tracking.step_episode import step_episode_env_cfg
 from g1_lower_rl.tasks.lower_body import (
   flat_env_cfg,
   flat_env_cfg_gru,
@@ -21,12 +22,20 @@ from g1_lower_rl.tasks.standing import standing_env_cfg, standing_ppo_runner_cfg
 # 脚本的默认任务。别再各自硬编码字符串——改过任务名之后漏改一处就会静默跑错环境。
 DEFAULT_TASK = "G1-Gloria-LowerBody-Flat"
 FOOTSTEP_TASK = "G1-Gloria-FootstepTracking"
+STEP_EPISODE_TASK = "G1-Gloria-FootstepEpisode"
 
 register_mjlab_task(
   task_id=FOOTSTEP_TASK,
   env_cfg=footstep_env_cfg(),
   play_env_cfg=footstep_env_cfg(play=True),
   rl_cfg=footstep_ppo_runner_cfg(),
+)
+
+register_mjlab_task(
+  task_id=STEP_EPISODE_TASK,
+  env_cfg=step_episode_env_cfg(),
+  play_env_cfg=step_episode_env_cfg(play=True),
+  rl_cfg=step_episode_ppo_runner_cfg(),
 )
 
 # 课程档位是按 ITER 步/迭代换算成环境步数的，对不上的话课程会整体提前或推迟，且不报错。

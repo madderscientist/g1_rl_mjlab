@@ -42,6 +42,7 @@ class FootstepCommand(CommandTerm):
   """仅在终止与奖励计算前推进一次，reset 后等待正向运动学刷新再读脚位"""
 
   cfg: FootstepCommandCfg
+  manager_type = TensorFootstepManager
 
   def __init__(self, cfg: FootstepCommandCfg, env):
     """批量脚步状态与物理状态驻留同一设备，不逐环境创建Python执行器"""
@@ -50,7 +51,7 @@ class FootstepCommand(CommandTerm):
       raise ValueError("Footstep control_dt must match environment step_dt")
     self.robot = env.scene[cfg.entity_name]
     self.site_ids = self.robot.find_sites(("left_foot", "right_foot"), preserve_order=True)[0]
-    self.batch = TensorFootstepManager(cfg.manager, cfg.source, self.num_envs, self.device, env.cfg.seed or 0,
+    self.batch = self.manager_type(cfg.manager, cfg.source, self.num_envs, self.device, env.cfg.seed or 0,
                       compiled=cfg.compile_backend and torch.device(self.device).type == "cuda")
     self.pending_reset = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
     self._needs_reset = True

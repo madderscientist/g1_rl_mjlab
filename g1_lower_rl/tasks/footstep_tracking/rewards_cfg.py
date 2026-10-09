@@ -1,4 +1,4 @@
-"""脚步奖励率初值，部署前仍需通过行走训练验证权重"""
+"""脚步跟踪共享奖励配置；阶段差异由对应环境工厂显式覆盖。"""
 
 from __future__ import annotations
 
@@ -136,7 +136,7 @@ def make_rewards(
           "copper_weights": copper_weights,
           "command_name": command_name,
           "standing_scale": 2.0,
-          "limit_scale": 10.0,
+          "limit_scale": 50.0,
           "limit_margin": math.radians(0.1),
         },
       ),
@@ -165,7 +165,7 @@ def make_rewards(
       ),
       "waist_yaw_zero": RewardTermCfg(
         func=rewards.joint_zero_l2,
-        weight=-0.4,
+        weight=-0.8,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=("waist_yaw_joint",))},
       ),
       "waist_roll_pitch_edges": RewardTermCfg(
@@ -178,7 +178,7 @@ def make_rewards(
       ),
       "torso_upright": RewardTermCfg(
         func=rewards.body_tilt_angle_l2,
-        weight=-1.0,
+        weight=-2.0,
         params={"asset_cfg": SceneEntityCfg("robot", body_names=("torso_link",))},
       ),
       "body_ang_vel": RewardTermCfg(

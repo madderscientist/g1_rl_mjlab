@@ -76,6 +76,9 @@ class LowerBodyTorqueCost:
     if not all(math.isfinite(value) and value > 0 for value in weights):
       raise ValueError("Copper weights must be finite and positive")
     self.weights = torch.tensor(weights, device=env.device)
+    self.knee_mask = torch.tensor(
+      [name in ("left_knee_joint", "right_knee_joint") for name in names], device=env.device, dtype=torch.bool,
+    )
 
   def __call__(
     self,
@@ -87,12 +90,15 @@ class LowerBodyTorqueCost:
     standing_scale: float = 1.0,
     limit_scale: float = 1.0,
     limit_margin: float = 0.0,
+    knee_limit_scale: float | None = None,
   ) -> torch.Tensor:
     del copper_weights
     if not math.isfinite(standing_scale) or standing_scale <= 0:
       raise ValueError("Standing torque scale must be finite and positive")
     if not math.isfinite(limit_scale) or limit_scale < 1.0:
       raise ValueError("Limit torque scale must be finite and at least 1")
+    if knee_limit_scale is not None and (not math.isfinite(knee_limit_scale) or knee_limit_scale < 1.0):
+      raise ValueError("Limit torque scale for knees must be finite and at least 1")
     if not math.isfinite(limit_margin) or limit_margin < 0.0:
       raise ValueError("Limit margin must be finite and nonnegative")
     data = env.scene[asset_cfg.name].data
@@ -102,6 +108,8 @@ class LowerBodyTorqueCost:
     self.at_lower_limit = positions <= limits[..., 0] + limit_margin
     self.at_upper_limit = positions >= limits[..., 1] - limit_margin
     self.pushing_limit = (self.at_lower_limit & (torques < 0)) | (self.at_upper_limit & (torques > 0))
+    if knee_limit_scale is not None:
+      limit_scale = torch.where(self.knee_mask, knee_limit_scale, limit_scale)
     weights = self.weights * torch.where(self.pushing_limit, limit_scale, 1.0)
     cost = torque_square_cost(torques, weights, reference_torque)
     if standing_scale != 1.0:

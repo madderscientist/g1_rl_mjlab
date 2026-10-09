@@ -22,7 +22,7 @@ from mjlab.utils.os import dump_yaml, get_checkpoint_path
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
 
-from g1_lower_rl.tasks import FOOTSTEP_TASK
+from g1_lower_rl.tasks import FOOTSTEP_TASK, STEP_EPISODE_TASK
 from g1_lower_rl.tasks.lower_body.cfg.constants import MIRROR_STAGES
 
 
@@ -30,6 +30,7 @@ from g1_lower_rl.tasks.lower_body.cfg.constants import MIRROR_STAGES
 class TrainConfig:
   env: ManagerBasedRlEnvCfg
   agent: RslRlBaseRunnerCfg
+  resume_checkpoint: str | None = None
   video: bool = False
   video_length: int = 200
   video_interval: int = 2000
@@ -54,13 +55,13 @@ class TrainConfig:
     return TrainConfig(
       env=load_env_cfg(task_id),
       agent=load_rl_cfg(task_id),
-      mirror_schedule=() if task_id == FOOTSTEP_TASK else MIRROR_STAGES,
+      mirror_schedule=() if task_id in (FOOTSTEP_TASK, STEP_EPISODE_TASK) else MIRROR_STAGES,
     )
 
 
 def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
   """按任务配置启动物理环境与 PPO，脚步任务先统一执行器、奖励和模型相位"""
-  if task_id == FOOTSTEP_TASK:
+  if task_id in (FOOTSTEP_TASK, STEP_EPISODE_TASK):
     if cfg.mirror_schedule:
       raise ValueError("Footstep observations require mirror_schedule=(); the velocity-task mirror layout is incompatible")
     # CLI 可覆盖生成器相位，必须同步到奖励窗口和模型导出元数据
@@ -100,9 +101,8 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 
   resume_path: Path | None = None
   if cfg.agent.resume:
-    resume_path = get_checkpoint_path(
-      log_dir.parent, cfg.agent.load_run, cfg.agent.load_checkpoint
-    )
+    resume_path = (Path(cfg.resume_checkpoint).resolve(strict=True) if cfg.resume_checkpoint else
+      get_checkpoint_path(log_dir.parent, cfg.agent.load_run, cfg.agent.load_checkpoint))
 
   # 只在 rank 0 录像，避免多个 worker 写同一批文件。
   if cfg.video and rank == 0:
@@ -152,7 +152,7 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     runner.load(str(resume_path))
 
   runner.learn(
-    num_learning_iterations=cfg.agent.max_iterations, init_at_random_ep_len=True
+    num_learning_iterations=cfg.agent.max_iterations, init_at_random_ep_len=task_id != STEP_EPISODE_TASK
   )
   env.close()
 

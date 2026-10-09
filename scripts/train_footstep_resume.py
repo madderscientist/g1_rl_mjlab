@@ -1,4 +1,4 @@
-"""在两张 GPU 上从零开始或从检查点训练当前脚步任务"""
+"""在指定 GPU 上从零开始或从检查点训练当前脚步任务"""
 
 from __future__ import annotations
 
@@ -52,13 +52,36 @@ class StopRequested(Exception):
   pass
 
 
+def restore_fixed_exploration(actor, actor_cfg):
+  distribution_cfg = actor_cfg.get("distribution_cfg") or {}
+  if distribution_cfg.get("learn_std", True):
+    return None
+  value = float(distribution_cfg["init_std"])
+  if not math.isfinite(value) or value <= 0 or distribution_cfg.get("std_type", "scalar") != "scalar":
+    raise ValueError("Fixed exploration requires a positive scalar standard deviation")
+  distribution = actor.distribution
+  if distribution.std_param.requires_grad:
+    raise ValueError("Fixed exploration parameter must be frozen before constructing PPO")
+  if tuple(distribution.std_range) != (value, value):
+    raise ValueError("Fixed exploration must also be enforced by distribution bounds")
+  with torch.no_grad():
+    distribution.std_param.fill_(value)
+  return value
+
+
 class FootstepResumeRunner(MjlabOnPolicyRunner):
   def save(self, path, infos=None):
-    if os.environ.get("FOOTSTEP_PROFILE") == "precision":
+    if os.environ.get("FOOTSTEP_PROFILE") in {"precision", "step-episode"}:
       params = self.env.unwrapped.reward_manager.get_term_cfg("footstep_landing").params
       infos = {**(infos or {}), "precision_stage": {
         name: params[name] for name in ("landing_start_step", "landing_ramp_steps")
       }}
+      if os.environ["FOOTSTEP_PROFILE"] == "step-episode":
+        infos["footstep_profile"] = "step-episode"
+        actor_cfg = getattr(self, "cfg", {}).get("actor", {})
+        distribution_cfg = actor_cfg.get("distribution_cfg") or {}
+        if not distribution_cfg.get("learn_std", True):
+          infos["fixed_exploration_std"] = float(distribution_cfg["init_std"])
     return super().save(path, infos)
 
   def load(self, path, load_cfg=None, strict=True, map_location=None):
@@ -77,6 +100,13 @@ class FootstepResumeRunner(MjlabOnPolicyRunner):
       assert all(group["lr"] == self.alg.learning_rate for group in self.alg.optimizer.param_groups)
     else:
       assert_same_state(self.alg.optimizer.state_dict(), saved["optimizer_state_dict"])
+    fixed_std = restore_fixed_exploration(self.alg.actor, self.cfg.get("actor", {}))
+    learning_rate_scale = float(os.environ.get("FOOTSTEP_LEARNING_RATE_SCALE", "1"))
+    if not math.isfinite(learning_rate_scale) or not 0 < learning_rate_scale <= 1:
+      raise ValueError("Resume learning-rate scale must be in (0, 1]")
+    if learning_rate_scale != 1:
+      for group in self.alg.optimizer.param_groups:
+        group["lr"] = max(1e-5, group["lr"] * learning_rate_scale)
     self.current_learning_iteration = int(saved["iter"]) + 1
     self.alg.learning_rate = self.alg.optimizer.param_groups[0]["lr"]
     env = self.env.unwrapped
@@ -86,8 +116,11 @@ class FootstepResumeRunner(MjlabOnPolicyRunner):
       "rank": self.gpu_global_rank, "pid": os.getpid(), "checkpoint": str(path),
       "checkpoint_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
       "saved_iteration": int(saved["iter"]), "next_iteration": self.current_learning_iteration,
-      "actor_critic_exactly_restored": True, "optimizer_reset": reset_optimizer,
-      "actor_critic_optimizer_exactly_restored": not reset_optimizer, "learning_rate": self.alg.learning_rate,
+      "actor_critic_exactly_restored": fixed_std is None, "optimizer_reset": reset_optimizer,
+      "actor_mean_and_critic_exactly_restored": True, "fixed_exploration_std": fixed_std,
+      "optimizer_exactly_restored": not reset_optimizer and learning_rate_scale == 1,
+      "learning_rate_scale": learning_rate_scale,
+      "actor_critic_optimizer_exactly_restored": not reset_optimizer and fixed_std is None and learning_rate_scale == 1, "learning_rate": self.alg.learning_rate,
       "optimizer_state_entries": len(self.alg.optimizer.state), "envs_per_rank": env.num_envs,
       "environment_counter": env.common_step_counter,
       "arm_target_scale": env.event_manager.get_term_cfg("reset_arm_pose").params["target_scale"],
@@ -216,20 +249,24 @@ def worker(cfg, log_dir):
   train.MjlabOnPolicyRunner = FootstepResumeRunner
   cfg.env.sim.nan_guard.output_dir = str(log_dir / f"nan_rank_{os.environ.get('RANK', '0')}")
   try:
-    train.run_train(train.FOOTSTEP_TASK, cfg, log_dir)
+    train.run_train(os.environ.get("FOOTSTEP_TASK_ID", train.FOOTSTEP_TASK), cfg, log_dir)
   finally:
     if distributed.is_initialized():
       distributed.destroy_process_group()
 
 
 def main():
+  from g1_lower_rl.tasks.footstep_tracking import FOOTSTEP_PROFILES, make_footstep_env_cfg
+
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("checkpoint", type=Path, nargs="?")
   parser.add_argument("--from-scratch", action="store_true", help="Initialize new models and optimizer; do not load a checkpoint")
   parser.add_argument("--reset-optimizer", action="store_true", help="Restore models but keep the newly initialized optimizer and configured learning rate")
   parser.add_argument("--run-root", type=Path, help="Parent experiment directory for a new run")
   parser.add_argument("--envs-per-rank", type=int, default=128)
-  parser.add_argument("--profile", choices=("tracking", "walk-first", "precision"), default="tracking")
+  parser.add_argument("--gpu-ids", type=int, nargs="+", default=[0, 1])
+  parser.add_argument("--learning-rate-scale", type=float, default=1.)
+  parser.add_argument("--profile", choices=FOOTSTEP_PROFILES, default="tracking")
   parser.add_argument("--landing-start-step", type=int, help="Precision ramp origin; defaults to the saved stage or checkpoint counter")
   parser.add_argument("--landing-ramp-updates", type=int, help="Precision ramp duration; defaults to the saved stage or 2000 updates")
   budget = parser.add_mutually_exclusive_group()
@@ -238,6 +275,10 @@ def main():
   parser.add_argument("--save-interval", type=int, default=100, help="Save every N cumulative PPO iterations")
   parser.add_argument("--tag", default="swing_linear_continuous")
   args = parser.parse_args()
+  if any(index < 0 for index in args.gpu_ids) or len(set(args.gpu_ids)) != len(args.gpu_ids):
+    parser.error("GPU IDs must be distinct nonnegative indices")
+  if not math.isfinite(args.learning_rate_scale) or not 0 < args.learning_rate_scale <= 1:
+    parser.error("Learning-rate scale must be in (0, 1]")
   if args.from_scratch == (args.checkpoint is not None):
     parser.error("Specify either a checkpoint or --from-scratch, but not both")
   if args.reset_optimizer and args.from_scratch:
@@ -256,13 +297,14 @@ def main():
     raise ValueError("Environment and update counts must be positive")
   for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "FOOTSTEP_DEADLINE_UTC", "FOOTSTEP_TRAIN_DURATION_S"):
     os.environ.pop(name, None)
-  os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+  os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, args.gpu_ids))
   os.environ["MUJOCO_GL"] = "egl"
   continuous = args.max_updates is None and args.hours is None
   os.environ["FOOTSTEP_CONTINUOUS"] = "1" if continuous else "0"
   if args.hours is not None:
     os.environ["FOOTSTEP_TRAIN_DURATION_S"] = str(args.hours * 3600)
   os.environ["FOOTSTEP_RESET_OPTIMIZER"] = "1" if args.reset_optimizer else "0"
+  os.environ["FOOTSTEP_LEARNING_RATE_SCALE"] = str(args.learning_rate_scale)
   os.environ["FOOTSTEP_PROFILE"] = args.profile
   checkpoint = None if args.from_scratch else args.checkpoint.resolve(strict=True)
   first_iteration = 0
@@ -276,25 +318,26 @@ def main():
     if args.profile == "precision":
       stage_config = dict(checkpoint_infos.get("precision_stage", {}))
     del saved
-  cfg = replace(train.TrainConfig.from_task(train.FOOTSTEP_TASK), gpu_ids=[0, 1], enable_nan_guard=True)
-  if args.profile == "walk-first":
-    from g1_lower_rl.tasks.footstep_tracking.walk_first import walk_first_env_cfg
-
-    cfg = replace(cfg, env=walk_first_env_cfg())
-  elif args.profile == "precision":
-    from g1_lower_rl.tasks.footstep_tracking.walk_first.precision import precision_env_cfg
-
+  task_id = train.STEP_EPISODE_TASK if args.profile == "step-episode" else train.FOOTSTEP_TASK
+  os.environ["FOOTSTEP_TASK_ID"] = task_id
+  cfg = replace(train.TrainConfig.from_task(task_id), gpu_ids=args.gpu_ids, enable_nan_guard=True)
+  if args.profile == "precision":
     stage_config.setdefault("landing_start_step", checkpoint_counter)
     stage_config.setdefault("landing_ramp_steps", 2000 * cfg.agent.num_steps_per_env)
     if args.landing_start_step is not None:
       stage_config["landing_start_step"] = args.landing_start_step
     if args.landing_ramp_updates is not None:
       stage_config["landing_ramp_steps"] = args.landing_ramp_updates * cfg.agent.num_steps_per_env
-    cfg = replace(cfg, env=precision_env_cfg(**stage_config))
+  elif args.profile == "step-episode":
+    stage_config = {"landing_start_step": 0, "landing_ramp_steps": 1}
+    cfg.agent.experiment_name = "g1_footstep_episode"
+  cfg = replace(cfg, env=make_footstep_env_cfg(args.profile,
+    precision_stage=stage_config if args.profile == "precision" else None))
   cfg.env.scene.num_envs = args.envs_per_rank
   cfg.agent.seed = 42
   cfg.agent.resume = checkpoint is not None
   if checkpoint is not None:
+    cfg = replace(cfg, resume_checkpoint=str(checkpoint))
     cfg.agent.load_run = re.escape(checkpoint.parent.name) + "$"
     cfg.agent.load_checkpoint = re.escape(checkpoint.name) + "$"
   cfg.agent.max_iterations = args.max_updates if args.max_updates is not None else (1000000000 if args.hours else 10000)
@@ -305,12 +348,14 @@ def main():
   log_dir.mkdir(parents=True, exist_ok=False)
   setup = {
     "profile": args.profile,
+    "task_id": task_id,
     "stage_config": stage_config,
     "checkpoint": str(checkpoint) if checkpoint else None, "from_scratch": args.from_scratch,
     "reset_optimizer": args.reset_optimizer, "configured_learning_rate": cfg.agent.algorithm.learning_rate,
+    "learning_rate_scale": args.learning_rate_scale,
     "run_dir": str(log_dir), "source_root": str(ROOT),
-    "gpu_ids": [0, 1], "envs_per_rank": args.envs_per_rank, "total_envs": 2 * args.envs_per_rank,
-    "rollout_steps": cfg.agent.num_steps_per_env, "samples_per_update": 2 * args.envs_per_rank * cfg.agent.num_steps_per_env,
+    "gpu_ids": args.gpu_ids, "envs_per_rank": args.envs_per_rank, "total_envs": len(args.gpu_ids) * args.envs_per_rank,
+    "rollout_steps": cfg.agent.num_steps_per_env, "samples_per_update": len(args.gpu_ids) * args.envs_per_rank * cfg.agent.num_steps_per_env,
     "first_iteration": first_iteration, "max_updates": args.max_updates, "continuous": continuous,
     "hours": args.hours, "duration_s": args.hours * 3600 if args.hours is not None else None,
     "save_interval": cfg.agent.save_interval, "reward_weights": {name: term.weight for name, term in cfg.env.rewards.items()},
@@ -323,8 +368,11 @@ def main():
   os.environ["TORCHRUNX_LOG_DIR"] = str(log_dir / "torchrunx")
   pythonpath = os.pathsep.join((str(ROOT), str(ROOT / "scripts")))
   logging.basicConfig(level=logging.INFO)
+  if len(args.gpu_ids) == 1:
+    worker(cfg, log_dir)
+    return
   torchrunx.Launcher(
-    hostnames=["localhost"], workers_per_host=2, backend=None,
+    hostnames=["localhost"], workers_per_host=len(args.gpu_ids), backend=None,
     copy_env_vars=torchrunx.DEFAULT_ENV_VARS_FOR_COPY + ("MUJOCO*", "OMP_NUM_THREADS", "FOOTSTEP_*", "PYTHONUNBUFFERED"),
     extra_env_vars={"PYTHONPATH": pythonpath},
   ).run(worker, cfg, log_dir)

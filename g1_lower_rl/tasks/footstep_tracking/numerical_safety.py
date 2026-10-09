@@ -82,23 +82,25 @@ class NumericalSafety:
 
   def step(self):
     self.substeps += 1
-    if not torch.isfinite(self.sim.data.ctrl).all():
-      ids = (~torch.isfinite(self.sim.data.ctrl).all(-1)).nonzero(as_tuple=False).flatten()
-      self.dump(ids, "nonfinite_control")
-      raise FloatingPointError("Non-finite control input; refusing to advance physics")
+    invalid_control = ~torch.isfinite(self.sim.data.ctrl).all(-1)
     before = self.invalid_state() & ~self.failed
-    if before.any():
-      self.dump(before.nonzero(as_tuple=False).flatten(), "before_step")
-      self.failed |= before
-    self.quarantine(self.failed)
+    if (invalid_control | before | self.failed).any():
+      if invalid_control.any():
+        self.dump(invalid_control.nonzero(as_tuple=False).flatten(), "nonfinite_control")
+        raise FloatingPointError("Non-finite control input; refusing to advance physics")
+      if before.any():
+        self.dump(before.nonzero(as_tuple=False).flatten(), "before_step")
+        self.failed |= before
+      self.quarantine(self.failed)
     self.safe_qpos.copy_(self.sim.data.qpos)
     self.safe_qvel.copy_(self.sim.data.qvel)
     self._step()
     after = self.invalid_state() & ~self.failed
-    if after.any():
-      self.dump(after.nonzero(as_tuple=False).flatten(), "after_step")
-      self.failed |= after
-    self.quarantine(self.failed)
+    if (after | self.failed).any():
+      if after.any():
+        self.dump(after.nonzero(as_tuple=False).flatten(), "after_step")
+        self.failed |= after
+      self.quarantine(self.failed)
 
   def __call__(self, env, joint_speed_limit=120., root_speed_limit=20., root_angular_limit=80.):
     return self.failed

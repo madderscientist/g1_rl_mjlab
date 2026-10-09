@@ -31,10 +31,10 @@ def body_imu(env, asset_cfg: SceneEntityCfg, component: str = "both") -> torch.T
   data = env.scene[asset_cfg.name].data
   orientation = data.body_link_quat_w[:, asset_cfg.body_ids].squeeze(1)
   angular = data.body_link_ang_vel_w[:, asset_cfg.body_ids].squeeze(1)
-  gravity = torch.zeros_like(angular)
-  gravity[:, 2] = -1
   if component == "angular":
     return quat_apply_inverse(orientation, angular)
+  gravity = torch.zeros_like(angular)
+  gravity[:, 2] = -1
   if component == "gravity":
     return quat_apply_inverse(orientation, gravity)
   if component != "both":

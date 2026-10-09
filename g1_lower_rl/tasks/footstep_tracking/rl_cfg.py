@@ -7,7 +7,7 @@ from g1_lower_rl.tasks.footstep_tracking.curriculum import NUM_STEPS_PER_ENV
 
 
 def footstep_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
-  """建立 64 拍 recurrent rollout 和普通 PPO，参数尚未经步行训练调优"""
+  """单任务64拍recurrent PPO基础配置；联合入口显式覆盖学习率和探索。"""
   return RslRlOnPolicyRunnerCfg(
     actor=FootstepModelCfg(),
     critic=RslRlModelCfg(hidden_dims=(256, 128), activation="elu", obs_normalization=True),
@@ -31,3 +31,11 @@ def footstep_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
     # 动作幅度由15轴比例映射决定，不额外改变已约定的部署控制公式
     clip_actions=None,
   )
+
+
+def step_episode_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
+  """一步精度任务固定小幅探索，不影响通用脚步策略的PPO配置"""
+  cfg = footstep_ppo_runner_cfg()
+  cfg.algorithm.entropy_coef = 0.
+  cfg.actor.distribution_cfg.update(init_std=.25, learn_std=False, std_range=(.25, .25))
+  return cfg

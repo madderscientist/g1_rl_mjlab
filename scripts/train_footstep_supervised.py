@@ -40,7 +40,7 @@ def valid_checkpoint(path):
 
 
 def select_checkpoint(root, initial):
-  candidates = sorted(root.glob("*_attempt*/model_*.pt"),
+  candidates = sorted((path for path in root.glob("*_attempt*/model_*.pt") if not path.parent.is_symlink()),
     key=lambda path: int(path.stem.split("_")[-1]), reverse=True)
   for path in candidates + [initial]:
     if valid_checkpoint(path):
@@ -91,6 +91,7 @@ def main():
   parser.add_argument("--hours", type=float, required=True)
   parser.add_argument("--save-interval", type=int, default=1000)
   parser.add_argument("--max-restarts", type=int, default=3)
+  parser.add_argument("--profile", choices=("precision", "step-episode"), default="precision")
   args = parser.parse_args()
   if not math.isfinite(args.hours) or args.hours <= 0 or args.max_restarts < 0 or args.save_interval <= 0:
     parser.error("Hours and save interval must be positive; restarts must be nonnegative")
@@ -117,6 +118,7 @@ def main():
 
   def record(status, **fields):
     state = {"status": status, "pid": os.getpid(), "deadline_utc": deadline.isoformat(),
+      "profile": args.profile,
       "remaining_s": max(0., duration - (time.monotonic() - start)),
       "updated_at_utc": datetime.now(timezone.utc).isoformat(), **fields}
     temporary = state_path.with_suffix(".json.tmp")
@@ -135,7 +137,7 @@ def main():
       reference.symlink_to(checkpoint.parent, target_is_directory=True)
     tag = f"recovered_attempt{attempt}"
     command = [sys.executable, str(source / "scripts/train_footstep_resume.py"), str(checkpoint),
-      "--profile", "precision", "--hours", str(remaining / 3600), "--save-interval", str(args.save_interval),
+      "--profile", args.profile, "--hours", str(remaining / 3600), "--save-interval", str(args.save_interval),
       "--envs-per-rank", "128", "--run-root", str(root), "--tag", tag]
     process = subprocess.Popen(command, cwd=source, stdout=subprocess.PIPE,
       stderr=subprocess.STDOUT, start_new_session=True)

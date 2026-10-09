@@ -3,7 +3,8 @@
 from dataclasses import replace
 
 from g1_lower_rl.tasks.footstep_tracking.env_cfg import footstep_env_cfg
-from g1_lower_rl.tasks.footstep_tracking.walk_first.curriculum import make_walk_first_curriculum
+
+from .curriculum import make_walk_first_curriculum
 
 
 def _staged_env_cfg(play: bool):
