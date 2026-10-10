@@ -30,7 +30,7 @@ OBSERVATION_LAYOUT = (
   ("torso_projected_gravity", 67, 70, "unit vector"),
   ("phase", 70, 71, "rad"),
   ("frequency", 71, 72, "cycles/s"),
-  ("footsteps", 72, 84, "[m, m, rad] per slot"),
+  ("footsteps", 72, 78, "[m, m, rad] per slot"),
 )
 
 
@@ -64,7 +64,7 @@ def nominal_action_parameters() -> dict[str, list[float]]:
 
 
 class FootstepObservationEncoder(nn.Module):
-  """将形状为 [..., 84] 的原始观测编码为 [..., 89] 的连续特征"""
+  """将形状为 [..., 78] 的原始观测编码为 [..., 81] 的连续特征"""
 
   def __init__(self, default_joint_pos: Sequence[float] | None = None) -> None:
     super().__init__()
@@ -79,7 +79,7 @@ class FootstepObservationEncoder(nn.Module):
   def forward(self, obs: torch.Tensor) -> torch.Tensor:
     if obs.shape[-1] != RAW_OBS_DIM:
       raise ValueError(f"Footstep observations must have exactly {RAW_OBS_DIM} raw features")
-    footprints = obs[..., 72:84].unflatten(-1, (4, 3))
+    footprints = obs[..., 72:].unflatten(-1, (2, 3))
     headings = footprints[..., 2:3]
     encoded_footprints = torch.cat((footprints[..., :2], headings.sin(), headings.cos()), dim=-1).flatten(-2)
     phase = obs[..., 70:71]
@@ -98,6 +98,9 @@ class FootstepObservationEncoder(nn.Module):
 
 class FootstepActor(RNNModel):
   """以原始观测作为明确部署输入边界的 rsl_rl 循环策略网络"""
+
+  raw_obs_dim = RAW_OBS_DIM
+  encoded_obs_dim = ENCODED_OBS_DIM
 
   def __init__(
     self,
@@ -140,7 +143,7 @@ class FootstepActor(RNNModel):
   def _get_obs_dim(self, obs: TensorDict, obs_groups: dict[str, list[str]], obs_set: str) -> tuple[list[str], int]:
     groups, raw_dim = super()._get_obs_dim(obs, obs_groups, obs_set)
     if len(groups) != 1 or raw_dim != RAW_OBS_DIM:
-      raise ValueError("FootstepActor requires one observation group with 84 raw features")
+      raise ValueError("FootstepActor requires one observation group with 78 raw features")
     return groups, ENCODED_OBS_DIM
 
   def get_latent(self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None) -> torch.Tensor:
@@ -149,7 +152,7 @@ class FootstepActor(RNNModel):
 
   def update_normalization(self, obs: TensorDict) -> None:
     if self.obs_normalization:
-      features = self.encoder(obs[self.obs_groups[0]]).reshape(-1, ENCODED_OBS_DIM)
+      features = self.encoder(obs[self.obs_groups[0]]).reshape(-1, self.encoded_obs_dim)
       self.obs_normalizer.update(features)
 
   def as_jit(self) -> nn.Module:
@@ -160,7 +163,7 @@ class FootstepActor(RNNModel):
   def as_onnx(self, verbose: bool = False) -> nn.Module:
     exported = super().as_onnx(verbose)
     exported.obs_normalizer = nn.Sequential(copy.deepcopy(self.encoder), exported.obs_normalizer)
-    exported.input_size = RAW_OBS_DIM
+    exported.input_size = self.raw_obs_dim
     return exported
 
   def deployment_contract(self) -> dict:
@@ -171,11 +174,12 @@ class FootstepActor(RNNModel):
       "model_class": "g1_lower_rl.rl.footstep_model:FootstepActor",
       "control_dt_s": 0.02,
       "dtype": "float32",
-      "inputs": {"obs": [1, RAW_OBS_DIM], "h_in": hidden_shape},
+      "inputs": {"obs": [1, self.raw_obs_dim], "h_in": hidden_shape},
       "outputs": {"actions": [1, ACTION_DIM], "h_out": hidden_shape},
-      "encoded_obs_dim": ENCODED_OBS_DIM,
+      "encoded_obs_dim": self.encoded_obs_dim,
       "observation_layout": [
-        {"name": name, "start": start, "stop": stop, "units": units} for name, start, stop, units in OBSERVATION_LAYOUT
+        {"name": name, "start": start, "stop": stop, "units": units}
+        for name, start, stop, units in OBSERVATION_LAYOUT
       ],
       "joint_names": list(WHOLE_BODY_JOINTS),
       "default_joint_pos": defaults,
@@ -191,16 +195,16 @@ class FootstepActor(RNNModel):
         "encoded_fields": ["dx", "dy", "sin(dtheta)", "cos(dtheta)"],
         "reference_frame": "one common frozen stance-foot heading frame; x forward, y left, z up",
         "heading": "foot sole yaw, positive counterclockwise about +z",
-        "support": "last planned landing per foot, initialized from reset-time measured feet; frozen during swing, never live foot poses",
+        "support": "not an actor input; retained only by the physical planner and critic",
         "preview": "first unconsumed queued landing per foot, including the currently executing swing target; only two future steps",
         "side_order": "fixed left/right within each pair; never chronological order",
         "update": "liftoff leaves all world slots unchanged; at planned touchdown move that foot's next to support and advance its next goal",
-        "coordinates": "both support poses and both landing goals relative to the same frozen anchor, not chained deltas",
+        "coordinates": "all supplied poses relative to the same frozen anchor, not chained deltas",
         "reanchor": "transform unchanged physical targets using an estimated new anchor",
         "requires_external_coordinate_conversion": True,
         "all_slots_required": True,
         "zero_progress": "repeat each foot's fixed landing pose; f>0 marches, f=0 holds double support",
-        "standing_slots": "at f=0 use [left_hold, right_hold, left_hold, right_hold]; holds do not follow measured foot drift",
+        "standing_slots": "at f=0 use [left_hold, right_hold]; holds do not follow measured foot drift",
       },
       "phase": {
         "raw_range_rad": [0.0, 2 * math.pi],

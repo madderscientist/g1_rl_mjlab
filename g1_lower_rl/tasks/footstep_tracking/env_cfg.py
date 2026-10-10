@@ -47,6 +47,11 @@ def critic_state(env) -> torch.Tensor:
   return torch.cat((env.scene["robot"].data.root_link_lin_vel_b, env.scene["feet_ground_contact"].data.found.float()), dim=-1)
 
 
+def next_footstep_commands(env, command_name: str) -> torch.Tensor:
+  command = generated_commands(env, command_name)
+  return torch.cat((command[:, :2], command[:, 8:]), dim=-1)
+
+
 def footstep_env_cfg(play: bool = False):
   """复用基础 G1 平地场景，替换速度和高度任务的命令、观测、奖励与课程"""
   cfg = make_lower_body_env_cfg()
@@ -61,7 +66,6 @@ def footstep_env_cfg(play: bool = False):
   ))}
   joints = SceneEntityCfg("robot", joint_names=WHOLE_BODY_JOINTS, preserve_order=True)
   reference = lower_body_observations()["actor"].terms
-  # 契约：29角度、29速度、两组IMU各6维、相位/频率及双脚支撑基准与两步目标共14维
   terms = {
     "joint_pos": ObservationTermCfg(
       func=joint_state, params={"asset_cfg": joints}, noise=copy.deepcopy(reference["joint_pos"].noise)
@@ -91,6 +95,7 @@ def footstep_env_cfg(play: bool = False):
   critic = copy.deepcopy(terms)
   critic["privileged"] = ObservationTermCfg(func=critic_state)
   critic["actions"] = ObservationTermCfg(func=last_action)
+  terms["footsteps"].func = next_footstep_commands
   cfg.observations = {
     "actor": ObservationGroupCfg(terms=terms, concatenate_terms=True, enable_corruption=not play),
     "critic": ObservationGroupCfg(terms=critic, concatenate_terms=True, enable_corruption=False),

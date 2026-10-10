@@ -46,7 +46,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| [env_cfg.py](env_cfg.py)、[commands.py](commands.py) | 共享物理场景、84维观测、零延迟、命令时序与完成拍奖励快照 |
+| [env_cfg.py](env_cfg.py)、[commands.py](commands.py) | 共享物理场景、78维actor/104维critic观测、零延迟、命令时序与完成拍奖励快照 |
 | [curriculum.py](curriculum.py)、[walking/curriculum.py](walking/curriculum.py) | 手臂幅度、步频变化率与空间采样课程；不修改共享奖励权重 |
 | [walking/env_cfg.py](walking/env_cfg.py)、[walking/precision.py](walking/precision.py) | 连续行走的基础与精度配方，共用场景和课程 |
 | [step_episode/env_cfg.py](step_episode/env_cfg.py) | 单步场景配方，组合共享场景与单步专属项 |
@@ -60,11 +60,11 @@
 
 ## 策略接口
 
-- Actor：84维输入，编码为89维，经GRU(64)和MLP(256,256,128)输出15轴位置增量。
-- 输入：29轴角度与速度、骨盆/躯干角速度与重力、相位、频率、四个XY/yaw脚印。
-- 脚印顺序：`[L_support,R_support,L_next,R_next]`。support在计划落地时更新，next包含正在迈向的目标。
+- Actor：78维输入，编码为81维，经GRU(64)和MLP(256,256,128)输出15轴位置增量。
+- 输入：29轴角度与速度、骨盆/躯干角速度与重力、相位、频率、两个XY/yaw下一落点。
+- Actor脚印顺序：`[L_next,R_next]`，包含正在迈向的目标；规划器和critic仍保留内部支撑基准，不改变物理目标。
 - Critic：104维，额外观测线速度、接触和上一拍动作，使用MLP(256,128)。
-- 控制周期0.02s，PPO每轮64拍，回合60s。契约为 `g1_footstep_gru_v4`。
+- 控制周期0.02s，PPO每轮64拍，连续回合60s。契约为`g1_footstep_gru_v5_next_only`。
 
 物理步长0.0025s，每控制拍8个子步，约束容量1024。子步数值保护在关节速度超过120rad/s、根线速度超过20m/s、根角速度超过80rad/s或状态非有限时隔离对应环境，记录现场并按失败终止后reset；正常倒地仍使用概率终止。首10次事件保存状态、控制、外力与随机化模型字段，后续持续记录摘要。
 
@@ -159,7 +159,7 @@ walk-first配置见 [walking/env_cfg.py](walking/env_cfg.py)，阶段表见 [wal
 
 - 计划支撑脚距当前执行目标超过1m、规划器故障或停脚接触确认超时，立即终止；60s回合到期截断。
 - 骨盆倾角超过70°或离最低足底低于0.35m时，每拍以0.005概率终止，两项共享同一次抽样。
-- `footstep_fault` 在物理步后推进命令，奖励读取完成拍的频率和切换前目标；actor读取下一拍support/next。
+- `footstep_fault` 在物理步后推进命令，奖励读取完成拍的频率和切换前目标；actor读取下一拍的左右脚next目标。
 - reset在运动学刷新后读取实测脚位，局部reset只更新对应环境；普通换步和停走保持GRU状态。
 
 训练使用设备驻留的 [TensorFootstepManager](../../footsteps/tensor_manager.py)，CUDA默认编译执行。NumPy生成器用于独立部署与Web预览。
@@ -195,8 +195,8 @@ OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python scripts/train_footst
 
 ```bash
 export REPO_ROOT="$(pwd)"
-export SOURCE_ROOT="$REPO_ROOT/run_logs/footstep_joint_posture_limit50_source_20261009"
-RUN_DIR="$REPO_ROOT/logs/rsl_rl/footstep_joint_step60_continuous_20261008"
+export SOURCE_ROOT="$REPO_ROOT/run_logs/footstep_joint_next_only_source_20261010"
+RUN_DIR="$REPO_ROOT/logs/rsl_rl/footstep_joint_next_only_continuous_20261010"
 export CHECKPOINT="$(find "$RUN_DIR" -maxdepth 1 -type f -name 'model_*.pt' | sort -V | tail -n 1)"
 
 [[ -f "$CHECKPOINT" && -d "$SOURCE_ROOT/g1_lower_rl" ]] && \
@@ -253,7 +253,7 @@ PYTHONPATH="$SOURCE_ROOT:$SOURCE_ROOT/scripts" \
   --profile precision --manual-step --port 8087 --label "Manual forward step"
 ```
 
-- 四槽仍为`[当前左脚,当前右脚,前方左目标,前方右目标]`；默认计划消费两次落脚，首脚可选左或右。加`--single-foot`只执行选中脚的一步，另一脚保持原地，该参数同时启用手动模式。
+- Viser显示`[L_support,R_support,L_next,R_next]`四个脚印，便于对照支撑和落脚位置；Actor输入为`[L_next,R_next]`。默认计划消费两次落脚，首脚可选左或右。加`--single-foot`只执行选中脚的一步，另一脚保持原地，该参数同时启用手动模式。
 - `x`为沿初始双脚共同朝向的前移距离，默认0.10m、范围0–0.35m；`f`为完整左右周期频率，范围0.8–1.8Hz；保持站宽和共同朝向。
 - 初始双脚并列且f=0，站稳后执行；起步/收步各0.5秒插值，计划结束后确认双脚接触并保持f=0。
 - 手动模式关闭随机脚印、随机停走及步频游走，手臂初始角度、速度和PD目标为零；添加仅预览生效的14轴零位等式约束，允许求解器数值误差。执行中锁定参数，不重置GRU、不瞬移机器人。

@@ -115,7 +115,7 @@ class FootstepCommand(CommandTerm):
     self._update_command()
 
   def _debug_vis_impl(self, visualizer) -> None:
-    """绘制下一拍策略输入的双脚支撑基准及各自下一落点，不推进状态"""
+    """绘制左右脚支撑基准和下一落点四个脚印供调试，不推进状态"""
     if self._footprint_geometry is None:
       self._footprint_geometry = load_footprint_geometry()["feet"]
     colors = ((0.05, 0.65, 1.0), (1.0, 0.3, 0.12))

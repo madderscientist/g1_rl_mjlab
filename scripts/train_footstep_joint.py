@@ -104,6 +104,7 @@ class SharedActorPPO(PPO):
         task: record["optimizer"] for task, record in zip(("walking", "single_step"), records)
       }, infos={"shared_actor": True, "task_weights": self.task_weights,
         "fixed_exploration_std": .25, "actor_normalizer_frozen": True,
+        "actor_raw_obs_dim": self.actor.raw_obs_dim,
         "precision_stage": self.joint_stage,
         "env_state": {"common_step_counter": records[0]["counter"]},
         "task_environment_counters": [record["counter"] for record in records]})
@@ -175,6 +176,7 @@ class JointRunner(FootstepResumeRunner):
       "actor_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
       "fixed_std": .25, "actor_normalizer_frozen": True, "task_weight": self.alg.task_weight,
       "learning_rate": self.alg.learning_rate, "counter": counter}
+    receipt["actor_raw_obs_dim"] = actor.raw_obs_dim
     write_json(Path(self.logger.log_dir) / "initialization.json", receipt)
     print("JOINT_INITIALIZATION " + json.dumps(receipt), flush=True)
     return local.get("infos")
@@ -413,6 +415,10 @@ def main():
       args.walking_checkpoint = str(candidates[-1].resolve(strict=True))
   else:
     run_dir.mkdir(parents=True, exist_ok=False)
+  saved = torch.load(args.walking_checkpoint, map_location="cpu", weights_only=False)
+  input_weight = saved.get("actor_state_dict", {}).get("rnn.rnn.weight_ih_l0")
+  if input_weight is not None and input_weight.shape[1] != 81:
+    parser.error("Footstep training requires 78 raw observations and 81 encoded features")
   args.evaluation_iteration = (int(torch.load(args.resume_joint or args.walking_checkpoint,
     map_location="cpu", weights_only=False)["iter"]) + args.evaluate_at_updates) if args.evaluate_at_updates else None
   write_json(run_dir / "launch.json", {**vars(args), "run_dir": str(run_dir),

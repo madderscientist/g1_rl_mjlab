@@ -11,8 +11,8 @@
 
 ## 契约概览
 
-当前输入为 `[L_support,R_support,L_next,R_next]`：双脚上一次支撑落点，加双脚各自下一落点，仅预览未来两步。
-原始84维、编码89维保持不变，但槽位语义不兼容；v1/v2/v3 ONNX不得换标签复用。
+脚印输入为`[L_next,R_next]`，分别表示左右脚各自下一落点，包含正在迈向的目标。
+契约为`g1_footstep_gru_v5_next_only`，原始78维、编码81维。
 默认GRU隐藏维度64，MLP为256→256→128；连续场景reset时50%站立、50%直接行走，单步场景固定先站1秒。
 
 已实现模型、输入编码、PPO 模型配置、TorchScript/ONNX 导出、CPU 推理封装，以及训练奖励和防摔终止配置。
@@ -35,7 +35,7 @@
 - 观测全身 29 轴，不包括两个 Gloria-M 夹爪关节。
 - 只控制 15 轴：左腿 6、右腿 6、腰 yaw/roll/pitch。
 - 骨盆和 torso 各输入角速度与单位重力方向。
-- 固定左右顺序输入双脚支撑基准和双脚各自下一落点，共四个 XY/yaw 位姿；只有后两个是未来落点。
+- 固定左右顺序输入双脚各自下一落点，共两个XY/yaw位姿；规划器和critic仍保留内部支撑基准。
 - 输入全局相位和当前频率；不输入身体高度、线速度指令、骨盆相对支撑系位姿、接触力或外力真值。
 - f>0 为行走/踏步，f=0 为双脚站立；原地踏步通过正频率和重复左右各自固定的落点表达。
 - 上肢和夹爪由独立控制器控制，本策略不得覆盖其输出。
@@ -46,7 +46,7 @@
 
 | 输入 | 默认 shape | 含义 |
 | --- | --- | --- |
-| `obs` | `[1,84]` | 未归一化、未编码的原始观测 |
+| `obs` | `[1,78]` | 未归一化、未编码的原始观测 |
 | `h_in` | `[1,1,64]` | GRU `[层数,batch,hidden_size]` 隐状态 |
 
 | obs 切片 | 维数 | 内容 | 单位/约定 |
@@ -59,21 +59,19 @@
 | `67:70` | 3 | torso 系重力方向 | 单位向量，正立时 `[0,0,-1]` |
 | `70:71` | 1 | 相位 x | rad，`0 <= x < 2*pi` |
 | `71:72` | 1 | 当前频率 f | 完整左右周期/s，非负；0 为双脚站立，正数时总步频为 `2*f` |
-| `72:75` | 3 | L_support | 左脚上次计划落脚点；摆动时保留起脚前基准 |
-| `75:78` | 3 | R_support | 右脚上次计划落脚点；摆动时保留起脚前基准 |
-| `78:81` | 3 | L_next | 左脚首个未消费落点，包含正在迈向的目标 |
-| `81:84` | 3 | R_next | 右脚首个未消费落点，包含正在迈向的目标 |
+| `72:75` | 3 | L_next | 左脚首个未消费落点，包含正在迈向的目标 |
+| `75:78` | 3 | R_next | 右脚首个未消费落点，包含正在迈向的目标 |
 
-四个脚印槽位必须有效。本版没有 padding/valid 掩码；缺少远期指令时，必须由调度器显式补齐
-可执行的重复落点或进行安全处理，不能用全零表示数据缺失。输入形状为 `[4,3]`，排列为
-`[L_support,R_support,L_next,R_next]`，每对固定左右顺序，不按时间交换槽位。
-support重置时取实测双脚位姿，此后仅在计划落地事件更新为该次计划落点；不跟随实测脚位或滑移。
-抬脚不改变四个世界槽位；落地时将该脚next移到support，再选择该脚的下一个队列目标。
-next是每脚队列中的首个未消费目标，不再排除正在执行的摆动目标；两项恰好是内部队列最近两步。
-例如左脚支撑在L0、右脚从R0迈向R1：本版输入 `[L0,R0,L1,R1]`，不是v3的 `[L0,R1,L1,R2]`。
+两个脚印槽位必须有效。本版没有padding/valid掩码；缺少远期指令时，必须由调度器显式补齐
+可执行的重复落点或进行安全处理，不能用全零表示数据缺失。输入形状为`[2,3]`，排列为
+`[L_next,R_next]`，固定左右顺序，不按时间交换槽位。
+内部support重置时取实测双脚位姿，此后仅在计划落地事件更新；它不作为Actor输入。
+抬脚不改变世界目标；落地时内部将该脚next移到support，再选择该脚的下一个队列目标。
+next是每脚队列中的首个未消费目标，包含正在执行的摆动目标；两项恰好是内部队列最近两步。
+例如左脚支撑在L0、右脚从R0迈向R1：本版输入`[L1,R1]`。
 重复原地踏步时位姿可以相同，但目标编号不同；计划落地不等于传感器确认落地。
 
-f=0 时四个槽位为 `[left_hold,right_hold,left_hold,right_hold]`，两个不同的足底保持目标
+f=0时两个槽位为`[left_hold,right_hold]`，两个不同的足底保持目标
 仍在同一参考系表达，不输入远处行走目标，也不把两脚同时设为原点。
 
 ### 关节顺序
@@ -95,16 +93,16 @@ f=0 时四个槽位为 `[left_hold,right_hold,left_hold,right_hold]`，两个不
 1. `q_rel = q - default_joint_pos`。默认角存于 checkpoint 的 `encoder.default_joint_pos` buffer。
 2. 相位 `x` 转为 `[sin(x),cos(x)]`。
 3. 每个脚印的 `[dx,dy,dtheta]` 转为 `[dx,dy,sin(dtheta),cos(dtheta)]`。
-4. 对编码后的 89 维特征做经验归一化。运行均值和方差保存于 checkpoint，并随模型导出。
+4. 对编码后的81维特征做经验归一化。运行均值和方差保存于checkpoint，并随模型导出。
 
 编码后布局：`q_rel[0:29]`、`dq[29:58]`、两组 IMU `[58:70]`、
-`sin(x),cos(x)[70:72]`、`f[72:73]`、四个脚印 `[73:89]`，每项 4 维。
+`sin(x),cos(x)[70:72]`、`f[72:73]`、两个脚印`[73:81]`，每项4维。
 
 ```text
-obs[batch,84]
-  -> FootstepObservationEncoder[batch,89]
+obs[batch,78]
+  -> FootstepObservationEncoder[batch,81]
   -> EmpiricalNormalization
-  -> GRU(input=89, hidden=64, layers=1)
+  -> GRU(input=81, hidden=64, layers=1)
   -> MLP(64 -> 256 -> 256 -> 128 -> 15, ELU)
   -> actions[batch,15]
 ```
@@ -112,7 +110,7 @@ obs[batch,84]
 `FootstepModelCfg` 默认使用可训练的标量 Gaussian std=1.0，供 PPO 探索。
 `FootstepActor.forward(..., stochastic_output=True)` 采样动作；默认 forward 和部署导出均为确定性输出。
 Actor 支持 rsl_rl 的 padded 序列、mask、初始隐状态、按环境 reset 和截断反传。
-模型配置可改变隐藏层大小；本版部署布局仍为 84/89/15，实际隐状态 shape 必须读取导出契约。
+模型配置可改变隐藏层大小；本版部署布局为78/81/15，实际隐状态shape必须读取导出契约。
 
 **部署端不能再次减默认角、做 sin/cos、做经验归一化，或每拍清零 GRU。**
 
@@ -145,11 +143,11 @@ scale、Kp、Kd、effort_limit 在模型构造时从资产快照取得，并作�
 
 ## 5. 脚印坐标与相位调度边界
 
-四个脚印相对于**同一个**冻结的水平支撑参考系 A：原点取建系时估计的支撑足底位置，
+两个目标脚印相对于**同一个**冻结的水平支撑参考系A：原点取建系时估计的支撑足底位置，
 X 为该脚的水平前向，Y 向左，Z 向上。`dtheta` 是足底 yaw 相对 A 的角度，绕 +Z 逆时针为正。
 足底的参考点应与训练中的 `left_foot/right_foot` site 一致，而不是另换脚踝或鞋尖。
 
-所有四项直接相对 A，不是未来目标相对前一个目标的链式增量。一次支撑阶段内目标指令固定；
+两个目标直接相对A，不是未来目标相对前一个目标的链式增量。一次支撑阶段内目标指令固定；
 重建 A 时统一变换尚未消费的目标，不能移动其地面位置来抹掉误差。理论支撑事件不等于实际可靠接地；
 定位/运动学模块必须处理迟落地和打滑，模型本身不能提供全局定位。
 
@@ -158,8 +156,8 @@ X 为该脚的水平前向，Y 向左，Z 向上。`dtheta` 是足底 yaw 相对
 
 - 跨过左/右计划抬脚边界：内部执行目标切换为该脚next，供控制拍奖励使用；观测的世界槽位不变。
 - 跨过 `pi/2 + 2*k*pi` 或 `3*pi/2 + 2*k*pi`：消费该侧队头，将落点写入support，next推进至该脚下一目标。
-- 内部仍维护四个承诺落点，停车仍完成四步加收步；对actor只显示两脚support和最近两个未来落点。
-- 奖励读取独立的完成拍执行目标，不能将actor的support或已经推进的next直接用作奖励目标。
+- 内部仍维护四个承诺落点，停车仍完成四步加收步；对actor只显示最近两个未来落点。
+- 奖励读取独立的完成拍执行目标，不能将已经推进的next直接用作奖励目标。
 - 相位、列表索引、参考系和观测必须在同一拍一致更新。普通换步不 reset GRU。
 - 网络中的 sin/cos 是全局相位编码，不分别绑定左右脚，所以不隐含 1:3 步间隔。
 - 模型不判断是否踩准，不输出换步信号，也不自行推进脚印。
@@ -180,7 +178,7 @@ f=0 单独表示双支撑站立，不作为行走随机游走的下界。正频�
 | 两处角速度 | 各自陀螺仪 | 旋转到对应 link 坐标轴；不能将 torso 数据冒充骨盆数据 |
 | 两处重力方向 | 姿态估计 | `R_world_from_link.T @ [0,0,-1]`；不是直接归一化加速度计 |
 | x/f | 调度器 | 相位、脚印来自同一个控制时间基准 |
-| 四个脚印 | 规划器 + 坐标变换 | 地图绝对脚印需要定位或视觉反馈；相对里程计可能累积漂移 |
+| 两个下一落点 | 规划器 + 坐标变换 | 地图绝对脚印需要定位或视觉反馈；相对里程计可能累积漂移 |
 
 原始加速度、世界线速度、身体高度、骨盆平面位姿、接触力和外力均不作为 actor 输入。
 双 IMU 可以有不同测量噪声，但必须标定安装轴，并进行时间同步。
@@ -192,7 +190,7 @@ f=0 单独表示双支撑站立，不作为行走随机游走的下界。正频�
 重力方向每拍标准差0.029、每episode偏置标准差0.01，两个IMU及各轴独立
 偏置在episode内固定、reset重新采样而非累加，随机延迟关闭；重力加噪后不再归一化
 critic与play关闭此观测噪声，但既有startup编码器偏置U[-0.015,0.015]rad仍保留
-IMU在环境中拆成四个3维项以兼容噪声reset，最终84维排列不变，脚印/相位/频率不加噪声
+IMU在环境中拆成四个3维项以兼容噪声reset，最终Actor为78维，脚印/相位/频率不加噪声
 详见[初始化与随机化](README.md#初始化与随机化)。
 
 ## 7. 构造、保存和导出
@@ -209,13 +207,13 @@ from g1_lower_rl.rl.footstep_model import FootstepActor, FootstepModelCfg, expor
 cfg = FootstepModelCfg()
 options = {key: value for key, value in asdict(cfg).items()
            if key in inspect.signature(FootstepActor).parameters}
-example = TensorDict({"actor": torch.zeros(1, 84)}, batch_size=[1])
+example = TensorDict({"actor": torch.zeros(1, 78)}, batch_size=[1])
 actor = FootstepActor(example, {"actor": ["actor"]}, "actor", 15, **options)
 torch.save({"actor_state_dict": actor.state_dict(), "actor_config": asdict(cfg)}, "footstep_actor.pt")
 export_footstep_policy(actor, "export/footstep/policy.onnx")
 ```
 
-训练接入时传一个 84 维原始观测组，不要提前编码成 89 维；类路径可由 rsl_rl 的 resolver 加载。
+训练接入时传一个78维原始观测组，不要提前编码成81维；类路径可由rsl_rl的resolver加载。
 训练已绑定奖励与104维 MLP critic 观测；不继承旧速度任务的课程，默认tracking的方向变化与频率变化率分别注册为独立课程
 默认tracking每回合reset随机初始方向和0.8–1.8Hz目标步频，并独立抽取站立/行走模式及左右起脚
 方向变化在1500/2500/4000次逐档放开，频率变化率从±0.01Hz/s开始，在800/2000次放开至±0.15/±0.3Hz/s
@@ -257,6 +255,7 @@ policy = FootstepPolicy("export/footstep/policy.onnx")
 policy.reset()
 
 # 在外部控制循环中，以下变量由已同步的硬件反馈和规划器提供。
+footprints = [left_next_pose, right_next_pose]
 obs = pack_footstep_observation(
     joint_pos=q, joint_vel=dq,
     pelvis_ang_vel=pelvis_gyro, pelvis_projected_gravity=pelvis_gravity,
@@ -280,8 +279,8 @@ actions, q_des = policy.step(obs)
 OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_model.py tests/test_tensor_footsteps.py -q
 ```
 
-测试包括84/89维布局、扩容网络、固定左右support/next槽位、角度周期性、GRU reset、ONNX Runtime
-多拍动作/隐状态对齐、旧契约拒绝及真实环境支撑基准输入与完成拍执行奖励的分离。
+测试包括78/81维布局、扩容网络、固定左右next槽位、角度周期性、GRU reset、ONNX Runtime
+多拍动作/隐状态对齐、接口校验及真实环境下一落点输入与完成拍执行奖励的分离。
 规划器测试覆盖NumPy/编译GPU状态一致性、摆动期间基准冻结、计划落地更新和仅预览最近两步及局部重置；不验证策略已学会行走。
 
 评测分别报告实际首次落脚XY/yaw误差、存活时间、起停成功率、力矩和关节对称性，不用不同配方的总奖励直接比较优劣。
@@ -412,7 +411,7 @@ feet_slip_still = -sum_feet(max(norm(foot_velocity_world_xyz) - 0.02, 0)) * (f =
 支撑mask覆盖为双脚支撑，两个摆动奖励关闭；clearance继续要求两脚高度为地面，重新起步的新计划步须先离地再触地才评价落脚。
 精确零频率才切换模式，小的正频率仍按行走评分。
 
-默认移除 `footstep_support`，不在落地后的支撑阶段持续追罚计划落点XY/yaw误差；支撑观测槽位和独立规划器不变。
+默认移除`footstep_support`，不在落地后的支撑阶段持续追罚计划落点XY/yaw误差；规划器与critic仍保留支撑基准，Actor不接收支撑输入。
 防滑、接触时序、原有1m离轨和摔倒终止仍保留，放松支撑精度不等于允许无限滑移。
 步态引导使用同一 `phase_windows` 的计划侧别和摆动进度。
 支撑脚目标离地高度为0，摆动脚为 `0.11*sin(pi*s)^2`，起落边界高度和斜率均为0。
@@ -453,7 +452,7 @@ reward_soft_landing = -0.002 * landing_force * (f>0) * step_dt
 不是力矩平方、冲量、物理子步最大峰值或按体重归一化的值。保留原任务的 dt 缩放，不除以 step_dt。
 复用函数记录 `Metrics/landing_force_mean`，为本拍所有首次触地脚的平均力模长；本拍无落地时为零，
 因此跨时间直接平均该指标不等于跨所有落地事件的平均冲击力。
-接触力仅作为训练奖励数据，不增加 actor 的 84 维输入，也不引入夹爪观测。
+接触力仅作为训练奖励数据，不增加actor的78维输入，也不引入夹爪观测。
 
 ### 10.3 铜损代理与腰部
 
@@ -492,7 +491,7 @@ reward_rate = -0.25 * copper_proxy * (2 if f == 0 else 1)
 该阈值允许名义封顶高度以下约10cm变化，不规定膝角。权重和阈值为待验证初值，效果仍需重训验证。
 当前模型的 `head_link` 是网格名而非独立body；使用已有头部几何体，不增加刚体，也不再使用手工 `body_point`。
 封顶基准为原骨盆0.78m加腰部0.044m和头部中心局部Z偏移0.43m；双脚腾空或非超时失败拍不发此奖励。
-高度参考 `ground_height` 而不是运动中的脚底；它不改变84维actor输入，也不加入高度命令或固定膝角。
+高度参考`ground_height`而不是运动中的脚底；它不改变78维actor输入，也不加入高度命令或固定膝角。
 原 `pelvis_height` 及中间的 `torso_height` 项均由 `head_height` 替换；它仍不是保证站直的硬约束。
 骨盆倾斜使用真实骨盆局部单位重力向量的一阶低通，`fc=f/4`（f>0），f=0时`fc=0.2Hz`。
 每个控制拍用当前执行频率计算 `alpha=1-exp(-2*pi*fc*step_dt)`，
@@ -552,7 +551,7 @@ f=0包括停止后的settling阶段。屈膝项按共享相位选择支撑腿、
 ### 10.4 训练命令状态接口
 
 命令项必须提供 `env.command_manager.get_term("footsteps").reward_state`，类型为
-`FootstepRewardState`。这是训练特权状态，不增加 actor/ONNX 的 84 维输入：
+`FootstepRewardState`。这是训练特权状态，不增加actor/ONNX的78维输入：
 
 | 字段 | shape | 含义 |
 | --- | --- | --- |

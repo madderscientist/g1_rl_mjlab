@@ -4,7 +4,7 @@ import argparse
 import json
 from dataclasses import asdict, replace
 
-from g1_lower_rl.footstep_contract import FOOTSTEP_SLOTS
+from g1_lower_rl.footstep_contract import PLANNER_FOOTSTEP_SLOTS
 from g1_lower_rl.footsteps import FootstepManager, FootstepManagerCfg, RandomCommandCfg, RandomCommandSource
 
 
@@ -23,7 +23,7 @@ def main() -> None:
     json.dumps(
       {
         "demo": "planning only, no physics/contact verification",
-        "footstep_slots": list(FOOTSTEP_SLOTS),
+        "footstep_slots": list(PLANNER_FOOTSTEP_SLOTS),
         "initial_mode": manager.mode,
         "config": {"manager": asdict(cfg), "source": asdict(source.cfg)},
       }

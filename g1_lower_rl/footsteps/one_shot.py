@@ -1,4 +1,4 @@
-"""单环境预览用的一次或两次落脚计划，保持四槽观测接口"""
+"""单环境预览用的一次或两次落脚计划"""
 
 from dataclasses import replace
 import math

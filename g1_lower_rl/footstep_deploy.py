@@ -34,7 +34,7 @@ def pack_footstep_observation(
   frequency: float,
   footsteps: ArrayLike,
 ) -> np.ndarray:
-  """拼接原始传感器数据及按左支撑、右支撑、左下一落点、右下一落点排列的 XY/yaw 位姿"""
+  """拼接原始传感器数据及左右脚下一落点的 XY/yaw 位姿"""
   parts = []
   for name, value, shape in (
     ("joint_pos", joint_pos, (29,)),
@@ -44,7 +44,7 @@ def pack_footstep_observation(
     ("torso_ang_vel", torso_ang_vel, (3,)),
     ("torso_projected_gravity", torso_projected_gravity, (3,)),
     ("phase/frequency", [phase, frequency], (2,)),
-    ("footsteps", footsteps, (4, 3)),
+    ("footsteps", footsteps, (2, 3)),
   ):
     array = np.asarray(value, dtype=np.float32)
     if array.shape != shape:
@@ -70,7 +70,7 @@ class FootstepPolicy:
     if self.contract.get("version") != CONTRACT_VERSION or self.contract.get("dtype") != "float32":
       raise ValueError("Unsupported footstep policy contract")
     if self.contract.get("footsteps", {}).get("slots") != list(FOOTSTEP_SLOTS):
-      raise ValueError("Expected fixed left/right support and next landing slots")
+      raise ValueError("Expected fixed left/right next landing slots")
     schedule = self.contract.get("phase", {}).get("contact_schedule")
     if schedule is not None and schedule.get("parameterization") != "stance_centers_shared_half_width_v1":
       raise ValueError("Unsupported legacy phase-window metadata; re-export with the correct stance-center configuration")

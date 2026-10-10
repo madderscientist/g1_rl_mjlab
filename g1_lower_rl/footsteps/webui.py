@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from g1_lower_rl.footstep_contract import FOOTSTEP_SLOTS, PREVIEW_FORMAT
+from g1_lower_rl.footstep_contract import PLANNER_FOOTSTEP_SLOTS, PREVIEW_FORMAT
 from g1_lower_rl.footsteps import (
   FootstepCommand,
   FootstepManager,
@@ -241,7 +241,7 @@ class PreviewSession:
     """导出配置与保留范围内的轨迹记录，不承诺还原被截断的历史"""
     return {
       "format": PREVIEW_FORMAT,
-      "footstep_slots": list(FOOTSTEP_SLOTS),
+      "footstep_slots": list(PLANNER_FOOTSTEP_SLOTS),
       "planning_only": True,
       "seed": self.seed,
       "config": {"manager": asdict(self.manager.cfg), "source": asdict(self.source.cfg)},
