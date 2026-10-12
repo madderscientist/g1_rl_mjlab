@@ -99,20 +99,28 @@ class FootstepCommand(CommandTerm):
                          ("targets_w", "completed_targets"), ("target_ids", "completed_ids")):
       getattr(self.reward_state, name).copy_(self.batch.state[source])
 
-  def _update_command(self) -> None:
+  def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
     """在 sim.forward 之后用真实初始脚位重建待重置环境的队列"""
     if not self._needs_reset:
       return
-    self.batch.reset(foot_poses(self.robot.data, self.site_ids), self.pending_reset)
+    reset_mask = self.pending_reset
+    if env_ids is not None:
+      reset_mask = torch.zeros_like(self.pending_reset)
+      reset_mask[env_ids] = self.pending_reset[env_ids]
+    self.batch.reset(foot_poses(self.robot.data, self.site_ids), reset_mask)
     for name, value in self.symmetry_state.items():
-      value.copy_(torch.where(self.pending_reset, self.batch.state[name], value))
-    self.pending_reset.zero_()
-    self._needs_reset = False
+      value.copy_(torch.where(reset_mask, self.batch.state[name], value))
+    if env_ids is None:
+      self.pending_reset.zero_()
+      self._needs_reset = False
+    else:
+      self.pending_reset[env_ids] = False
+      self._needs_reset = bool(self.pending_reset.any())
     self._publish()
 
-  def compute(self, dt: float) -> None:
+  def compute(self, dt: float | torch.Tensor, env_ids: torch.Tensor | None = None) -> None:
     """默认步末回调只完成 reset，不推进时间或重采样行走意图"""
-    self._update_command()
+    self._update_command(env_ids)
 
   def _debug_vis_impl(self, visualizer) -> None:
     """绘制左右脚支撑基准和下一落点四个脚印供调试，不推进状态"""

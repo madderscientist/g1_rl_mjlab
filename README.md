@@ -1,6 +1,6 @@
 # g1_lower_rl
 
-Unitree G1 + 双 Gloria-M 夹爪的强化学习项目，包含下肢行走、分阶段脚步跟踪和全身动作跟踪，基于 [mjlab](https://github.com/mujocolab/mjlab) 1.5.x。
+Unitree G1 + 双 Gloria-M 夹爪的强化学习项目，包含下肢行走、分阶段脚步跟踪和全身动作跟踪，基于 [mjlab](https://github.com/mujocolab/mjlab) 1.6.0。
 
 ## 脚步跟踪
 
@@ -28,8 +28,20 @@ Unitree G1 + 双 Gloria-M 夹爪的强化学习项目，包含下肢行走、分
 micromamba activate mj
 ```
 
-`mj` 环境已装好 mjlab 1.5.3（mujoco 3.10 / mujoco-warp 3.10 / warp-lang 1.16 / rsl-rl-lib 5.4）
+`mj` 环境已装好 mjlab 1.6.0（mujoco 3.11.0 / mujoco-warp 3.11.0 / warp-lang 1.18.0 / rsl-rl-lib 5.4.2，
+torch 2.14.1 / torchvision 0.29.1 / viser 1.1.1）
 和本包（`pip install -e .`）。
+
+升级项目依赖（包含间接依赖）：
+
+```bash
+python -m pip install --upgrade --upgrade-strategy eager -e .
+python -m pip check
+python scripts/list_envs.py
+```
+
+自定义 command 已适配 mjlab 1.6 的 `env_ids` 接口，局部 reset 不推进其他环境的指令状态。
+升级前已启动的训练或回放进程不会自动切换依赖版本，需要自行重启；MuJoCo 升级后应重新评估已有策略。
 
 环境里加了一个 activate 钩子把 `$CONDA_PREFIX/lib` 挂到 `LD_LIBRARY_PATH`——
 conda-forge 的 `libicui18n` 需要比系统更新的 `libstdc++`，不加的话

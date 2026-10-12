@@ -577,9 +577,11 @@ class GeneralMotionCommand(CommandTerm):
     )
     self.robot.clear_state(env_ids=env_ids)
 
-  def _update_command(self) -> None:
-    self.phase += self.speed
-    done = torch.where(self.phase >= self.motion.num_frames[self.motion_ids])[0]
+  def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
+    selected = slice(None) if env_ids is None else env_ids
+    self.phase[selected] += self.speed[selected]
+    finished = self.phase[selected] >= self.motion.num_frames[self.motion_ids[selected]]
+    done = torch.where(finished)[0] if env_ids is None else env_ids[finished]
     if done.numel() > 0:
       self._resample_command(done)
 

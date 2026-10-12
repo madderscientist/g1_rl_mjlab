@@ -127,10 +127,11 @@ class BaseHeightCommand(CommandTerm):
     first = env_ids[self.command_counter[env_ids] == 0]
     self.height_command[first] = self.height_target[first]
 
-  def _update_command(self) -> None:
+  def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
+    selected = slice(None) if env_ids is None else env_ids
     step = self.cfg.max_rate * self._env.step_dt
-    delta = (self.height_target - self.height_command).clamp(-step, step)
-    self.height_command += delta
+    delta = (self.height_target[selected] - self.height_command[selected]).clamp(-step, step)
+    self.height_command[selected] += delta
 
   def _update_metrics(self) -> None:
     max_command_step = self.cfg.resampling_time_range[1] / self._env.step_dt
