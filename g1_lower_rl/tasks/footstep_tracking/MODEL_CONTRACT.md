@@ -327,6 +327,7 @@ OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_mode
 | `head_height_low` | -1.0 | `relu(1.15-head_height_above_ground)/0.2`，站立和行走均启用，不因腾空免罚 |
 | `stance_knee_bend` | -0.2 | 计划支撑腿过度屈膝平方代价，停脚容许30度、行走支撑45度，尺度45度；摆动腿不罚 |
 | `pelvis_upright_filtered` | -1.0 | 随f调整的一阶低通骨盆重力向量XY分量平方和，不罚步频摆动的原始幅度 |
+| `standing_pelvis_upright` | -1.0 | 仅实际执行f=0，盆骨相对世界竖直的原始倾角平方（弧度），无低通、无死区、不约束yaw；与低通项叠加 |
 | `stand_still_linear_velocity` | +2.0 | f=0时根机体系零线速度指数奖励，乘冻结站定脚位系数 |
 | `stand_still_angular_velocity` | +0.5 | f=0时根机体系零角速度指数奖励，乘相同站定脚位系数 |
 | `action_rate` | -0.02 | 15 维动作相邻拍差的平方和 |
@@ -342,7 +343,7 @@ OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_mode
 | `standing_joint_velocity` | -0.2 | 零步频时15轴速度平方均值，原始值封顶4，0.3秒渐入 |
 | `standing_action_change` | -0.04 | 零步频时动作差分平方和，原始值封顶25，0.3秒渐入；与全程-0.02项叠加 |
 
-规则、保持时长与完成判据见[单步说明](step_episode/README.md)。当前连续30项、单步33项；共同姿态和限位倍率不因任务切换改变。
+规则、保持时长与完成判据见[单步说明](step_episode/README.md)。当前连续31项、单步34项；共同姿态和限位倍率不因任务切换改变。
 
 这是带权 RL 目标，而非保证不摔的约束优化或安全证明。以可达脚印下的落地精度和存活为主要目标，
 再降低能耗。能耗项过重可能导致不愿迈步，过轻则可能动作剧烈，需要结合实际训练调权。

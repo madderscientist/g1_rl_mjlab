@@ -216,6 +216,14 @@ def make_rewards(
           "standing_cutoff_hz": 0.2,
         },
       ),
+      "standing_pelvis_upright": RewardTermCfg(
+        func=rewards.standing_body_tilt_angle_l2,
+        weight=-1.0,
+        params={
+          "asset_cfg": SceneEntityCfg("robot", body_names=("pelvis",)),
+          "command_name": command_name,
+        },
+      ),
       "action_rate": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.02),
       "controlled_joint_acc": RewardTermCfg(
         func=mdp.joint_acc_l2,

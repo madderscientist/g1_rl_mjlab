@@ -127,6 +127,16 @@ def body_tilt_angle_l2(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> tor
   return angle.square()
 
 
+def standing_body_tilt_angle_l2(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg,
+  command_name: str = "footsteps",
+) -> torch.Tensor:
+  """零执行步频时直接惩罚相对竖直方向的倾角平方"""
+  frequency = env.command_manager.get_term(command_name).reward_state.frequency
+  return body_tilt_angle_l2(env, asset_cfg) * (frequency == 0)
+
+
 def _head_height_above_ground(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg, command_name: str) -> torch.Tensor:
   state = env.command_manager.get_term(command_name).reward_state
   data = env.scene[asset_cfg.name].data
