@@ -22,6 +22,94 @@ def foot_poses(data, site_ids) -> torch.Tensor:
   return torch.cat((data.site_pos_w[:, site_ids, :2], heading.unsqueeze(-1)), dim=-1)
 
 
+def _heading_ramp(current, target, speed, dt):
+  difference = target - current
+  increment = torch.minimum(difference.abs(), speed * dt)
+  return current + difference.sign() * increment
+
+
+def _heading_metrics(current, target, speed, command_metric, target_metric, speed_metric):
+  command_metric.copy_(current.abs())
+  target_metric.copy_(target.abs())
+  speed_metric.copy_(speed)
+
+
+def _heading_step(current, target, speed, dt, command_metric, target_metric, speed_metric):
+  _heading_metrics(current, target, speed, command_metric, target_metric, speed_metric)
+  current.copy_(_heading_ramp(current, target, speed, dt))
+
+
+@dataclass(kw_only=True)
+class TorsoHeadingCommandCfg(CommandTermCfg):
+  resampling_time_range: tuple[float, float] = (8.0, 12.0)
+  angle_limit: float = math.radians(20)
+  speed_range: tuple[float, float] = (math.radians(5), math.radians(30))
+  curriculum_start_step: int = 0
+  compile_backend: bool = True
+
+  def build(self, env) -> TorsoHeadingCommand:
+    return TorsoHeadingCommand(self, env)
+
+
+class TorsoHeadingCommand(CommandTerm):
+  """均匀采样期望躯干偏角与速度，以限速连续过渡发布一维 rad 指令"""
+
+  def __init__(self, cfg: TorsoHeadingCommandCfg, env):
+    super().__init__(cfg, env)
+    if not math.isfinite(cfg.angle_limit) or not 0 < cfg.angle_limit < math.pi:
+      raise ValueError("Heading angle limit must be finite and in (0, pi)")
+    for bounds in (cfg.speed_range, cfg.resampling_time_range):
+      if not all(math.isfinite(value) for value in bounds) or not 0 < bounds[0] <= bounds[1]:
+        raise ValueError("Heading speeds and resampling intervals must be finite, positive and ordered")
+    if cfg.curriculum_start_step < 0:
+      raise ValueError("Heading curriculum start step must be nonnegative")
+    self.angle_limit = cfg.angle_limit
+    self._command = torch.zeros(self.num_envs, 1, device=self.device)
+    self.target = torch.zeros(self.num_envs, device=self.device)
+    self.speed = torch.zeros_like(self.target)
+    self._update_dt = 0.0
+    for name in ("command_abs_rad", "target_abs_rad", "speed_rad_s"):
+      self.metrics[name] = torch.zeros_like(self.target)
+    compiled = cfg.compile_backend and torch.device(self.device).type == "cuda"
+    self._step = torch.compile(_heading_step, fullgraph=True) if compiled else None
+
+  @property
+  def command(self) -> torch.Tensor:
+    return self._command
+
+  def reset(self, env_ids):
+    self._command[env_ids] = 0.0
+    return super().reset(env_ids)
+
+  def _resample_command(self, env_ids) -> None:
+    self.target[env_ids] = torch.empty_like(self.target[env_ids]).uniform_(-self.angle_limit, self.angle_limit)
+    self.speed[env_ids] = torch.empty_like(self.speed[env_ids]).uniform_(*self.cfg.speed_range)
+
+  def _update_metrics(self) -> None:
+    _heading_metrics(self._command[:, 0], self.target, self.speed,
+      self.metrics["command_abs_rad"], self.metrics["target_abs_rad"], self.metrics["speed_rad_s"])
+
+  def compute(self, dt, env_ids=None) -> None:
+    self._update_dt = dt
+    if self._step is None or env_ids is not None:
+      super().compute(dt, env_ids)
+      return
+    self.time_left -= dt
+    resample_env_ids = (self.time_left <= 0.0).nonzero().flatten()
+    if len(resample_env_ids) > 0:
+      self._update_metrics()
+      self._resample(resample_env_ids)
+      self._update_command()
+    else:
+      self._step(self._command[:, 0], self.target, self.speed, dt,
+        self.metrics["command_abs_rad"], self.metrics["target_abs_rad"], self.metrics["speed_rad_s"])
+
+  def _update_command(self, env_ids=None) -> None:
+    selected = slice(None) if env_ids is None else env_ids
+    dt = self._update_dt[selected] if isinstance(self._update_dt, torch.Tensor) else self._update_dt
+    self._command[selected, 0] = _heading_ramp(self._command[selected, 0], self.target[selected], self.speed[selected], dt)
+
+
 @dataclass(kw_only=True)
 class FootstepCommandCfg(CommandTermCfg):
   """平地训练适配参数，算法默认值与 Web 一致，自动调度由 source 负责"""

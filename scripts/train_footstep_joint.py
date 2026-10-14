@@ -14,6 +14,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -21,7 +22,11 @@ sys.path.insert(0, str(ROOT))
 import torch
 import torch.distributed as distributed
 import torchrunx
+from mjlab.rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from rsl_rl.algorithms import PPO
+from torch.multiprocessing.spawn import spawn
+
+from g1_lower_rl.footstep_contract import ENCODED_OBS_DIM, RAW_OBS_DIM
 
 import train
 from train_footstep_resume import FootstepResumeRunner, assert_same_state, restore_fixed_exploration, write_json
@@ -50,32 +55,75 @@ def restore_joint_state(algorithm, saved, rank):
   return infos["task_environment_counters"][rank]
 
 
+def cpu_checkpoint_state(value: Any) -> Any:
+  if isinstance(value, torch.Tensor):
+    return value.detach().cpu()
+  if isinstance(value, dict):
+    return {key: cpu_checkpoint_state(item) for key, item in value.items()}
+  if isinstance(value, list):
+    return [cpu_checkpoint_state(item) for item in value]
+  if isinstance(value, tuple):
+    return tuple(cpu_checkpoint_state(item) for item in value)
+  return value
+
+
 class SharedActorPPO(PPO):
+  task_weights: list[float]
+  task_weight: float
+  joint_updates: int
+  joint_first_iteration: int
+  joint_save_interval: int
+  joint_evaluation_iteration: int
+  joint_log_dir: Path
+  joint_env: RslRlVecEnvWrapper
+  joint_stage: dict[str, Any]
+  joint_theta_stage: dict[str, Any] | None
+
   def broadcast_parameters(self):
     for value in self.actor.state_dict().values():
       distributed.broadcast(value, src=0)
 
   def reduce_parameters(self):
-    weight = self.task_weight
-    parameters = [parameter for parameter in self.actor.parameters() if parameter.requires_grad]
-    gradients = torch.cat([
-      (parameter.grad if parameter.grad is not None else torch.zeros_like(parameter)).reshape(-1)
-      for parameter in parameters
-    ])
-    gradients.mul_(weight)
+    if not hasattr(self, "_joint_gradient_buffer"):
+      parameters = tuple(parameter for parameter in self.actor.parameters() if parameter.requires_grad)
+      first = parameters[0]
+      if any(parameter.device != first.device or parameter.dtype != first.dtype for parameter in parameters):
+        raise ValueError("Shared actor gradients require one device and dtype")
+      sizes = [parameter.numel() for parameter in parameters]
+      self._joint_gradient_buffer = first.new_empty(sum(sizes))
+      self._joint_gradient_views = [(parameter, chunk.view_as(parameter))
+        for parameter, chunk in zip(parameters, self._joint_gradient_buffer.split(sizes))]
+    gradients = self._joint_gradient_buffer
+    for parameter, view in self._joint_gradient_views:
+      if parameter.grad is None:
+        view.zero_()
+      else:
+        view.copy_(parameter.grad)
+    gradients.mul_(self.task_weight)
     distributed.all_reduce(gradients)
-    offset = 0
-    for parameter in parameters:
-      count = parameter.numel()
-      parameter.grad = gradients[offset:offset + count].view_as(parameter).clone()
-      offset += count
+    for parameter, view in self._joint_gradient_views:
+      parameter.grad = view
 
   def verify_actor(self):
-    for value in self.actor.state_dict().values():
-      reference = value.clone()
+    state = self.actor.state_dict()
+    if not hasattr(self, "_joint_actor_check_groups"):
+      grouped = {}
+      for name, value in state.items():
+        grouped.setdefault((value.device, value.dtype), []).append(name)
+      self._joint_actor_check_groups = []
+      for names in grouped.values():
+        sizes = [state[name].numel() for name in names]
+        packed = state[names[0]].new_empty(sum(sizes))
+        self._joint_actor_check_groups.append((names, packed.split(sizes), packed, torch.empty_like(packed)))
+    matched = torch.ones((), dtype=torch.bool, device=next(iter(state.values())).device)
+    for names, views, packed, reference in self._joint_actor_check_groups:
+      for name, view in zip(names, views):
+        view.copy_(state[name].reshape(-1))
+      reference.copy_(packed)
       distributed.broadcast(reference, src=0)
-      if not torch.equal(value, reference):
-        raise RuntimeError("Shared actor replicas diverged")
+      matched.logical_and_(torch.eq(packed, reference).all())
+    if not matched.item():
+      raise RuntimeError("Shared actor replicas diverged")
 
   def update(self):
     losses = super().update()
@@ -90,14 +138,14 @@ class SharedActorPPO(PPO):
     self.verify_actor()
     local = {
       "critic": {name: value.detach().cpu() for name, value in self.critic.state_dict().items()},
-      "optimizer": self.optimizer.state_dict(),
+      "optimizer": cpu_checkpoint_state(self.optimizer.state_dict()),
       "counter": self.joint_env.unwrapped.common_step_counter,
     }
-    records = [None, None]
+    records: list[dict[str, Any]] = [{}, {}]
     distributed.all_gather_object(records, local)
     iteration = self.joint_first_iteration + self.joint_updates - 1
     if self.gpu_global_rank == 0:
-      saved = self.save()
+      saved = cpu_checkpoint_state(self.save())
       saved.update(iter=iteration, task_critic_state_dicts={
         task: record["critic"] for task, record in zip(("walking", "single_step"), records)
       }, task_optimizer_state_dicts={
@@ -105,6 +153,7 @@ class SharedActorPPO(PPO):
       }, infos={"shared_actor": True, "task_weights": self.task_weights,
         "fixed_exploration_std": .25, "actor_normalizer_frozen": True,
         "actor_raw_obs_dim": self.actor.raw_obs_dim,
+        "theta_stage": getattr(self, "joint_theta_stage", None),
         "precision_stage": self.joint_stage,
         "env_state": {"common_step_counter": records[0]["counter"]},
         "task_environment_counters": [record["counter"] for record in records]})
@@ -117,6 +166,15 @@ class SharedActorPPO(PPO):
 
 
 class JointRunner(FootstepResumeRunner):
+  alg: SharedActorPPO
+
+  @property
+  def task_log_dir(self) -> Path:
+    directory = self.logger.log_dir
+    if directory is None:
+      raise ValueError("Joint training requires a task log directory")
+    return Path(directory)
+
   def _configure_multi_gpu(self):
     if os.environ.get("JOINT_DISTRIBUTED_BACKEND", "nccl") == "nccl":
       return super()._configure_multi_gpu()
@@ -154,7 +212,7 @@ class JointRunner(FootstepResumeRunner):
     restore_fixed_exploration(actor, self.cfg["actor"])
     if joint_resume:
       assert_same_state(actor.state_dict(), walking["actor_state_dict"])
-    actor.update_normalization = lambda observations: None
+    actor.update_normalization = lambda obs: None
     self.current_learning_iteration = int(walking["iter"]) + 1
     self.env.unwrapped.common_step_counter = counter
     with torch.inference_mode():
@@ -168,16 +226,18 @@ class JointRunner(FootstepResumeRunner):
     self.alg.joint_evaluation_iteration = int(os.environ["JOINT_EVALUATION_ITERATION"])
     self.alg.joint_log_dir = Path(os.environ["JOINT_RUN_DIR"])
     self.alg.joint_env = self.env
-    self.alg.joint_stage = (walking.get("infos") or {}).get("precision_stage", {})
+    infos = walking.get("infos") or {}
+    self.alg.joint_stage = infos.get("precision_stage", {})
+    self.alg.joint_theta_stage = infos.get("theta_stage")
     receipt = {"rank": self.gpu_global_rank, "actor_checkpoint": str(path),
       "critic_checkpoint": str(path) if self.gpu_global_rank == 0 else step_path,
       "actor_mean_exact": True, "critic_exact": True, "optimizer_reset": not joint_resume,
       "joint_resume": joint_resume, "optimizer_exact": joint_resume,
       "actor_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
       "fixed_std": .25, "actor_normalizer_frozen": True, "task_weight": self.alg.task_weight,
-      "learning_rate": self.alg.learning_rate, "counter": counter}
-    receipt["actor_raw_obs_dim"] = actor.raw_obs_dim
-    write_json(Path(self.logger.log_dir) / "initialization.json", receipt)
+      "learning_rate": self.alg.learning_rate, "counter": counter,
+      "theta_stage": self.alg.joint_theta_stage, "actor_raw_obs_dim": actor.raw_obs_dim}
+    write_json(self.task_log_dir / "initialization.json", receipt)
     print("JOINT_INITIALIZATION " + json.dumps(receipt), flush=True)
     return local.get("infos")
 
@@ -188,7 +248,7 @@ class JointRunner(FootstepResumeRunner):
     super().learn(num_learning_iterations, init_at_random_ep_len=False)
     self.alg.save_joint()
     final = self.alg.joint_log_dir / f"model_{self.current_learning_iteration}.pt"
-    status_path = Path(self.logger.log_dir) / f"status_rank_{self.gpu_global_rank}.json"
+    status_path = self.task_log_dir / f"status_rank_{self.gpu_global_rank}.json"
     status = json.loads(status_path.read_text())
     write_json(status_path, {**status, "final_checkpoint": str(final), "actor_sync_verified": True})
 
@@ -206,23 +266,35 @@ def worker(args, run_dir):
   os.environ["JOINT_DISTRIBUTED_BACKEND"] = args.distributed_backend
   task = train.FOOTSTEP_TASK if rank == 0 else train.STEP_EPISODE_TASK
   cfg = train.TrainConfig.from_task(task)
+  if not isinstance(cfg.agent, RslRlOnPolicyRunnerCfg):
+    raise TypeError("Joint training requires an on-policy PPO configuration")
+  agent = cfg.agent
   from g1_lower_rl.tasks.footstep_tracking import make_footstep_env_cfg
 
-  stage_config = None
-  if rank == 0:
-    saved = torch.load(args.walking_checkpoint, map_location="cpu", weights_only=False)
-    stage_config = (saved.get("infos") or {}).get("precision_stage", {})
-  cfg = replace(cfg, env=make_footstep_env_cfg(profile, precision_stage=stage_config),
-    resume_checkpoint=args.walking_checkpoint, enable_nan_guard=True)
+  saved = torch.load(args.walking_checkpoint, map_location="cpu", weights_only=False)
+  stage_config = (saved.get("infos") or {}).get("precision_stage", {}) if rank == 0 else None
+  theta_stage = (saved.get("infos") or {}).get("theta_stage")
+  if theta_stage is not None:
+    from g1_lower_rl.tasks.footstep_tracking.theta_stage import make_theta_stage_env_cfg
+    from g1_lower_rl.rl.footstep_model import FootstepModelCfg
+
+    env_cfg = make_theta_stage_env_cfg(profile, theta_stage, rank, precision_stage=stage_config)
+    agent.actor = FootstepModelCfg()
+  else:
+    env_cfg = make_footstep_env_cfg(profile, precision_stage=stage_config)
+  cfg = replace(cfg, env=env_cfg, resume_checkpoint=args.walking_checkpoint, enable_nan_guard=True)
   cfg.env.scene.num_envs = args.envs_per_rank
-  cfg.agent.resume = True
-  cfg.agent.max_iterations = args.max_updates
-  cfg.agent.save_interval = args.save_interval
-  cfg.agent.algorithm.class_name = "train_footstep_joint:SharedActorPPO"
-  cfg.agent.algorithm.learning_rate = args.learning_rate
-  cfg.agent.algorithm.schedule = "fixed"
-  cfg.agent.algorithm.entropy_coef = 0.
-  cfg.agent.actor.distribution_cfg.update(init_std=.25, learn_std=False, std_range=(.25, .25))
+  agent.resume = True
+  agent.max_iterations = args.max_updates
+  agent.save_interval = args.save_interval
+  agent.algorithm.class_name = "train_footstep_joint:SharedActorPPO"
+  agent.algorithm.learning_rate = args.learning_rate
+  agent.algorithm.schedule = "fixed"
+  agent.algorithm.entropy_coef = 0.
+  distribution_cfg = agent.actor.distribution_cfg
+  if distribution_cfg is None:
+    raise ValueError("Joint training requires an actor distribution")
+  distribution_cfg.update(init_std=.25, learn_std=False, std_range=(.25, .25))
   lane = run_dir / ("walking" if rank == 0 else "single_step")
   lane.mkdir(exist_ok=True)
   if args.continuous and not (lane / "STOP").is_symlink() and not (lane / "STOP").exists():
@@ -238,7 +310,7 @@ def worker(args, run_dir):
 
 def synchronization_test(rank, rendezvous, weights):
   distributed.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
-  algorithm = object.__new__(SharedActorPPO)
+  algorithm = cast(Any, object.__new__(SharedActorPPO))
   algorithm.actor = torch.nn.Linear(2, 1)
   algorithm.critic = torch.nn.Linear(2, 1)
   algorithm.task_weight = weights[rank]
@@ -258,7 +330,9 @@ def synchronization_test(rank, rendezvous, weights):
     torch.testing.assert_close(parameter.grad, torch.full_like(parameter, weights[0] + 2 * weights[1]))
   for parameter in algorithm.critic.parameters():
     assert torch.equal(parameter, torch.full_like(parameter, rank + 10.))
-    assert torch.equal(parameter.grad, torch.full_like(parameter, rank + 4.))
+    gradient = parameter.grad
+    assert gradient is not None
+    assert torch.equal(gradient, torch.full_like(parameter, rank + 4.))
   optimizer = torch.optim.Adam(list(algorithm.actor.parameters()) + list(algorithm.critic.parameters()), lr=1e-5)
   optimizer.step()
   algorithm.verify_actor()
@@ -267,7 +341,7 @@ def synchronization_test(rank, rendezvous, weights):
     "task_critic_state_dicts": {"walking": algorithm.critic.state_dict(), "single_step": algorithm.critic.state_dict()},
     "task_optimizer_state_dicts": {"walking": optimizer.state_dict(), "single_step": optimizer.state_dict()},
     "infos": {"shared_actor": True, "task_weights": [.7, .3], "task_environment_counters": [100, 200]}}
-  restored = object.__new__(SharedActorPPO)
+  restored = cast(Any, object.__new__(SharedActorPPO))
   restored.actor = torch.nn.Linear(2, 1)
   restored.critic = torch.nn.Linear(2, 1)
   restored.optimizer = torch.optim.Adam(list(restored.actor.parameters()) + list(restored.critic.parameters()), lr=1e-3)
@@ -361,7 +435,7 @@ def main():
     from unittest.mock import patch
     for weights in ([.7, .3], [.4, .6]):
       with tempfile.TemporaryDirectory() as directory:
-        torch.multiprocessing.spawn(synchronization_test, args=("file://" + directory + "/rendezvous", weights), nprocs=2)
+        spawn(synchronization_test, args=("file://" + directory + "/rendezvous", weights), nprocs=2)
     with tempfile.TemporaryDirectory() as directory:
       run_dir = Path(directory)
       baseline = run_dir / "baseline.pt"
@@ -417,8 +491,11 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=False)
   saved = torch.load(args.walking_checkpoint, map_location="cpu", weights_only=False)
   input_weight = saved.get("actor_state_dict", {}).get("rnn.rnn.weight_ih_l0")
-  if input_weight is not None and input_weight.shape[1] != 81:
-    parser.error("Footstep training requires 78 raw observations and 81 encoded features")
+  theta_stage = (saved.get("infos") or {}).get("theta_stage")
+  raw_dim, encoded_dim = (RAW_OBS_DIM, ENCODED_OBS_DIM) if theta_stage is not None else (78, 81)
+  if input_weight is not None and input_weight.shape[1] != encoded_dim:
+    parser.error(f"Selected stage requires {raw_dim} raw observations and {encoded_dim} encoded features; "
+                 "legacy checkpoints require an explicit migration before training with theta")
   args.evaluation_iteration = (int(torch.load(args.resume_joint or args.walking_checkpoint,
     map_location="cpu", weights_only=False)["iter"]) + args.evaluate_at_updates) if args.evaluate_at_updates else None
   write_json(run_dir / "launch.json", {**vars(args), "run_dir": str(run_dir),

@@ -118,6 +118,46 @@ class LowerBodyTorqueCost:
     return cost
 
 
+def _torso_heading_offset(orientations: torch.Tensor) -> torch.Tensor:
+  scalar, roll, pitch, yaw = orientations.unbind(-1)
+  headings = torch.atan2(2 * (scalar * yaw + roll * pitch), 1 - 2 * (pitch.square() + yaw.square()))
+  feet = headings[:, :2]
+  sine, cosine = feet.sin().sum(-1), feet.cos().sum(-1)
+  mean = torch.where(torch.hypot(sine, cosine) > 1e-6, torch.atan2(sine, cosine), feet[:, 0])
+  difference = headings[:, 2] - mean
+  return torch.remainder(difference + math.pi, 2 * math.pi) - math.pi
+
+
+def _torso_heading_cost(orientations: torch.Tensor, desired: torch.Tensor) -> torch.Tensor:
+  difference = _torso_heading_offset(orientations) - desired
+  return (torch.remainder(difference + math.pi, 2 * math.pi) - math.pi).square()
+
+
+_compiled_torso_heading_cost = torch.compile(_torso_heading_cost, fullgraph=True)
+
+
+def torso_heading_error(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+  """返回 torso 相对实际双脚圆周平均航向的偏角，反向双脚时以左脚为基准"""
+  data = env.scene[asset_cfg.name].data
+  orientations = torch.cat((data.site_quat_w[:, asset_cfg.site_ids],
+                            data.body_link_quat_w[:, asset_cfg.body_ids]), dim=1)
+  return _torso_heading_offset(orientations).unsqueeze(-1)
+
+
+def torso_heading_error_l2(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg,
+  command_name: str = "torso_heading",
+  compile_backend: bool = True,
+) -> torch.Tensor:
+  data = env.scene[asset_cfg.name].data
+  orientations = torch.cat((data.site_quat_w[:, asset_cfg.site_ids],
+                            data.body_link_quat_w[:, asset_cfg.body_ids]), dim=1)
+  desired = env.command_manager.get_term(command_name).command[:, 0]
+  cost = _compiled_torso_heading_cost if compile_backend and orientations.is_cuda else _torso_heading_cost
+  return cost(orientations, desired)
+
+
 def body_tilt_angle_l2(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
   """计算相对竖直方向的弧度倾角平方，不受世界航向角影响"""
   data = env.scene[asset_cfg.name].data

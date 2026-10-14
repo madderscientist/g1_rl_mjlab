@@ -19,6 +19,10 @@ FREQUENCY_RATE_STAGES = (
   (800, (-0.15, 0.15)),
   (2000, (-0.3, 0.3)),
 )
+TORSO_HEADING_STAGES = tuple(
+  (iteration, math.radians(degrees))
+  for iteration, degrees in ((0, 20), (1000, 40), (2500, 60), (5000, 90))
+)
 
 
 def _select_stage(stages, iteration):
@@ -47,6 +51,15 @@ def command_frequency_rate(env, env_ids, stages=FREQUENCY_RATE_STAGES, num_steps
   target = env.command_manager.get_term("footsteps").batch.change_ranges[1]
   target.copy_(target.new_tensor(bounds))
   return {"iteration_start": iteration_start, "min_hz_s": bounds[0], "max_hz_s": bounds[1]}
+
+
+def torso_heading_range(env, env_ids, stages=TORSO_HEADING_STAGES, num_steps_per_env=NUM_STEPS_PER_ENV):
+  del env_ids
+  term = env.command_manager.get_term("torso_heading")
+  added_steps = max(0, env.common_step_counter - term.cfg.curriculum_start_step)
+  iteration_start, limit = _select_stage(stages, added_steps // num_steps_per_env)
+  term.angle_limit = limit
+  return {"added_iteration_start": iteration_start, "min_rad": -limit, "max_rad": limit}
 
 
 def arm_target_scale(iteration: int) -> float:

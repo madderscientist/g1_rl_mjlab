@@ -11,13 +11,17 @@
 
 ## 契约概览
 
+默认注册任务及既有150351部署仍使用 `g1_footstep_gru_v5_next_only`：actor78/81维、critic104维，无theta输入。第1至9节中的v7接口仅描述150351训练完毕后的独立theta阶段，不是默认任务的全局接口；第10节分别说明默认奖励与阶段差异。
+
 脚印输入为`[L_next,R_next]`，分别表示左右脚各自下一落点，包含正在迈向的目标。
-契约为`g1_footstep_gru_v5_next_only`，原始78维、编码81维。
+契约为`g1_footstep_gru_v7_torso_heading_command`，原始79维、编码82维。
+旧 v5 的78/81维检查点和已交付部署包不变；不能直接加载到 v7，须显式迁移权重、归一化、critic 与 Adam 状态并重新验证，不能仅修改元数据或补一个零输入。
+v6 中 theta 表示实际偏角，v7 改为期望偏角指令；即使维度相同也不能混用这两种语义。
 默认GRU隐藏维度64，MLP为256→256→128；连续场景reset时50%站立、50%直接行走，单步场景固定先站1秒。
 
 已实现模型、输入编码、PPO 模型配置、TorchScript/ONNX 导出、CPU 推理封装，以及训练奖励和防摔终止配置。
 另已实现独立的 NumPy 脚印采样、四步管理及频率停走调度模块。
-基础行走、精度、联合训练以及可选单步预训练均保持本页的部署接口；actor不接收root平移真值。定量精度、存活和硬件安全须分别评估，不能直接将仿真模型用于机器人。
+基础行走、精度、联合训练以及可选单步预训练保持原v5接口。独立阶段由 [theta_stage.py](theta_stage.py) 显式构建，仅含 `torso_heading_range` 课程，旧课程固定在150351进度；联合入口通过迁移检查点的 `infos.theta_stage` 启用。actor不接收root平移真值。定量精度、存活和硬件安全须分别评估，不能直接将仿真模型用于机器人。
 
 ### 实现位置
 
@@ -35,6 +39,7 @@
 - 观测全身 29 轴，不包括两个 Gloria-M 夹爪关节。
 - 只控制 15 轴：左腿 6、右腿 6、腰 yaw/roll/pitch。
 - 骨盆和 torso 各输入角速度与单位重力方向。
+- 输入 `theta`：torso 相对实际双脚平均航向的期望偏角指令，不是实际测量偏角。
 - 固定左右顺序输入双脚各自下一落点，共两个XY/yaw位姿；规划器和critic仍保留内部支撑基准。
 - 输入全局相位和当前频率；不输入身体高度、线速度指令、骨盆相对支撑系位姿、接触力或外力真值。
 - f>0 为行走/踏步，f=0 为双脚站立；原地踏步通过正频率和重复左右各自固定的落点表达。
@@ -46,7 +51,7 @@
 
 | 输入 | 默认 shape | 含义 |
 | --- | --- | --- |
-| `obs` | `[1,78]` | 未归一化、未编码的原始观测 |
+| `obs` | `[1,79]` | 未归一化、未编码的原始观测 |
 | `h_in` | `[1,1,64]` | GRU `[层数,batch,hidden_size]` 隐状态 |
 
 | obs 切片 | 维数 | 内容 | 单位/约定 |
@@ -61,6 +66,19 @@
 | `71:72` | 1 | 当前频率 f | 完整左右周期/s，非负；0 为双脚站立，正数时总步频为 `2*f` |
 | `72:75` | 3 | L_next | 左脚首个未消费落点，包含正在迈向的目标 |
 | `75:78` | 3 | R_next | 右脚首个未消费落点，包含正在迈向的目标 |
+| `78:79` | 1 | theta | 期望 torso 相对实际双脚圆周平均航向的偏角指令，rad，`-pi <= theta < pi` |
+
+`feet_mean_yaw = atan2(sin(left_yaw)+sin(right_yaw), cos(left_yaw)+cos(right_yaw))`，
+`actual_offset = wrap(torso_yaw - feet_mean_yaw)`；目标为 `actual_offset = theta`，正指令表示期望 torso 相对双脚均值绕竖直轴逆时针偏转。
+三个航向必须来自同一参考系下的实际姿态；足底是 `left_foot/right_foot` site，不是支撑槽位或下一落点目标。
+双脚单位朝向向量之和的模长不超过 `1e-6` 时，均值退化，固定以左脚实际航向为基准。
+世界系共同旋转不改变实际偏角；`f=0` 时也继续更新期望 theta，不随队列或 anchor 冻结。
+部署调度器提供限速连续过渡的期望值作为 `pack_footstep_observation(theta=...)` 的必填参数。
+`compute_torso_heading_error(torso_yaw, [left_yaw, right_yaw])` 计算实际偏角，仅用于反馈/诊断，不能当作期望 theta 输入。
+训练按新增 PPO 轮数在 0/1000/2500/5000 轮使用 ±20/40/60/90 度的均匀目标采样；角度内部均为 rad。
+每个环境每 8–12 秒独立重采样目标与正速度，速度均匀取 0.087266–0.523599 rad/s。
+当前指令每拍按 `sign(target-theta)*min(abs(target-theta), speed*dt)` 更新；重采样不修改当前 theta，进行中的过渡可被新目标接续。
+episode reset 将当前 theta 置零并抽取目标；普通重采样不置零、不瞬移。
 
 两个脚印槽位必须有效。本版没有padding/valid掩码；缺少远期指令时，必须由调度器显式补齐
 可执行的重复落点或进行安全处理，不能用全零表示数据缺失。输入形状为`[2,3]`，排列为
@@ -93,16 +111,17 @@ f=0时两个槽位为`[left_hold,right_hold]`，两个不同的足底保持目�
 1. `q_rel = q - default_joint_pos`。默认角存于 checkpoint 的 `encoder.default_joint_pos` buffer。
 2. 相位 `x` 转为 `[sin(x),cos(x)]`。
 3. 每个脚印的 `[dx,dy,dtheta]` 转为 `[dx,dy,sin(dtheta),cos(dtheta)]`。
-4. 对编码后的81维特征做经验归一化。运行均值和方差保存于checkpoint，并随模型导出。
+4. `theta` 保留为一维弧度偏角，不转为 sin/cos。
+5. 对编码后的82维特征做经验归一化。运行均值和方差保存于checkpoint，并随模型导出。
 
 编码后布局：`q_rel[0:29]`、`dq[29:58]`、两组 IMU `[58:70]`、
-`sin(x),cos(x)[70:72]`、`f[72:73]`、两个脚印`[73:81]`，每项4维。
+`sin(x),cos(x)[70:72]`、`f[72:73]`、两个脚印`[73:81]`，每项4维，以及 `theta[81:82]`。
 
 ```text
-obs[batch,78]
-  -> FootstepObservationEncoder[batch,81]
+obs[batch,79]
+  -> FootstepObservationEncoder[batch,82]
   -> EmpiricalNormalization
-  -> GRU(input=81, hidden=64, layers=1)
+  -> GRU(input=82, hidden=64, layers=1)
   -> MLP(64 -> 256 -> 256 -> 128 -> 15, ELU)
   -> actions[batch,15]
 ```
@@ -110,7 +129,7 @@ obs[batch,78]
 `FootstepModelCfg` 默认使用可训练的标量 Gaussian std=1.0，供 PPO 探索。
 `FootstepActor.forward(..., stochastic_output=True)` 采样动作；默认 forward 和部署导出均为确定性输出。
 Actor 支持 rsl_rl 的 padded 序列、mask、初始隐状态、按环境 reset 和截断反传。
-模型配置可改变隐藏层大小；本版部署布局为78/81/15，实际隐状态shape必须读取导出契约。
+模型配置可改变隐藏层大小；本版部署布局为79/82/15，实际隐状态shape必须读取导出契约。
 
 **部署端不能再次减默认角、做 sin/cos、做经验归一化，或每拍清零 GRU。**
 
@@ -190,7 +209,8 @@ f=0 单独表示双支撑站立，不作为行走随机游走的下界。正频�
 重力方向每拍标准差0.029、每episode偏置标准差0.01，两个IMU及各轴独立
 偏置在episode内固定、reset重新采样而非累加，随机延迟关闭；重力加噪后不再归一化
 critic与play关闭此观测噪声，但既有startup编码器偏置U[-0.015,0.015]rad仍保留
-IMU在环境中拆成四个3维项以兼容噪声reset，最终Actor为78维，脚印/相位/频率不加噪声
+IMU在环境中拆成四个3维项以兼容噪声reset，最终Actor为79维，脚印/相位/频率/theta不加噪声。
+当前 theta 是期望指令，不加传感器噪声；实际偏角奖励由 link/site 姿态计算，不能将仿真真值精度视为实机标定保证。
 详见[初始化与随机化](README.md#初始化与随机化)。
 
 ## 7. 构造、保存和导出
@@ -207,14 +227,14 @@ from g1_lower_rl.rl.footstep_model import FootstepActor, FootstepModelCfg, expor
 cfg = FootstepModelCfg()
 options = {key: value for key, value in asdict(cfg).items()
            if key in inspect.signature(FootstepActor).parameters}
-example = TensorDict({"actor": torch.zeros(1, 78)}, batch_size=[1])
+example = TensorDict({"actor": torch.zeros(1, 79)}, batch_size=[1])
 actor = FootstepActor(example, {"actor": ["actor"]}, "actor", 15, **options)
 torch.save({"actor_state_dict": actor.state_dict(), "actor_config": asdict(cfg)}, "footstep_actor.pt")
 export_footstep_policy(actor, "export/footstep/policy.onnx")
 ```
 
-训练接入时传一个78维原始观测组，不要提前编码成81维；类路径可由rsl_rl的resolver加载。
-训练已绑定奖励与104维 MLP critic 观测；不继承旧速度任务的课程，默认tracking的方向变化与频率变化率分别注册为独立课程
+训练接入时传一个79维原始观测组，不要提前编码成82维；类路径可由rsl_rl的resolver加载。
+独立theta阶段使用105维MLP critic观测，其他参数保留150351基线，仅推进theta课程。下面的历史基础课程属于默认78/81/104维配方，不在新阶段重新运行；默认tracking的方向变化与频率变化率分别注册为独立课程
 默认tracking每回合reset随机初始方向和0.8–1.8Hz目标步频，并独立抽取站立/行走模式及左右起脚
 方向变化在1500/2500/4000次逐档放开，频率变化率从±0.01Hz/s开始，在800/2000次放开至±0.15/±0.3Hz/s
 阶段表见[指令课程](README.md#指令课程)，独立脚步库不依赖课程或训练轮数
@@ -261,6 +281,7 @@ obs = pack_footstep_observation(
     pelvis_ang_vel=pelvis_gyro, pelvis_projected_gravity=pelvis_gravity,
     torso_ang_vel=torso_gyro, torso_projected_gravity=torso_gravity,
     phase=phase, frequency=frequency, footsteps=footprints,
+    theta=desired_torso_offset_rad,
 )
 actions, q_des = policy.step(obs)
 # 按 policy.action_joint_names 和契约中的 PD 参数下发 q_des。
@@ -279,7 +300,7 @@ actions, q_des = policy.step(obs)
 OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_model.py tests/test_tensor_footsteps.py -q
 ```
 
-测试包括78/81维布局、扩容网络、固定左右next槽位、角度周期性、GRU reset、ONNX Runtime
+测试包括79/82维布局、扩容网络、固定左右next槽位、theta圆周均值/单角度透传/共同旋转不变性、GRU reset、ONNX Runtime
 多拍动作/隐状态对齐、接口校验及真实环境下一落点输入与完成拍执行奖励的分离。
 规划器测试覆盖NumPy/编译GPU状态一致性、摆动期间基准冻结、计划落地更新和仅预览最近两步及局部重置；不验证策略已学会行走。
 
@@ -319,9 +340,9 @@ OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_mode
 | `lower_body_copper_proxy` | -0.25（基础） | 15个受控腿腰执行器的实际力矩统一尺度平方和；f=0乘2，有效权重-0.5 |
 | `hip_yaw_zero` | -0.1 | 左右 `hip_yaw_joint` 绝对角度（rad）的平方和，目标是 0 rad，站立和行走均启用 |
 | `leg_symmetry_ema` | -0.1 | 六对腿关节镜像偏差先EMA，超过3°的部分平方后平均；直行/对称站姿门控及1秒渐入 |
-| `waist_yaw_zero` | -0.8 | `waist_yaw_joint` 绝对角度平方，目标是 0 rad，不是默认姿态偏差 |
+| `waist_yaw_zero` | -0.8 | 默认配方保留腰yaw关节回零，站立和行走均启用 |
 | `waist_roll_pitch_edges` | -2.0 | 两个腰轴靠近硬限位的边缘平方惩罚，内部区域为零 |
-| `torso_upright` | -2.0 | torso 相对竖直倾角的平方（弧度），`theta=atan2(norm(g_b.xy),-g_b.z)`，不约束世界 yaw，不控制身体高度 |
+| `torso_upright` | -2.0 | torso 相对竖直倾角的平方（弧度），`tilt=atan2(norm(g_b.xy),-g_b.z)`，不约束世界 yaw，不控制身体高度 |
 | `body_ang_vel` | -0.05 | `torso_link` 实际世界系X/Y角速度平方和，站立和行走均启用，不罚Z轴转向 |
 | `head_height` | +0.4 | `clip((head_z-ground_z)/1.254,0,1)`，直接取 `head_collision` 几何体中心，至少一脚接触且未失败时启用 |
 | `head_height_low` | -1.0 | `relu(1.15-head_height_above_ground)/0.2`，站立和行走均启用，不因腾空免罚 |
@@ -344,6 +365,8 @@ OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_mode
 | `standing_action_change` | -0.04 | 零步频时动作差分平方和，原始值封顶25，0.3秒渐入；与全程-0.02项叠加 |
 
 规则、保持时长与完成判据见[单步说明](step_episode/README.md)。当前连续31项、单步34项；共同姿态和限位倍率不因任务切换改变。
+
+独立theta阶段以原150351为基线：移除 `waist_yaw_zero`，替换为 `torso_feet_heading`，权重-2.0、原始值 `wrap(actual_offset-theta)^2`，站立和行走均启用。不带入150351之后添加的 `standing_pelvis_upright`；其余奖励保持基线，因此连续30项、单步33项。此差异仅由显式阶段工厂应用，默认 `make_rewards` 不变。
 
 这是带权 RL 目标，而非保证不摔的约束优化或安全证明。以可达脚印下的落地精度和存活为主要目标，
 再降低能耗。能耗项过重可能导致不愿迈步，过轻则可能动作剧烈，需要结合实际训练调权。
@@ -370,7 +393,7 @@ reward_landing_per_step = -0.1 * landing_ramp * raw_landing * step_dt
 ```
 
 线性代价不截断，XY整体距离与yaw各占50%，不把X和Y拆开。
-连续配置30项（7正、23负），独立walk-first配置29项（移除落脚事件代价）；铜损行走-0.25、f=0时-0.5。
+默认连续配置31项（7正、24负），walk-first配置30项（移除落脚事件代价）；独立theta阶段连续30项（7正、23负）。铜损行走-0.25、f=0时-0.5。
 
 `leg_symmetry_ema` 对pitch/knee计算左减右、对roll/yaw计算左加右。EMA时间常数为 `min(1/f,2s)`，站立1秒，按控制步计算 `alpha=1-exp(-dt/tau)`。门控使用完成拍的计划意图而非实际速度：稳定行走需方向与脚朝向差不超过15°；站定需两目标脚在朝向系内前后差不超过5cm；目标yaw镜像和偏差均需不超过30°。不满足时清空滤波，重新启用/意图变化后从当前误差初始化、1秒渐入。六对均值使用rad平方，腰/手臂不计入；无需修改GRU或观测契约。
 历史A/B脚本须使用对应源码快照，不能直接调用当前奖励工厂。
@@ -453,7 +476,7 @@ reward_soft_landing = -0.002 * landing_force * (f>0) * step_dt
 不是力矩平方、冲量、物理子步最大峰值或按体重归一化的值。保留原任务的 dt 缩放，不除以 step_dt。
 复用函数记录 `Metrics/landing_force_mean`，为本拍所有首次触地脚的平均力模长；本拍无落地时为零，
 因此跨时间直接平均该指标不等于跨所有落地事件的平均冲击力。
-接触力仅作为训练奖励数据，不增加actor的78维输入，也不引入夹爪观测。
+接触力仅作为训练奖励数据，不增加actor的79维输入，也不引入夹爪观测。
 
 ### 10.3 铜损代理与腰部
 
@@ -492,7 +515,7 @@ reward_rate = -0.25 * copper_proxy * (2 if f == 0 else 1)
 该阈值允许名义封顶高度以下约10cm变化，不规定膝角。权重和阈值为待验证初值，效果仍需重训验证。
 当前模型的 `head_link` 是网格名而非独立body；使用已有头部几何体，不增加刚体，也不再使用手工 `body_point`。
 封顶基准为原骨盆0.78m加腰部0.044m和头部中心局部Z偏移0.43m；双脚腾空或非超时失败拍不发此奖励。
-高度参考`ground_height`而不是运动中的脚底；它不改变78维actor输入，也不加入高度命令或固定膝角。
+高度参考`ground_height`而不是运动中的脚底；它不改变79维actor输入，也不加入高度命令或固定膝角。
 原 `pelvis_height` 及中间的 `torso_height` 项均由 `head_height` 替换；它仍不是保证站直的硬约束。
 骨盆倾斜使用真实骨盆局部单位重力向量的一阶低通，`fc=f/4`（f>0），f=0时`fc=0.2Hz`。
 每个控制拍用当前执行频率计算 `alpha=1-exp(-2*pi*fc*step_dt)`，
@@ -552,7 +575,7 @@ f=0包括停止后的settling阶段。屈膝项按共享相位选择支撑腿、
 ### 10.4 训练命令状态接口
 
 命令项必须提供 `env.command_manager.get_term("footsteps").reward_state`，类型为
-`FootstepRewardState`。这是训练特权状态，不增加actor/ONNX的78维输入：
+`FootstepRewardState`。这是训练特权状态，不增加actor/ONNX的79维输入：
 
 | 字段 | shape | 含义 |
 | --- | --- | --- |

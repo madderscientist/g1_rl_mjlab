@@ -20,6 +20,18 @@ def validate_footstep_observation(obs: np.ndarray) -> None:
     raise ValueError("Phase must be wrapped into [0, 2*pi)")
   if obs[0, 71] < 0:
     raise ValueError("Frequency must be nonnegative; zero commands double-support standing")
+  if not -np.float32(np.pi) <= obs[0, 78] < np.float32(np.pi):
+    raise ValueError("Theta must be wrapped into [-pi, pi)")
+
+
+def compute_torso_heading_error(torso_yaw: float, foot_yaws: ArrayLike) -> float:
+  """用同一参考系中的实际 torso/左右足底航向计算 theta，单位 rad"""
+  feet = np.asarray(foot_yaws, dtype=np.float64)
+  if feet.shape != (2,) or not np.isfinite(feet).all() or not np.isfinite(torso_yaw):
+    raise ValueError("Expected one finite torso yaw and two finite left/right foot yaws")
+  sine, cosine = np.sin(feet).sum(), np.cos(feet).sum()
+  mean = np.arctan2(sine, cosine) if np.hypot(sine, cosine) > 1e-6 else feet[0]
+  return float((torso_yaw - mean + np.pi) % (2 * np.pi) - np.pi)
 
 
 def pack_footstep_observation(
@@ -33,8 +45,11 @@ def pack_footstep_observation(
   phase: float,
   frequency: float,
   footsteps: ArrayLike,
+  theta: float,
 ) -> np.ndarray:
-  """拼接原始传感器数据及左右脚下一落点的 XY/yaw 位姿"""
+  """拼接原始传感器、左右脚下一落点及期望 torso 偏角指令 theta"""
+  if not np.isfinite(theta) or not -np.pi <= theta < np.pi:
+    raise ValueError("Theta must be finite and wrapped into [-pi, pi)")
   parts = []
   for name, value, shape in (
     ("joint_pos", joint_pos, (29,)),
@@ -45,12 +60,15 @@ def pack_footstep_observation(
     ("torso_projected_gravity", torso_projected_gravity, (3,)),
     ("phase/frequency", [phase, frequency], (2,)),
     ("footsteps", footsteps, (2, 3)),
+    ("theta", [theta], (1,)),
   ):
     array = np.asarray(value, dtype=np.float32)
     if array.shape != shape:
       raise ValueError(f"{name} must have shape {shape}, got {array.shape}")
     parts.append(array.reshape(-1))
   obs = np.concatenate(parts)[None, :]
+  if obs[0, 78] == np.float32(np.pi):
+    obs[0, 78] = -np.float32(np.pi)
   validate_footstep_observation(obs)
   return obs
 

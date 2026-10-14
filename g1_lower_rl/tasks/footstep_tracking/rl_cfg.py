@@ -9,7 +9,7 @@ from g1_lower_rl.tasks.footstep_tracking.curriculum import NUM_STEPS_PER_ENV
 def footstep_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
   """单任务64拍recurrent PPO基础配置；联合入口显式覆盖学习率和探索。"""
   return RslRlOnPolicyRunnerCfg(
-    actor=FootstepModelCfg(),
+    actor=FootstepModelCfg(class_name="g1_lower_rl.rl.footstep_model:LegacyFootstepActor"),
     critic=RslRlModelCfg(hidden_dims=(256, 128), activation="elu", obs_normalization=True),
     algorithm=RslRlPpoAlgorithmCfg(
       num_learning_epochs=5,

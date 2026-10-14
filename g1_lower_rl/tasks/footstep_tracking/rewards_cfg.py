@@ -21,6 +21,12 @@ from g1_lower_rl.tasks.motion_tracking.mdp.terminations import with_probabilisti
 PROB_TERMINATION = 1.0 / (50.0 * 4.0)
 
 
+def make_torso_heading_reward() -> RewardTermCfg:
+  return RewardTermCfg(func=rewards.torso_heading_error_l2, weight=-2.0, params={"asset_cfg": SceneEntityCfg(
+    "robot", body_names=("torso_link",), site_names=("left_foot", "right_foot"), preserve_order=True,
+  )})
+
+
 def make_rewards(
   command_name: str = "footsteps",
   sensor_name: str = "feet_ground_contact",

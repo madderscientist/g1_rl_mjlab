@@ -31,6 +31,7 @@ OBSERVATION_LAYOUT = (
   ("phase", 70, 71, "rad"),
   ("frequency", 71, 72, "cycles/s"),
   ("footsteps", 72, 78, "[m, m, rad] per slot"),
+  ("theta", 78, 79, "rad; desired torso yaw offset from actual mean foot yaw"),
 )
 
 
@@ -64,10 +65,12 @@ def nominal_action_parameters() -> dict[str, list[float]]:
 
 
 class FootstepObservationEncoder(nn.Module):
-  """将形状为 [..., 78] 的原始观测编码为 [..., 81] 的连续特征"""
+  """将形状为 [..., 79] 的原始观测编码为 [..., 82] 的特征"""
 
-  def __init__(self, default_joint_pos: Sequence[float] | None = None) -> None:
+  def __init__(self, default_joint_pos: Sequence[float] | None = None, *, include_theta: bool = True) -> None:
     super().__init__()
+    self.include_theta = include_theta
+    self.raw_obs_dim = RAW_OBS_DIM if include_theta else 78
     defaults = torch.tensor(
       nominal_joint_positions() if default_joint_pos is None else default_joint_pos,
       dtype=torch.float32,
@@ -77,13 +80,13 @@ class FootstepObservationEncoder(nn.Module):
     self.register_buffer("default_joint_pos", defaults)
 
   def forward(self, obs: torch.Tensor) -> torch.Tensor:
-    if obs.shape[-1] != RAW_OBS_DIM:
-      raise ValueError(f"Footstep observations must have exactly {RAW_OBS_DIM} raw features")
-    footprints = obs[..., 72:].unflatten(-1, (2, 3))
+    if obs.shape[-1] != self.raw_obs_dim:
+      raise ValueError(f"Footstep observations must have exactly {self.raw_obs_dim} raw features")
+    footprints = obs[..., 72:78].unflatten(-1, (2, 3))
     headings = footprints[..., 2:3]
     encoded_footprints = torch.cat((footprints[..., :2], headings.sin(), headings.cos()), dim=-1).flatten(-2)
     phase = obs[..., 70:71]
-    return torch.cat(
+    features = torch.cat(
       (
         obs[..., :29] - self.default_joint_pos,
         obs[..., 29:70],
@@ -94,6 +97,7 @@ class FootstepObservationEncoder(nn.Module):
       ),
       dim=-1,
     )
+    return torch.cat((features, obs[..., 78:79]), dim=-1) if self.include_theta else features
 
 
 class FootstepActor(RNNModel):
@@ -135,16 +139,16 @@ class FootstepActor(RNNModel):
       rnn_hidden_dim=rnn_hidden_dim,
       rnn_num_layers=rnn_num_layers,
     )
-    self.encoder = FootstepObservationEncoder(default_joint_pos)
+    self.encoder = FootstepObservationEncoder(default_joint_pos, include_theta=self.raw_obs_dim == 79)
     self.phase_cfg = resolve_phase_cfg(phase_cfg=FootstepPhaseCfg(**phase_cfg) if isinstance(phase_cfg, dict) else phase_cfg)
     for name, values in nominal_action_parameters().items():
       self.register_buffer(f"action_{name}", torch.tensor(values, dtype=torch.float32))
 
   def _get_obs_dim(self, obs: TensorDict, obs_groups: dict[str, list[str]], obs_set: str) -> tuple[list[str], int]:
     groups, raw_dim = super()._get_obs_dim(obs, obs_groups, obs_set)
-    if len(groups) != 1 or raw_dim != RAW_OBS_DIM:
-      raise ValueError("FootstepActor requires one observation group with 78 raw features")
-    return groups, ENCODED_OBS_DIM
+    if len(groups) != 1 or raw_dim != self.raw_obs_dim:
+      raise ValueError(f"FootstepActor requires one observation group with {self.raw_obs_dim} raw features")
+    return groups, self.encoded_obs_dim
 
   def get_latent(self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None) -> torch.Tensor:
     features = self.obs_normalizer(self.encoder(obs[self.obs_groups[0]]))
@@ -188,6 +192,18 @@ class FootstepActor(RNNModel):
         "pelvis": "angular velocity and unit gravity in calibrated pelvis link axes",
         "torso": "angular velocity and unit gravity in calibrated torso link axes",
         "gravity": "R_world_from_link.T @ [0, 0, -1]; not raw accelerometer readings",
+      },
+      "theta": {
+        "role": "command",
+        "raw_range_rad": [-math.pi, math.pi],
+        "upper_bound_exclusive": True,
+        "encoded_fields": ["theta"],
+        "definition": "desired torso yaw offset from the circular mean of actual left/right sole headings; not the measured torso offset",
+        "reference": "actual measured sole headings, not queued landing or support targets; all headings in one common frame",
+        "positive": "desired torso counterclockwise relative to mean foot heading about +z",
+        "degenerate_mean": "use left foot heading when the summed unit heading vector norm is <= 1e-6",
+        "standing": "continue smoothly updating the desired theta at f=0; do not freeze with the planner anchor",
+        "generation": "external uniformly sampled angle goals and positive speeds; rate-limit the current command without jumps when resampling",
       },
       "footsteps": {
         "slots": list(FOOTSTEP_SLOTS),
@@ -246,6 +262,19 @@ class FootstepActor(RNNModel):
       },
       "deployment_status": "model interface only; training, sensing, scheduler and hardware validation are required",
     }
+
+
+class LegacyFootstepActor(FootstepActor):
+  raw_obs_dim = 78
+  encoded_obs_dim = 81
+
+  def deployment_contract(self) -> dict:
+    contract = super().deployment_contract()
+    contract["version"] = "g1_footstep_gru_v5_next_only"
+    contract["model_class"] = "g1_lower_rl.rl.footstep_model:LegacyFootstepActor"
+    contract["observation_layout"] = [field for field in contract["observation_layout"] if field["name"] != "theta"]
+    contract.pop("theta")
+    return contract
 
 
 def export_footstep_policy(model: FootstepActor, path: str | Path) -> Path:
