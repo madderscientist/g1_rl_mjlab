@@ -282,7 +282,8 @@ def worker(args, run_dir):
     agent.actor = FootstepModelCfg()
   else:
     env_cfg = make_footstep_env_cfg(profile, precision_stage=stage_config)
-  cfg = replace(cfg, env=env_cfg, resume_checkpoint=args.walking_checkpoint, enable_nan_guard=True)
+  cfg = replace(cfg, env=env_cfg, resume_checkpoint=args.walking_checkpoint, enable_nan_guard=True,
+    scene_cuda_graphs=not args.no_scene_cuda_graphs)
   cfg.env.scene.num_envs = args.envs_per_rank
   agent.resume = True
   agent.max_iterations = args.max_updates
@@ -427,6 +428,7 @@ def main():
   parser.add_argument("--task-weights", type=float, nargs=2, default=[.7, .3], metavar=("WALKING", "SINGLE_STEP"))
   parser.add_argument("--evaluate-at-updates", type=int)
   parser.add_argument("--distributed-backend", choices=("nccl", "gloo"), default="nccl")
+  parser.add_argument("--no-scene-cuda-graphs", action="store_true")
   parser.add_argument("--evaluate-after", action="store_true")
   parser.add_argument("--self-test", action="store_true")
   args = parser.parse_args()

@@ -9,7 +9,7 @@ from mjlab.managers.observation_manager import ObservationTermCfg
 from . import make_footstep_env_cfg
 from .commands import TorsoHeadingCommandCfg
 from .curriculum import FREQUENCY_RATE_STAGES, NUM_STEPS_PER_ENV, _select_stage, arm_target_scale, torso_heading_range
-from .rewards_cfg import make_torso_heading_reward
+from .rewards_cfg import make_standing_torso_upright_reward, make_torso_heading_reward
 from .walking.curriculum import WALK_FIRST_STAGES, WALK_FIRST_YAW_STAGES
 
 
@@ -20,6 +20,12 @@ def make_theta_stage_env_cfg(profile, theta_stage, rank, play=False, *, precisio
   if not isinstance(origin, int) or origin < 0:
     raise ValueError("Theta stage requires a nonnegative task origin")
   cfg = make_footstep_env_cfg(profile, play=play, precision_stage=precision_stage)
+  if theta_stage.get("step_landing_stability") is not None:
+    raise ValueError("Landing stability stage was withdrawn; use a pre-stage checkpoint")
+  if profile == "step-episode" and theta_stage.get("step_extra_contact") is not None:
+    from .step_episode.env_cfg import configure_extra_contacts
+
+    configure_extra_contacts(cfg, **theta_stage["step_extra_contact"])
   cfg.commands["torso_heading"] = TorsoHeadingCommandCfg(
     curriculum_start_step=origin, angle_limit=theta_stage["stages"][0][1],
     resampling_time_range=tuple(theta_stage["resampling_time_range_s"]),
@@ -37,7 +43,10 @@ def make_theta_stage_env_cfg(profile, theta_stage, rank, play=False, *, precisio
       group.terms["theta"] = term
   cfg.rewards.pop("waist_yaw_zero")
   cfg.rewards.pop("standing_pelvis_upright", None)
-  cfg.rewards["torso_feet_heading"] = make_torso_heading_reward()
+  cfg.rewards["torso_feet_heading"] = make_torso_heading_reward(theta_stage.get("heading_reward_weight", -2.0))
+  if theta_stage.get("standing_torso_upright") is not None:
+    cfg.rewards["standing_torso_upright"] = make_standing_torso_upright_reward(
+      **theta_stage["standing_torso_upright"])
   iteration = origin // NUM_STEPS_PER_ENV
   if profile == "precision":
     _, angle, distance, width, change = _select_stage(WALK_FIRST_STAGES, iteration)

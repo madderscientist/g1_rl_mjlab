@@ -82,6 +82,26 @@ python scripts/disturb_video.py <run>/model_8800.pt out.mp4 20
 
 动作跟踪任务另有一组脚本，见 [`tasks/motion_tracking/README.md`](g1_lower_rl/tasks/motion_tracking/README.md)。
 
+### 通用场景 CUDA Graph
+
+`scripts/train.py` 和联合训练入口默认开启
+[`scene_graph.py`](g1_lower_rl/scene_graph.py) 的场景阶段 Graph，不依赖 footstep 指令或 PPO：
+
+- 将无延迟 builtin 执行器的目标索引、`ctrl` 写入合为一次 Graph replay。
+- 将标准接触传感器的腾空计时、接触历史更新合为另一次 replay，保留每个物理子步的更新频率。
+- CPU 保持 eager；存在 custom、fused、delayed 执行器时，控制阶段明确警告并保留 eager；存在自定义或其他类型传感器时，接触阶段也保留原更新顺序。
+- **不是**把整个 decimation 或 rollout 合为一个 Graph：物理步仍使用 mjlab 自带的 Graph，数值保护、NaN guard、局部 reset、事件、课程与循环策略状态仍按原顺序执行。
+
+实现适配 mjlab 1.6.0 的内部接口；升级 mjlab 后须重新验证。安装后场景拓扑与捕获张量的 storage 必须保持不变；原位修改目标、增益、随机化参数及局部 reset 不受影响。
+已对下肢行走、站立、脚步跟踪验证共享输入下的控制量和接触状态精确一致，不等于保证不同训练运行的完整轨迹逐位相同。无接触历史或 launch 本来较少的任务，收益可能接近噪声。
+
+```bash
+# 单任务对照：关闭场景 Graph（不关闭 mjlab 原有物理 Graph）
+python scripts/train.py G1-Gloria-LowerBody-Flat --scene-cuda-graphs False
+
+# 联合训练对照：在原有参数后加 --no-scene-cuda-graphs
+```
+
 **全身动作跟踪最终成果**：GitHub Release `model-215787`。仓库内的
 `artifacts/final_model_215787/` 保留 manifest 和部署契约，checkpoint 与 ONNX 作为
 Release 资产发布。在 80 条 LAFAN1、8 env、250 s 无删失协议下，平均存活 **163.7 s**，

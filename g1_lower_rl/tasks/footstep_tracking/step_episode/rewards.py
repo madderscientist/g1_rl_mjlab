@@ -66,6 +66,52 @@ class StepLandingBonus:
     return self.value
 
 
+class ExtraContactCost:
+  """Count confirmed extra landings, excluding each planned foot's first landing."""
+
+  def __init__(self, cfg, env):
+    shape = (env.num_envs, 2)
+    self.air = torch.zeros(shape, device=env.device)
+    self.contact = torch.zeros_like(self.air)
+    self.ground = torch.zeros_like(self.air)
+    self.peak = torch.zeros_like(self.air)
+    self.normal = torch.zeros(shape, dtype=torch.bool, device=env.device)
+    self.value = torch.zeros(env.num_envs, device=env.device)
+    self.last_step = -1
+
+  def reset(self, env_ids=None):
+    selected = slice(None) if env_ids is None else env_ids
+    for buffer in (self.air, self.contact, self.ground, self.peak, self.normal, self.value):
+      buffer[selected] = 0
+
+  def __call__(self, env, asset_cfg, command_name="footsteps", sensor_name="feet_ground_contact",
+               minimum_lift=.008, minimum_air_time_s=.04, minimum_contact_time_s=.04):
+    if self.last_step == env.common_step_counter:
+      return self.value
+    command = env.command_manager.get_term(command_name)
+    episode = command.batch.state
+    enabled = episode["episode_started"][:, None]
+    sides = torch.arange(2, device=env.device)[None, :]
+    planned = episode["episode_aligned"][:, None] | (sides == episode["episode_side"][:, None])
+    contact = env.scene[sensor_name].data.found > 0
+    height = env.scene[asset_cfg.name].data.site_pos_w[:, asset_cfg.site_ids, 2]
+    airborne = enabled & ~contact
+    self.air.copy_(torch.where(airborne, self.air + env.step_dt, self.air))
+    self.peak.copy_(torch.where(airborne, torch.maximum(self.peak, height - self.ground), self.peak))
+    self.contact.copy_(torch.where(contact, self.contact + env.step_dt, 0.))
+    settled = contact & (self.contact >= minimum_contact_time_s - 1e-8)
+    landing = enabled & settled & (self.air >= minimum_air_time_s - 1e-8) & (self.peak >= minimum_lift - 1e-8)
+    normal = landing & planned & ~self.normal
+    self.normal |= normal
+    self.value.copy_((landing & ~normal).sum(-1).to(self.value.dtype) / env.step_dt)
+    clear = settled | ~enabled
+    self.air.masked_fill_(clear, 0.)
+    self.peak.masked_fill_(clear, 0.)
+    self.ground.copy_(torch.where(clear & contact, height, self.ground))
+    self.last_step = env.common_step_counter
+    return self.value
+
+
 def standing_penalty_gate(env, command_name="footsteps", ramp_s=.3):
   command = env.command_manager.get_term(command_name)
   age = torch.where(command.batch.state["episode_started"], command.standing_time,

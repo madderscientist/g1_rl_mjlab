@@ -21,10 +21,20 @@ from g1_lower_rl.tasks.motion_tracking.mdp.terminations import with_probabilisti
 PROB_TERMINATION = 1.0 / (50.0 * 4.0)
 
 
-def make_torso_heading_reward() -> RewardTermCfg:
-  return RewardTermCfg(func=rewards.torso_heading_error_l2, weight=-2.0, params={"asset_cfg": SceneEntityCfg(
+def make_torso_heading_reward(weight: float = -2.0) -> RewardTermCfg:
+  if not math.isfinite(weight) or weight >= 0:
+    raise ValueError("Theta heading reward weight must be finite and negative")
+  return RewardTermCfg(func=rewards.torso_heading_error_l2, weight=weight, params={"asset_cfg": SceneEntityCfg(
     "robot", body_names=("torso_link",), site_names=("left_foot", "right_foot"), preserve_order=True,
   )})
+
+
+def make_standing_torso_upright_reward(weight: float = -1.0) -> RewardTermCfg:
+  if not math.isfinite(weight) or weight >= 0:
+    raise ValueError("Standing torso upright weight must be finite and negative")
+  return RewardTermCfg(func=rewards.standing_body_tilt_angle_l1, weight=weight, params={
+    "asset_cfg": SceneEntityCfg("robot", body_names=("torso_link",)),
+  })
 
 
 def make_rewards(

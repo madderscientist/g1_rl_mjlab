@@ -1,7 +1,7 @@
 """Single-step completion, holding time, and episode metrics."""
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 import torch
 
@@ -77,9 +77,12 @@ class StepEpisodeCommand(FootstepCommand):
         episode_count = mask.sum()
         count = episode_count.clamp_min(1)
         prefix = f"step/{name}_{ending}"
-        result[f"{prefix}/episodes"] = episode_count.item()
+        result[f"{prefix}/episodes"] = episode_count
         for metric, value in metrics:
-          result[f"{prefix}/{metric}"] = ((value[selected] * mask).sum() / count).item()
+          result[f"{prefix}/{metric}"] = (value[selected] * mask).sum() / count
+    values = torch.stack(tuple(result.values())).cpu().tolist()
+    result = {name: int(value) if name.endswith("/episodes") else value
+      for name, value in zip(result, values, strict=True)}
     result.update(super().reset(env_ids))
     self.standing_time[selected] = 0.
     self.hold_started_at[selected] = -1.

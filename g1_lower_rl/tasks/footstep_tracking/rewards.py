@@ -177,6 +177,15 @@ def standing_body_tilt_angle_l2(
   return body_tilt_angle_l2(env, asset_cfg) * (frequency == 0)
 
 
+def standing_body_tilt_angle_l1(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg,
+  command_name: str = "footsteps",
+) -> torch.Tensor:
+  frequency = env.command_manager.get_term(command_name).reward_state.frequency
+  return body_tilt_angle_l2(env, asset_cfg).sqrt() * (frequency == 0)
+
+
 def _head_height_above_ground(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg, command_name: str) -> torch.Tensor:
   state = env.command_manager.get_term(command_name).reward_state
   data = env.scene[asset_cfg.name].data

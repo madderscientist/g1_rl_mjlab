@@ -8,6 +8,26 @@ import numpy as np
 import torch
 
 
+def _invalid_state(
+  qpos: torch.Tensor, qvel: torch.Tensor, qacc: torch.Tensor, qacc_warmstart: torch.Tensor,
+  sensordata: torch.Tensor, nefc: torch.Tensor, joint_speed_limit: float,
+  root_speed_limit: float, root_angular_limit: float, njmax: int,
+) -> torch.Tensor:
+  invalid = ~torch.isfinite(qpos).all(-1) | ~torch.isfinite(qvel).all(-1)
+  invalid |= qvel[:, 6:].abs().amax(-1) > joint_speed_limit
+  invalid |= qvel[:, :3].norm(dim=-1) > root_speed_limit
+  invalid |= qvel[:, 3:6].norm(dim=-1) > root_angular_limit
+  quaternion_norm = qpos[:, 3:7].norm(dim=-1)
+  invalid |= (quaternion_norm < .5) | (quaternion_norm > 1.5)
+  for value in (qacc, qacc_warmstart, sensordata):
+    invalid |= ~torch.isfinite(value).flatten(1).all(-1)
+  invalid |= nefc > njmax
+  return invalid
+
+
+_compiled_invalid_state = torch.compile(_invalid_state, fullgraph=True)
+
+
 class NumericalSafety:
   def __init__(self, cfg, env):
     self.env = env
@@ -22,6 +42,7 @@ class NumericalSafety:
     self.safe_qvel = self.sim.data.qvel.clone()
     self.incidents = 0
     self.substeps = 0
+    self._check_state = _compiled_invalid_state if self.safe_qpos.is_cuda else _invalid_state
     self._step = self.sim.step
     self.sim.step = self.step
 
@@ -33,17 +54,9 @@ class NumericalSafety:
 
   def invalid_state(self):
     data = self.sim.data
-    invalid = ~torch.isfinite(data.qpos).all(-1) | ~torch.isfinite(data.qvel).all(-1)
-    invalid |= data.qvel[:, 6:].abs().amax(-1) > self.limits["joint_speed_limit"]
-    invalid |= data.qvel[:, :3].norm(dim=-1) > self.limits["root_speed_limit"]
-    invalid |= data.qvel[:, 3:6].norm(dim=-1) > self.limits["root_angular_limit"]
-    quaternion_norm = data.qpos[:, 3:7].norm(dim=-1)
-    invalid |= (quaternion_norm < .5) | (quaternion_norm > 1.5)
-    for name in ("qacc", "qacc_warmstart", "sensordata"):
-      value = getattr(data, name)
-      invalid |= ~torch.isfinite(value).flatten(1).all(-1)
-    invalid |= data.nefc > self.sim.wp_data.njmax
-    return invalid
+    return self._check_state(data.qpos, data.qvel, data.qacc, data.qacc_warmstart, data.sensordata, data.nefc,
+      self.limits["joint_speed_limit"], self.limits["root_speed_limit"],
+      self.limits["root_angular_limit"], self.sim.wp_data.njmax)
 
   def dump(self, env_ids, phase):
     self.incidents += 1

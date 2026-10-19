@@ -133,6 +133,8 @@ OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python scripts/train_footst
 
 首次迁移设定新增第0轮；续训保留课程原点和进度。第四阶段仅由 `infos.theta_stage` 显式启用，默认任务不含theta。
 
+可在阶段元数据中显式加入 `standing_torso_upright: {"weight": -1.0}`，为连续走与单步任务同时增加静止torso线性倾角惩罚。设世界竖直倾角为 `alpha`（rad），新增奖励率为 `-alpha * (execution_frequency == 0)`；保留全时段原有 `-2 * alpha^2`，按控制步长积分。不增加角度死区、接触门控或完成条件，省略该字段时保持原行为。
+
 ## 续训与运行管理
 
 ### 恢复已有训练
@@ -210,6 +212,11 @@ Actor使用GRU(64)和MLP(256,256,128)，输出15轴位置增量；critic使用ML
 - 支撑脚偏离目标超过1m、规划器故障或接触确认超时，立即终止；回合到期截断。
 - 骨盆倾角超过70°或离最低足底低于0.35m，每拍以0.005概率终止。
 - 关节速度超过120rad/s、根线速度超过20m/s、根角速度超过80rad/s或状态非有限，触发子步保护并记录、隔离、reset。
+
+CUDA 上用 `torch.compile(fullgraph=True)` 融合数值保护的状态掩码计算，CPU 保持 eager。
+每个物理子步前后的检查、非有限控制输入报错、异常状态记录与隔离时序不变；不将检查延后到控制拍末。
+单步任务 reset 时将20个日志指标批量回传，保留原指标值与计数的整数类型。
+这些优化不等同于把8个物理子步合为一个 CUDA Graph。
 
 仿真测试与无噪声回放不能代替实机安全验证。
 

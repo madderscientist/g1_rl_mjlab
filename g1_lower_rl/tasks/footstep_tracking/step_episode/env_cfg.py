@@ -11,7 +11,21 @@ from g1_lower_rl.assets import LOWER_BODY_JOINTS
 from g1_lower_rl.tasks.footstep_tracking.walking.precision import precision_env_cfg
 
 from .commands import StepEpisodeCommandCfg, step_episode_complete
-from .rewards import StepLandingBonus, standing_action_change_cost, standing_joint_velocity_cost, step_failure_cost
+from .rewards import ExtraContactCost, StepLandingBonus, standing_action_change_cost, standing_joint_velocity_cost, step_failure_cost
+
+
+def configure_extra_contacts(cfg, weight=-10., minimum_lift=.008,
+                             minimum_air_time_s=.04, minimum_contact_time_s=.04):
+  if not math.isfinite(weight) or weight >= 0:
+    raise ValueError("Extra contact weight must be finite and negative")
+  thresholds = (minimum_lift, minimum_air_time_s, minimum_contact_time_s)
+  if any(not math.isfinite(value) or value <= 0 for value in thresholds):
+    raise ValueError("Extra contact thresholds must be finite and positive")
+  cfg.rewards["step_extra_contact"] = RewardTermCfg(func=ExtraContactCost, weight=weight, params={
+    "asset_cfg": SceneEntityCfg("robot", site_names=("left_foot", "right_foot"), preserve_order=True),
+    "minimum_lift": minimum_lift, "minimum_air_time_s": minimum_air_time_s,
+    "minimum_contact_time_s": minimum_contact_time_s,
+  })
 
 
 def step_episode_env_cfg(play=False):

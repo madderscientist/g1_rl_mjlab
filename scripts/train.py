@@ -22,6 +22,7 @@ from mjlab.utils.os import dump_yaml, get_checkpoint_path
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
 
+from g1_lower_rl.scene_graph import enable_scene_cuda_graphs
 from g1_lower_rl.tasks import FOOTSTEP_TASK, STEP_EPISODE_TASK
 from g1_lower_rl.tasks.lower_body.cfg.constants import MIRROR_STAGES
 
@@ -35,6 +36,7 @@ class TrainConfig:
   video_length: int = 200
   video_interval: int = 2000
   enable_nan_guard: bool = False
+  scene_cuda_graphs: bool = True
   log_root: str = "logs/rsl_rl"
   torchrunx_log_dir: str | None = None
   gpu_ids: list[int] | Literal["all"] | None = field(default_factory=lambda: [0])
@@ -98,6 +100,8 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
   env = ManagerBasedRlEnv(
     cfg=cfg.env, device=device, render_mode="rgb_array" if cfg.video else None
   )
+  if cfg.scene_cuda_graphs:
+    enable_scene_cuda_graphs(env)
 
   resume_path: Path | None = None
   if cfg.agent.resume:
