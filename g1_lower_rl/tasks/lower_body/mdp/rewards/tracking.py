@@ -8,6 +8,7 @@ import torch
 from mjlab.entity import Entity
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
+from g1_lower_rl.tasks.lower_body.mdp.commands import ScenarioVelocityCommand
 from g1_lower_rl.tasks.lower_body.mdp.observations import height_above_feet
 from g1_lower_rl.tasks.lower_body.mdp.rewards._common import (
   ROBOT,
@@ -307,7 +308,7 @@ class stationary_drift:
   ) -> torch.Tensor:
     asset: Entity = env.scene[asset_cfg.name]
     term = env.command_manager.get_term(command_name)
-    assert term is not None
+    assert isinstance(term, ScenarioVelocityCommand)
     xy = asset.data.root_link_pos_w[:, :2]
 
     fresh, self._prev_left = command_restarted(env, term, self._prev_left)

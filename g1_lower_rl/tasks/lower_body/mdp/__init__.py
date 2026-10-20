@@ -5,7 +5,7 @@
 在 mjlab 1.5.x 里语义变了或被删了，本包保留了原语义。
 """
 
-from mjlab.envs.mdp import *  # noqa: F403
+from mjlab.envs.mdp import *  # noqa: F403  # pyright: ignore[reportWildcardImportFromLibrary]
 from mjlab.tasks.velocity.mdp import commands_vel as commands_vel
 
 from g1_lower_rl.tasks.lower_body.mdp.commands import (
@@ -69,6 +69,7 @@ from g1_lower_rl.tasks.lower_body.mdp.observations import (
   height_above_feet as height_above_feet,
 )
 from g1_lower_rl.tasks.lower_body.mdp.observations import shifted_phase as shifted_phase
+from g1_lower_rl.tasks.lower_body.mdp import events as events
 from g1_lower_rl.tasks.lower_body.mdp.rewards import *  # noqa: F403
 from g1_lower_rl.tasks.lower_body.mdp.terminations import (
   base_height_below_minimum as base_height_below_minimum,

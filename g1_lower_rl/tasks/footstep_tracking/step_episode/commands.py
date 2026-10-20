@@ -15,7 +15,7 @@ def update_standing_time(previous, stable, dt):
 
 
 class StepEpisodeCommand(FootstepCommand):
-  cfg: "StepEpisodeCommandCfg"
+  cfg: "StepEpisodeCommandCfg"  # type: ignore[assignment]
   manager_type = StepEpisodeManager
 
   def __init__(self, cfg, env):

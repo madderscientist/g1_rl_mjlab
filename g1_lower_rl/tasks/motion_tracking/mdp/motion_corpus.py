@@ -28,7 +28,7 @@ class MotionBins(NamedTuple):
   """(num_bins,) 每个 bin 在所属动作内的起始相位。"""
   offset: torch.Tensor
   """(num_motions,) 每条动作的首个 bin 下标。"""
-  count: torch.Tensor
+  count: torch.Tensor  # type: ignore[assignment]
   """(num_motions,) 每条动作切出的 bin 数。"""
   frames: int
   """一个 bin 的帧数。"""

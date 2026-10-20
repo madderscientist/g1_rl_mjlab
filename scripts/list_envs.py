@@ -9,6 +9,7 @@ from prettytable import PrettyTable
 def main() -> None:
   import g1_lower_rl.tasks  # noqa: F401  注册任务
 
+  _ = g1_lower_rl.tasks
   table = PrettyTable(["#", "Task ID", "Entities", "Envs"])
   table.align["Task ID"] = "l"
   for index, task_id in enumerate(sorted(list_tasks())):

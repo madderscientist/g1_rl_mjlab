@@ -3,7 +3,7 @@
 from dataclasses import dataclass, fields, replace
 import math
 
-import mujoco
+from mujoco._enums import mjtEq, mjtObj
 import torch
 import viser
 from mjlab.viewer import ViserPlayViewer
@@ -15,9 +15,12 @@ from g1_lower_rl.tasks.footstep_tracking.commands import FootstepCommand, Footst
 
 
 class ManualFootstepCommand(FootstepCommand):
+  cfg: "ManualFootstepCommandCfg"  # type: ignore[assignment]
+  batch: OneShotFootstepManager
   manager_type = OneShotFootstepManager
 
   def create_gui(self, name, server, get_env_idx, on_change=None, request_action=None):
+    del name, get_env_idx, on_change
     self.notice = "等待站稳"
     self.first_foot = server.gui.add_dropdown("首脚", options=("左脚", "右脚"), initial_value="左脚")
     self.distance_input = server.gui.add_number("前移 x (m)", initial_value=.10, min=0., max=.35, step=.01)
@@ -28,13 +31,15 @@ class ManualFootstepCommand(FootstepCommand):
     self.status_display = server.gui.add_html("")
 
     @self.execute_button.on_click
-    def execute(event):
-      request_action("CUSTOM", {"type": "one_shot_forward", "distance": self.distance_input.value,
-        "frequency": self.frequency_input.value, "first_side": 0 if self.first_foot.value == "左脚" else 1})
+    def execute(_event):
+      if request_action is not None:
+        request_action("CUSTOM", {"type": "one_shot_forward", "distance": self.distance_input.value,
+          "frequency": self.frequency_input.value, "first_side": 0 if self.first_foot.value == "左脚" else 1})
 
     @self.reset_button.on_click
-    def reset(event):
-      request_action("RESET")
+    def reset(_event):
+      if request_action is not None:
+        request_action("RESET", None)
 
   def start_forward(self, distance, frequency, first_side):
     env = self._env
@@ -106,8 +111,8 @@ def configure_manual_preview(cfg, *, single_foot=False):
   def zero_arm_spec():
     spec = original_spec()
     for name in ARM_JOINTS:
-      constraint = spec.add_equality(name=f"preview_hold_{name}", type=mujoco.mjtEq.mjEQ_JOINT,
-        objtype=mujoco.mjtObj.mjOBJ_JOINT, name1=name, solref=[.005, 1.], solimp=[.99, .999, .001, .5, 2.])
+      constraint = spec.add_equality(name=f"preview_hold_{name}", type=mjtEq.mjEQ_JOINT,
+        objtype=mjtObj.mjOBJ_JOINT, name1=name, solref=[.005, 1.], solimp=[.99, .999, .001, .5, 2.])
       constraint.data[:] = 0.
     return spec
 
@@ -124,6 +129,7 @@ class ManualStepViewer(ViserPlayViewer):
   def _handle_custom_action(self, action, payload):
     if isinstance(payload, dict) and payload.get("type") == "one_shot_forward":
       command = self.env.unwrapped.command_manager.get_term("footsteps")
+      assert isinstance(command, ManualFootstepCommand)
       with torch.no_grad(), self._sim_lock:
         try:
           command.start_forward(payload["distance"], payload["frequency"], payload["first_side"])
@@ -137,6 +143,7 @@ class ManualStepViewer(ViserPlayViewer):
   def _execute_step(self):
     succeeded = super()._execute_step()
     command = self.env.unwrapped.command_manager.get_term("footsteps")
+    assert isinstance(command, ManualFootstepCommand)
     ended = bool(self.env.unwrapped.reset_buf.any())
     if ended:
       self.pause()
@@ -148,6 +155,7 @@ class ManualStepViewer(ViserPlayViewer):
   def reset_environment(self):
     super().reset_environment()
     command = self.env.unwrapped.command_manager.get_term("footsteps")
+    assert isinstance(command, ManualFootstepCommand)
     command.batch.executions = 0
     command.notice = "等待站稳"
     command.update_gui()

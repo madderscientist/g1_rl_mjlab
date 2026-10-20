@@ -79,6 +79,7 @@ def main():
     from mjlab.envs import ManagerBasedRlEnv
     from mjlab.rl import RslRlVecEnvWrapper
     from mjlab.utils.torch import configure_torch_backends
+    from g1_lower_rl.tasks.footstep_tracking.commands import FootstepCommandCfg
     from g1_lower_rl.tasks.footstep_tracking.theta_stage import make_theta_stage_env_cfg
 
     configure_torch_backends()
@@ -87,7 +88,9 @@ def main():
         precision_stage=saved["infos"].get("precision_stage") if rank == 0 else None)
       cfg.scene.num_envs = 1
       cfg.seed = 42
-      cfg.commands["footsteps"].compile_backend = False
+      footsteps = cfg.commands["footsteps"]
+      assert isinstance(footsteps, FootstepCommandCfg)
+      footsteps.compile_backend = False
       env = RslRlVecEnvWrapper(ManagerBasedRlEnv(cfg, device="cuda:0"), clip_actions=None)
       try:
         env.unwrapped.common_step_counter = saved["infos"]["task_environment_counters"][rank]

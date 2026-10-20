@@ -59,11 +59,12 @@ def footstep_env_cfg(play: bool = False):
   cfg.decimation = 8
   cfg.sim.njmax = 1024
   cfg.scene.num_envs = 1 if play else 64
-  cfg.commands = {"footsteps": FootstepCommandCfg(debug_vis=play, source=RandomCommandCfg(
+  footstep_command = FootstepCommandCfg(debug_vis=play, source=RandomCommandCfg(
     initial_frequency=None, initial_standing_probability=0.5,
     direction_change_range=DIRECTION_CHANGE_STAGES[0][1],
     frequency_rate_range=FREQUENCY_RATE_STAGES[0][1],
-  ))}
+  ))
+  cfg.commands = {"footsteps": footstep_command}
   joints = SceneEntityCfg("robot", joint_names=WHOLE_BODY_JOINTS, preserve_order=True)
   reference = lower_body_observations()["actor"].terms
   terms = {
@@ -79,7 +80,7 @@ def footstep_env_cfg(play: bool = False):
   for prefix, body in (("pelvis", "pelvis"), ("torso", "torso_link")):
     for component, baseline in (("angular", "base_ang_vel"), ("gravity", "projected_gravity")):
       noise = copy.deepcopy(reference[baseline].noise)
-      assert isinstance(noise, NoiseModelWithAdditiveBiasCfg)
+      assert isinstance(noise, NoiseModelWithAdditiveBiasCfg) and noise.bias_noise_cfg is not None
       noise.bias_noise_cfg.operation = "abs"
       terms[f"{prefix}_{component}"] = ObservationTermCfg(
         func=body_imu,
@@ -100,7 +101,7 @@ def footstep_env_cfg(play: bool = False):
     "actor": ObservationGroupCfg(terms=terms, concatenate_terms=True, enable_corruption=not play),
     "critic": ObservationGroupCfg(terms=critic, concatenate_terms=True, enable_corruption=False),
   }
-  cfg.rewards = make_rewards(phase_cfg=cfg.commands["footsteps"].manager.phase)
+  cfg.rewards = make_rewards(phase_cfg=footstep_command.manager.phase)
   # mjlab 默认在奖励之后更新 command，首个终止项负责提前推进并冻结本拍奖励快照
   cfg.terminations = {
     "footstep_fault": TerminationTermCfg(func=footstep_execution_failed),

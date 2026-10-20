@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
@@ -23,6 +24,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 import g1_lower_rl.tasks  # noqa: F401  注册任务
 
+_ = g1_lower_rl.tasks
 TASK = "G1-Gloria-MotionTracking"
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 
@@ -68,7 +70,7 @@ def main(
   runner = load_trained_runner(TASK, wrapped, agent_cfg, Path(checkpoint), device)
   policy = runner.get_inference_policy(device=device)
 
-  cmd = env.command_manager.get_term("motion")
+  cmd: Any = env.command_manager.get_term("motion")
   names = list(cmd.motion.names)
   wanted = [m.strip() for m in motions.split(",") if m.strip()] or names[:6]
   missing = [m for m in wanted if m not in names]

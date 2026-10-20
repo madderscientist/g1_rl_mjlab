@@ -19,6 +19,8 @@ import tyro
 import g1_lower_rl.tasks  # noqa: F401  注册任务
 from g1_lower_rl.rl import deployment_metadata, load_trained_runner
 
+_ = g1_lower_rl.tasks
+
 
 def _resolve_task_id(checkpoint: Path, task_id: str | None) -> str:
   """按日志目录中的 experiment_name 推断任务，必要时允许显式指定。"""

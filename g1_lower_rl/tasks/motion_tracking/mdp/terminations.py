@@ -23,7 +23,7 @@ def _shared_termination_coin(env: "ManagerBasedRlEnv", p_term: float) -> torch.T
   if cache is not None and cache[0] == step and cache[1].shape[0] == env.num_envs:
     return cache[1]
   coin = torch.rand(env.num_envs, device=env.device) < p_term
-  env._pt_coin_cache = (step, coin)
+  setattr(env, "_pt_coin_cache", (step, coin))
   return coin
 
 

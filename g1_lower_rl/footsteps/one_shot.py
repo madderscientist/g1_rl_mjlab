@@ -10,6 +10,7 @@ from g1_lower_rl.footsteps.tensor_manager import TensorFootstepManager, STARTING
 
 class OneShotFootstepManager(TensorFootstepManager):
   def __init__(self, cfg, source, num_envs, device, seed=0, *, compiled=False):
+    del compiled
     if num_envs != 1:
       raise ValueError("Manual preview requires one environment")
     if source.automatic_commands or source.automatic_restart or source.initial_standing_probability != 1.:
@@ -22,13 +23,14 @@ class OneShotFootstepManager(TensorFootstepManager):
     super().__init__(cfg, source, num_envs, device, seed, compiled=False)
 
   def _sample(self, previous, side, uniform):
+    del previous, uniform
     return self._choose(self.state["terminal_feet"], side)
 
   def _source_advance(self, uniform):
-    pass
+    del uniform
 
   def _apply_request(self, uniform):
-    pass
+    del uniform
 
   def start_forward(self, distance, frequency, first_side, *, close_stance=True):
     """从冻结的并列双脚目标前移，行走过程中不修改实际机器人状态"""

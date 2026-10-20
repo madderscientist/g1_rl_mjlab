@@ -31,7 +31,8 @@ def command_restarted(
   靠重采划窗口的累计类奖励都要用它归零。
   """
   left = term.time_left
-  if prev_left is None:
-    prev_left = left
-  fresh = (left > prev_left + 1e-6) | (env.episode_length_buf <= 1)
+  assert left is not None
+  prev = left if prev_left is None else prev_left
+  assert env.episode_length_buf is not None
+  fresh = (left > prev + 1e-6) | (env.episode_length_buf <= 1)
   return fresh, left.clone()

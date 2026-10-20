@@ -37,5 +37,6 @@ def step_episode_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
   """一步精度任务固定小幅探索，不影响通用脚步策略的PPO配置"""
   cfg = footstep_ppo_runner_cfg()
   cfg.algorithm.entropy_coef = 0.
+  assert cfg.actor.distribution_cfg is not None
   cfg.actor.distribution_cfg.update(init_std=.25, learn_std=False, std_range=(.25, .25))
   return cfg

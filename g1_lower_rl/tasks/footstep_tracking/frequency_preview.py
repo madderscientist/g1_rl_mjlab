@@ -37,6 +37,7 @@ class PreviewTorsoHeadingCommand(TorsoHeadingCommand):
       self.speed[env_ids] = self.cfg.speed_range[1]
 
   def create_gui(self, name, server, get_env_idx, on_change=None, request_action=None):
+    del name, on_change
     self.get_env_idx = get_env_idx
     limit_deg = round(math.degrees(self.angle_limit), 10)
     self.automatic_input = server.gui.add_checkbox("自动 theta", initial_value=self.automatic)
@@ -45,15 +46,16 @@ class PreviewTorsoHeadingCommand(TorsoHeadingCommand):
     self.theta_display = server.gui.add_html("")
 
     def request_theta():
-      request_action("CUSTOM", {"type": "torso_heading", "automatic": self.automatic_input.value,
-        "theta_deg": self.theta_input.value})
+      if request_action is not None:
+        request_action("CUSTOM", {"type": "torso_heading", "automatic": self.automatic_input.value,
+          "theta_deg": self.theta_input.value})
 
     @self.automatic_input.on_update
-    def change_mode(event):
+    def change_mode(_event):
       request_theta()
 
     @self.theta_input.on_update
-    def change_theta(event):
+    def change_theta(_event):
       self.automatic_input.value = False
       request_theta()
 
@@ -87,6 +89,7 @@ class ThetaPlayViewer(ViserPlayViewer):
   def _handle_custom_action(self, action, payload):
     if isinstance(payload, dict) and payload.get("type") == "torso_heading":
       command = self.env.unwrapped.command_manager.get_term("torso_heading")
+      assert isinstance(command, PreviewTorsoHeadingCommand)
       with torch.no_grad(), self._sim_lock:
         command.set_theta(payload["automatic"], payload["theta_deg"])
         command.update_gui()
@@ -96,7 +99,9 @@ class ThetaPlayViewer(ViserPlayViewer):
 
   def _update_theta_gui(self):
     if "torso_heading" in self.env.unwrapped.cfg.commands:
-      self.env.unwrapped.command_manager.get_term("torso_heading").update_gui()
+      command = self.env.unwrapped.command_manager.get_term("torso_heading")
+      assert isinstance(command, PreviewTorsoHeadingCommand)
+      command.update_gui()
 
   def _execute_step(self):
     succeeded = super()._execute_step()
@@ -125,6 +130,7 @@ class FrequencyFootstepCommand(FootstepCommand):
       self.batch.state["request_frequency"].fill_(frequency)
 
   def create_gui(self, name, server, get_env_idx, on_change=None, request_action=None):
+    del name, on_change
     self.get_env_idx = get_env_idx
     lower, upper = self.automatic_source.frequency_range
     initial = self.automatic_source.initial_frequency
@@ -134,15 +140,16 @@ class FrequencyFootstepCommand(FootstepCommand):
     self.frequency_display = server.gui.add_html("")
 
     def request_frequency():
-      request_action("CUSTOM", {"type": "footstep_frequency", "automatic": self.automatic_input.value,
-        "frequency": self.frequency_input.value})
+      if request_action is not None:
+        request_action("CUSTOM", {"type": "footstep_frequency", "automatic": self.automatic_input.value,
+          "frequency": self.frequency_input.value})
 
     @self.automatic_input.on_update
-    def change_mode(event):
+    def change_mode(_event):
       request_frequency()
 
     @self.frequency_input.on_update
-    def change_frequency(event):
+    def change_frequency(_event):
       self.automatic_input.value = False
       request_frequency()
 
@@ -174,6 +181,7 @@ class FrequencyPlayViewer(ThetaPlayViewer):
   def _handle_custom_action(self, action, payload):
     if isinstance(payload, dict) and payload.get("type") == "footstep_frequency":
       command = self.env.unwrapped.command_manager.get_term("footsteps")
+      assert isinstance(command, FrequencyFootstepCommand)
       with torch.no_grad(), self._sim_lock:
         command.set_frequency(payload["automatic"], payload["frequency"])
         command.update_gui()
@@ -184,9 +192,13 @@ class FrequencyPlayViewer(ThetaPlayViewer):
   def _execute_step(self):
     succeeded = super()._execute_step()
     if self._step_count % 10 == 0:
-      self.env.unwrapped.command_manager.get_term("footsteps").update_gui()
+      command = self.env.unwrapped.command_manager.get_term("footsteps")
+      assert isinstance(command, FrequencyFootstepCommand)
+      command.update_gui()
     return succeeded
 
   def reset_environment(self):
     super().reset_environment()
-    self.env.unwrapped.command_manager.get_term("footsteps").update_gui()
+    command = self.env.unwrapped.command_manager.get_term("footsteps")
+    assert isinstance(command, FrequencyFootstepCommand)
+    command.update_gui()

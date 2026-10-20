@@ -6,7 +6,8 @@ import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-import mujoco
+from mujoco._functions import mj_kinematics
+from mujoco._structs import MjData, MjModel
 import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
@@ -14,19 +15,19 @@ from scipy.spatial.transform import Rotation
 from g1_lower_rl import PKG_PATH
 
 
-def load_kinematic_model(path: Path) -> mujoco.MjModel:
+def load_kinematic_model(path: Path) -> MjModel:
   """去掉可视网格依赖后加载模型，保留运动学、惯量和碰撞定义"""
   root = ET.parse(path).getroot()
   for parent in root.iter():
     for child in list(parent):
       if child.tag == "mesh" or (child.tag == "geom" and "mesh" in child.attrib):
         parent.remove(child)
-  return mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
+  return MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
 
 
-def scan(model: mujoco.MjModel, height: float, width: float, increment: float, margin: float) -> dict:
+def scan(model: MjModel, height: float, width: float, increment: float, margin: float) -> dict:
   """在指定骨盆高度和站距下递增前后间距，用有界逆运动学搜索可达候选"""
-  data = mujoco.MjData(model)
+  data = MjData(model)
   names = [
     f"{side}_{joint}_joint"
     for side in ("left", "right")
@@ -45,7 +46,7 @@ def scan(model: mujoco.MjModel, height: float, width: float, increment: float, m
     """根据骨盆横移和双腿关节值，计算足端位置及平足朝向的加权残差"""
     data.qpos[0] = values[0]
     data.qpos[addresses] = values[1:]
-    mujoco.mj_kinematics(model, data)
+    mj_kinematics(model, data)
     orientation = Rotation.from_matrix(data.site_xmat[site_ids].reshape(2, 3, 3)).as_rotvec()
     return np.r_[(data.site_xpos[site_ids] - targets).ravel(), (0.2 * orientation).ravel()]
 
@@ -94,8 +95,8 @@ def main() -> None:
   if not all(0.4 <= height <= 0.85 for height in args.heights):
     parser.error("Heights must be between 0.4 and 0.85 m")
   model = load_kinematic_model(args.model)
-  data = mujoco.MjData(model)
-  mujoco.mj_kinematics(model, data)
+  data = MjData(model)
+  mj_kinematics(model, data)
   roll = model.body("left_hip_roll_link").id
   knee = model.body("left_knee_link").id
   ankle = model.body("left_ankle_pitch_link").id

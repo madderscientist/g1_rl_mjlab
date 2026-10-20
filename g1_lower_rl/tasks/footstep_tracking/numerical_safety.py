@@ -116,4 +116,5 @@ class NumericalSafety:
       self.quarantine(self.failed)
 
   def __call__(self, env, joint_speed_limit=120., root_speed_limit=20., root_angular_limit=80.):
+    del env, joint_speed_limit, root_speed_limit, root_angular_limit
     return self.failed

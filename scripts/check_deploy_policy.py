@@ -12,6 +12,9 @@ from __future__ import annotations
 import argparse
 
 import mujoco
+from mujoco._enums import mjtCamera, mjtObj
+from mujoco._functions import mj_name2id
+from mujoco._structs import MjData, MjvCamera
 import numpy as np
 
 from g1_lower_rl.deploy import (
@@ -40,9 +43,9 @@ SCENARIOS = (
 def open_video(model, path):
   if not path:
     return None
-  camera = mujoco.MjvCamera()
-  camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-  camera.trackbodyid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
+  camera = MjvCamera()
+  camera.type = mjtCamera.mjCAMERA_TRACKING
+  camera.trackbodyid = mj_name2id(model, mjtObj.mjOBJ_BODY, "torso_link")
   camera.distance, camera.azimuth, camera.elevation = 3.2, 135.0, -12.0
   return {
     "camera": camera,
@@ -64,7 +67,7 @@ def main() -> int:
   args = parser.parse_args()
 
   model = build_model()
-  data = mujoco.MjData(model)
+  data = MjData(model)
   policy = load_policy(args.policy)
   index = Index(model, policy)
   set_arm_mode(model, args.arms)

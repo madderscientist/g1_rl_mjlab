@@ -7,7 +7,7 @@ from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 
 from . import make_footstep_env_cfg
-from .commands import TorsoHeadingCommandCfg
+from .commands import FootstepCommandCfg, TorsoHeadingCommandCfg
 from .curriculum import FREQUENCY_RATE_STAGES, NUM_STEPS_PER_ENV, _select_stage, arm_target_scale, torso_heading_range
 from .rewards_cfg import (
   make_standing_pelvis_heading_reward,
@@ -64,6 +64,7 @@ def make_theta_stage_env_cfg(profile, theta_stage, rank, play=False, *, precisio
     _, yaw = _select_stage(WALK_FIRST_YAW_STAGES, iteration)
     _, frequency_rate = _select_stage(FREQUENCY_RATE_STAGES, iteration)
     command = cfg.commands["footsteps"]
+    assert isinstance(command, FootstepCommandCfg)
     command.manager = replace(command.manager, sampler=replace(command.manager.sampler,
       distance_range=distance, min_width=width[0], max_width=width[1], yaw_noise=(-yaw, yaw)))
     command.source = replace(command.source, direction_range=(-angle, angle),

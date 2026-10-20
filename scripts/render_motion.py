@@ -15,6 +15,8 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 
 import imageio.v2 as imageio
 import mujoco
+from mujoco._functions import mj_forward
+from mujoco._structs import MjData, MjvCamera
 import numpy as np
 import tyro
 
@@ -46,12 +48,12 @@ def main(
   spec.visual.global_.offwidth = width
   spec.visual.global_.offheight = height
   model = spec.compile()
-  data = mujoco.MjData(model)
+  data = MjData(model)
   if model.nq != 7 + n_joints:
     raise ValueError(f"模型 nq={model.nq} 与动作的 7+{n_joints} 对不上")
 
   renderer = mujoco.Renderer(model, height=height, width=width)
-  camera = mujoco.MjvCamera()
+  camera = MjvCamera()
   camera.distance = camera_distance
   camera.elevation = elevation
   camera.azimuth = azimuth
@@ -63,7 +65,7 @@ def main(
     data.qpos[0:3] = root_pos[i]
     data.qpos[3:7] = root_quat[i]
     data.qpos[7:] = joint_pos[i]
-    mujoco.mj_forward(model, data)
+    mj_forward(model, data)
     camera.lookat[:] = root_pos[i]  # 跟拍根节点，否则走动的动作会出画
     renderer.update_scene(data, camera)
     writer.append_data(renderer.render())

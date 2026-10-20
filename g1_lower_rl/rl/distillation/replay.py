@@ -14,11 +14,12 @@ class DaggerBuffer:
     self.capacity = capacity
     self.position = 0
     self.size = 0
-    self.observations = TensorDict(
-      {name: value.new_empty((capacity, value.shape[-1])) for name, value in observations.items()},
-      batch_size=[capacity],
-    )
-    self.labels = next(iter(observations.values())).new_empty((capacity, action_dim))
+    tensors: dict[str, torch.Tensor] = {}
+    for name, value in observations.items():
+      assert isinstance(value, torch.Tensor)
+      tensors[name] = value.new_empty((capacity, value.shape[-1]))
+    self.observations = TensorDict(tensors, batch_size=[capacity])
+    self.labels = next(iter(tensors.values())).new_empty((capacity, action_dim))
 
   @torch.no_grad()
   def add(self, observations: TensorDict, labels: torch.Tensor) -> None:

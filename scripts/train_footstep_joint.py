@@ -166,7 +166,7 @@ class SharedActorPPO(PPO):
 
 
 class JointRunner(FootstepResumeRunner):
-  alg: SharedActorPPO
+  alg: SharedActorPPO  # type: ignore[assignment]
 
   @property
   def task_log_dir(self) -> Path:
@@ -195,6 +195,7 @@ class JointRunner(FootstepResumeRunner):
     distributed.init_process_group(backend="gloo", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
 
   def load(self, path, load_cfg=None, strict=True, map_location=None):
+    del load_cfg, strict, map_location
     walking = torch.load(path, map_location="cpu", weights_only=False)
     joint_resume = os.environ.get("JOINT_RESUME") == "1"
     step_path = str(path) if joint_resume else os.environ["JOINT_STEP_CHECKPOINT"]
@@ -212,7 +213,7 @@ class JointRunner(FootstepResumeRunner):
     restore_fixed_exploration(actor, self.cfg["actor"])
     if joint_resume:
       assert_same_state(actor.state_dict(), walking["actor_state_dict"])
-    actor.update_normalization = lambda obs: None
+    setattr(actor, "update_normalization", lambda _obs: None)
     self.current_learning_iteration = int(walking["iter"]) + 1
     self.env.unwrapped.common_step_counter = counter
     with torch.inference_mode():
@@ -242,9 +243,11 @@ class JointRunner(FootstepResumeRunner):
     return local.get("infos")
 
   def save(self, path, infos=None):
+    del path, infos
     return None
 
   def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+    del init_at_random_ep_len
     super().learn(num_learning_iterations, init_at_random_ep_len=False)
     self.alg.save_joint()
     final = self.alg.joint_log_dir / f"model_{self.current_learning_iteration}.pt"
@@ -283,7 +286,7 @@ def worker(args, run_dir):
   else:
     env_cfg = make_footstep_env_cfg(profile, precision_stage=stage_config)
   cfg = replace(cfg, env=env_cfg, resume_checkpoint=args.walking_checkpoint, enable_nan_guard=True,
-    scene_cuda_graphs=not args.no_scene_cuda_graphs)
+    scene_cuda_graphs=not getattr(args, "no_scene_cuda_graphs", False))
   cfg.env.scene.num_envs = args.envs_per_rank
   agent.resume = True
   agent.max_iterations = args.max_updates

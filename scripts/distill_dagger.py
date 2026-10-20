@@ -12,6 +12,7 @@ import os
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import torch
 import tyro
@@ -105,9 +106,11 @@ def main(
   student_cfg = model_config(saved_student, student_model_config, asdict(student_default.actor))
   del saved_teacher, saved_student
   cfg = motion_tracking_env_cfg(motion_dir=motion_dir)
-  action_dim = len(cfg.commands["motion"].policy_joint_names)
+  motion_cfg: Any = cfg.commands["motion"]
+  action_dim = len(motion_cfg.policy_joint_names)
+  expected_ref_dim = getattr(student_default.actor, "reference_dim")
   for role, actor_cfg in (("teacher", teacher_cfg), ("student", student_cfg)):
-    if actor_cfg.get("reference_dim") != student_default.actor.reference_dim:
+    if actor_cfg.get("reference_dim") != expected_ref_dim:
       raise ValueError(f"{role} reference dimension does not match configured environment")
 
   def factory(observations, actor_cfg):

@@ -15,9 +15,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-import mujoco
+from mujoco._enums import mjtJoint
 import torch
 from mjlab.envs.mdp.actions.actions import JointPositionAction, JointPositionActionCfg
 from mjlab.utils.lab_api.math import quat_apply, sample_uniform
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 class GravityCompensatedJointPositionAction(JointPositionAction):
   """在指定关节上叠加 ``tau_g / kp`` 的位置偏移。"""
 
-  cfg: "GravityCompensatedJointPositionActionCfg"
+  cfg: "GravityCompensatedJointPositionActionCfg"  # type: ignore[assignment]
 
   def __init__(
     self, cfg: "GravityCompensatedJointPositionActionCfg", env: "ManagerBasedRlEnv"
@@ -52,7 +52,7 @@ class GravityCompensatedJointPositionAction(JointPositionAction):
     for name in names:
       # sim.mj_model 里的名字带实体前缀，走 indexing 拿全局下标更稳妥。
       jid = int(entity.indexing.joint_ids[entity.joint_names.index(name)])
-      if model.jnt_type[jid] != mujoco.mjtJoint.mjJNT_HINGE:
+      if model.jnt_type[jid] != mjtJoint.mjJNT_HINGE:
         raise ValueError(f"{name} 不是转动关节，重力补偿只支持 hinge")
       act = [i for i in range(model.nu) if model.actuator_trnid[i, 0] == jid]
       if not act:
@@ -105,12 +105,14 @@ class GravityCompensatedJointPositionAction(JointPositionAction):
 
     # 命令项在动作项之后构造，这里只记名字，首次用到时再解析。
     self._reference_name = cfg.reference_command_name
-    self._reference_term = None
+    self._reference_term: Any = None
 
   def _reference_pose(self) -> torch.Tensor:
     """当前控制步的参考关节角，按动作向量的关节顺序排。"""
     if self._reference_term is None:
+      assert self._reference_name is not None
       self._reference_term = self._env.command_manager.get_term(self._reference_name)
+    assert self._reference_term is not None
     # 命令项的 joint_pos 与 robot.data.joint_pos 同序，可直接用关节 id 取子集。
     return self._reference_term.joint_pos[:, self._target_ids]
 

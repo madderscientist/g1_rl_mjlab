@@ -15,6 +15,7 @@ import time
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -109,9 +110,10 @@ class FootstepResumeRunner(MjlabOnPolicyRunner):
         group["lr"] = max(1e-5, group["lr"] * learning_rate_scale)
     self.current_learning_iteration = int(saved["iter"]) + 1
     self.alg.learning_rate = self.alg.optimizer.param_groups[0]["lr"]
-    env = self.env.unwrapped
+    env: Any = self.env.unwrapped
     with torch.inference_mode():
       self.env.reset()
+    assert self.logger.log_dir is not None
     receipt = {
       "rank": self.gpu_global_rank, "pid": os.getpid(), "checkpoint": str(path),
       "checkpoint_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
@@ -141,20 +143,22 @@ class FootstepResumeRunner(MjlabOnPolicyRunner):
     if not math.isfinite(duration_s) or duration_s < 0:
       raise ValueError("Training duration must be finite and nonnegative")
     rank = self.gpu_global_rank
+    assert self.logger.log_dir is not None
     log_dir = Path(self.logger.log_dir)
     first_iteration = self.current_learning_iteration
     if self.cfg.get("resume") is False:
       assert first_iteration == 0 and not self.alg.optimizer.state
       assert self.alg.learning_rate == self.cfg["algorithm"]["learning_rate"]
+      unwrapped: Any = self.env.unwrapped
       initialization = {
         "rank": rank, "pid": os.getpid(), "from_scratch": True, "checkpoint": None,
         "first_iteration": first_iteration, "optimizer_state_entries": len(self.alg.optimizer.state),
         "learning_rate": self.alg.learning_rate, "source_root": str(ROOT),
         "profile": os.environ.get("FOOTSTEP_PROFILE", "tracking"),
-        "reward_weights": {name: self.env.unwrapped.reward_manager.get_term_cfg(name).weight
-                           for name in self.env.unwrapped.reward_manager.active_terms},
-        "compile_backend": self.env.unwrapped.command_manager.get_term("footsteps").cfg.compile_backend,
-        "envs_per_rank": self.env.unwrapped.num_envs,
+        "reward_weights": {name: unwrapped.reward_manager.get_term_cfg(name).weight
+                           for name in unwrapped.reward_manager.active_terms},
+        "compile_backend": unwrapped.command_manager.get_term("footsteps").cfg.compile_backend,
+        "envs_per_rank": unwrapped.num_envs,
       }
       write_json(log_dir / f"initialization_rank_{rank}.json", initialization)
       print("FRESH_INITIALIZATION_VERIFIED " + json.dumps(initialization), flush=True)
@@ -346,12 +350,14 @@ def main():
   run_root = args.run_root or (checkpoint.parent.parent if checkpoint else ROOT / "logs/rsl_rl" / cfg.agent.experiment_name)
   log_dir = run_root.resolve() / (datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_" + args.tag)
   log_dir.mkdir(parents=True, exist_ok=False)
+  agent_cfg: Any = cfg.agent
+  footsteps_cfg: Any = cfg.env.commands["footsteps"]
   setup = {
     "profile": args.profile,
     "task_id": task_id,
     "stage_config": stage_config,
     "checkpoint": str(checkpoint) if checkpoint else None, "from_scratch": args.from_scratch,
-    "reset_optimizer": args.reset_optimizer, "configured_learning_rate": cfg.agent.algorithm.learning_rate,
+    "reset_optimizer": args.reset_optimizer, "configured_learning_rate": agent_cfg.algorithm.learning_rate,
     "learning_rate_scale": args.learning_rate_scale,
     "run_dir": str(log_dir), "source_root": str(ROOT),
     "gpu_ids": args.gpu_ids, "envs_per_rank": args.envs_per_rank, "total_envs": len(args.gpu_ids) * args.envs_per_rank,
@@ -359,8 +365,8 @@ def main():
     "first_iteration": first_iteration, "max_updates": args.max_updates, "continuous": continuous,
     "hours": args.hours, "duration_s": args.hours * 3600 if args.hours is not None else None,
     "save_interval": cfg.agent.save_interval, "reward_weights": {name: term.weight for name, term in cfg.env.rewards.items()},
-    "command_config": {"manager": asdict(cfg.env.commands["footsteps"].manager),
-                       "source": asdict(cfg.env.commands["footsteps"].source)},
+    "command_config": {"manager": asdict(footsteps_cfg.manager),
+                       "source": asdict(footsteps_cfg.source)},
     "curriculum_config": {name: term.params for name, term in cfg.env.curriculum.items()},
   }
   write_json(log_dir / "launch.json", setup)

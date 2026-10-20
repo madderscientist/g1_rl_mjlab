@@ -180,6 +180,7 @@ class RgmtActor(MLPModel):
     return prop, act
 
   def get_latent(self, obs: TensorDict, masks=None, hidden_state=None) -> torch.Tensor:
+    del masks, hidden_state
     prop, act = self._split_history(obs)
     n = prop.shape[0]
 
@@ -200,7 +201,7 @@ class RgmtActor(MLPModel):
     return torch.cat([prop[:, -1], act[:, -1], u_hat], dim=-1)
 
   def update_normalization(self, obs: TensorDict) -> None:
-    pass
+    del obs
 
   def as_onnx(self, verbose: bool) -> nn.Module:
     return _OnnxRgmtActor(self, verbose)
@@ -219,13 +220,13 @@ class _OnnxRgmtActor(nn.Module):
     # 缓存的 ``Normal`` 上——它持有上一次 forward 的非叶子张量。先摘掉再复原。
     dist = model.distribution
     cached = getattr(dist, "_distribution", None) if dist is not None else None
-    if cached is not None:
-      dist._distribution = None
+    if dist is not None and cached is not None:
+      setattr(dist, "_distribution", None)
     try:
       self.model = copy.deepcopy(model)
     finally:
-      if cached is not None:
-        dist._distribution = cached
+      if dist is not None and cached is not None:
+        setattr(dist, "_distribution", cached)
     self.model.eval()
     if model.distribution is not None:
       self.deterministic_output = model.distribution.as_deterministic_output_module()

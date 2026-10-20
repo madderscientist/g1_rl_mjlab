@@ -29,3 +29,7 @@ indent-width = 2
 
 [tool.ruff.format]
 indent-style = "space"
+
+[tool.pyright]
+extraPaths = ["scripts"]
+exclude = ["logs", "run_logs", "export", "motions", "build", "dist", "*.egg-info"]

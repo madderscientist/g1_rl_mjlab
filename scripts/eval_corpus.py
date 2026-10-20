@@ -11,11 +11,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import torch
 import tyro
 
 import g1_lower_rl.tasks  # noqa: F401  注册任务
+
+_ = g1_lower_rl.tasks
 
 
 def main(
@@ -37,14 +40,14 @@ def main(
 
   cfg = load_env_cfg("G1-Gloria-MotionTracking", play=True)
   agent_cfg = load_rl_cfg("G1-Gloria-MotionTracking")
+  mc: Any = cfg.commands["motion"]
   if motion_dir is not None:
-    cfg.commands["motion"].motion_dir = motion_dir
+    mc.motion_dir = motion_dir
 
   # play 会清空初始扰动，这里按需放回。默认全 0 = 干净启动，测跟踪上限；
   # 带上扰动才是测「非直立启动能不能站住」。两者要一起看：只看前者会低估鲁棒性训练，
   # 只看后者会掩盖跟踪能力的退化。
   if tilt or joint or height_lo or height_hi:
-    mc = cfg.commands["motion"]
     mc.pose_range = {
       "roll": (-tilt, tilt),
       "pitch": (-tilt, tilt),
@@ -56,8 +59,9 @@ def main(
   # 先建一个最小环境问出动作条数，再按条数定环境数。
   cfg.scene.num_envs = 1
   probe = ManagerBasedRlEnv(cfg=cfg, device=device)
-  n_motions = probe.command_manager.get_term("motion").motion.num_motions
-  names = list(probe.command_manager.get_term("motion").motion.names)
+  probe_cmd: Any = probe.command_manager.get_term("motion")
+  n_motions = probe_cmd.motion.num_motions
+  names = list(probe_cmd.motion.names)
   probe.close()
 
   cfg.scene.num_envs = n_motions * envs_per_motion
@@ -71,7 +75,7 @@ def main(
   )
   policy = runner.get_inference_policy(device=device)
 
-  cmd = env.command_manager.get_term("motion")
+  cmd: Any = env.command_manager.get_term("motion")
   assign = torch.arange(n_motions, device=device).repeat_interleave(envs_per_motion)
 
   obs, _ = wrapped.reset()

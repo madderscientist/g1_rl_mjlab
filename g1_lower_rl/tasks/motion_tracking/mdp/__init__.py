@@ -4,7 +4,7 @@
 保持了同一套属性名，所以这里直接整体转出即可，不需要重写。
 """
 
-from mjlab.tasks.tracking.mdp import *
+from mjlab.tasks.tracking.mdp import *  # noqa: F403  # pyright: ignore[reportWildcardImportFromLibrary]
 
 from g1_lower_rl.tasks.motion_tracking.mdp.actions import (
   GravityCompensatedJointPositionActionCfg as GravityCompensatedJointPositionActionCfg,

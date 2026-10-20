@@ -9,8 +9,10 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Literal
 
 import torch
+from mjlab.actuator import BuiltinPositionActuatorCfg
 from mjlab.rl import RslRlModelCfg
 from rsl_rl.models import RNNModel
 from rsl_rl.modules import HiddenState
@@ -37,6 +39,7 @@ OBSERVATION_LAYOUT = (
 
 def nominal_joint_positions() -> tuple[float, ...]:
   positions = get_robot_cfg().init_state.joint_pos
+  assert positions is not None
   return tuple(
     next((value for pattern, value in positions.items() if re.fullmatch(pattern, name)), 0.0) for name in WHOLE_BODY_JOINTS
   )
@@ -44,7 +47,9 @@ def nominal_joint_positions() -> tuple[float, ...]:
 
 def nominal_action_parameters() -> dict[str, list[float]]:
   result: dict[str, list[float]] = {name: [] for name in ("scale", "stiffness", "damping", "effort_limit")}
-  actuators = get_robot_cfg().articulation.actuators
+  articulation = get_robot_cfg().articulation
+  assert articulation is not None and articulation.actuators is not None
+  actuators = articulation.actuators
   for joint_name in LOWER_BODY_JOINTS:
     matches = [
       actuator for actuator in actuators if any(re.fullmatch(pattern, joint_name) for pattern in actuator.target_names_expr)
@@ -52,6 +57,8 @@ def nominal_action_parameters() -> dict[str, list[float]]:
     if len(matches) != 1:
       raise ValueError(f"Expected exactly one actuator for {joint_name}")
     actuator = matches[0]
+    assert isinstance(actuator, BuiltinPositionActuatorCfg)
+    assert actuator.stiffness is not None and actuator.damping is not None and actuator.effort_limit is not None
     stiffness = float(actuator.stiffness)
     damping = float(actuator.damping)
     effort_limit = float(actuator.effort_limit)
@@ -66,6 +73,8 @@ def nominal_action_parameters() -> dict[str, list[float]]:
 
 class FootstepObservationEncoder(nn.Module):
   """将形状为 [..., 79] 的原始观测编码为 [..., 82] 的特征"""
+
+  default_joint_pos: torch.Tensor
 
   def __init__(self, default_joint_pos: Sequence[float] | None = None, *, include_theta: bool = True) -> None:
     super().__init__()
@@ -157,21 +166,23 @@ class FootstepActor(RNNModel):
   def update_normalization(self, obs: TensorDict) -> None:
     if self.obs_normalization:
       features = self.encoder(obs[self.obs_groups[0]]).reshape(-1, self.encoded_obs_dim)
-      self.obs_normalizer.update(features)
+      normalizer: Any = self.obs_normalizer
+      normalizer.update(features)
 
   def as_jit(self) -> nn.Module:
-    exported = super().as_jit()
+    exported: Any = super().as_jit()
     exported.obs_normalizer = nn.Sequential(copy.deepcopy(self.encoder), exported.obs_normalizer)
     return exported
 
   def as_onnx(self, verbose: bool = False) -> nn.Module:
-    exported = super().as_onnx(verbose)
+    exported: Any = super().as_onnx(verbose)
     exported.obs_normalizer = nn.Sequential(copy.deepcopy(self.encoder), exported.obs_normalizer)
     exported.input_size = self.raw_obs_dim
     return exported
 
   def deployment_contract(self) -> dict:
-    hidden_shape = [self.rnn.rnn.num_layers, 1, self.rnn.rnn.hidden_size]
+    rnn_module: Any = self.rnn.rnn
+    hidden_shape = [int(rnn_module.num_layers), 1, int(rnn_module.hidden_size)]
     defaults = self.encoder.default_joint_pos.detach().cpu().tolist()
     return {
       "version": CONTRACT_VERSION,
@@ -285,7 +296,7 @@ def export_footstep_policy(model: FootstepActor, path: str | Path) -> Path:
   if destination.suffix != ".onnx":
     raise ValueError("Footstep export path must end in .onnx")
   destination.parent.mkdir(parents=True, exist_ok=True)
-  exported = model.as_onnx().cpu().eval()
+  exported: Any = model.as_onnx().cpu().eval()
   contract = model.deployment_contract()
   with torch.no_grad():
     torch.onnx.export(
@@ -311,7 +322,7 @@ class FootstepModelCfg(RslRlModelCfg):
   hidden_dims: tuple[int, ...] = (256, 256, 128)
   activation: str = "elu"
   obs_normalization: bool = True
-  rnn_type: str = "gru"
+  rnn_type: str | None = "gru"
   rnn_hidden_dim: int = 64
   rnn_num_layers: int = 1
   default_joint_pos: tuple[float, ...] | None = None

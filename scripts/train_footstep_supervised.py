@@ -109,12 +109,14 @@ def main():
   deadline = datetime.now(timezone.utc) + timedelta(seconds=duration)
   requested = False
 
-  def request_stop(signum, frame):
+  def request_stop(_signum, _frame):
     nonlocal requested
     requested = True
 
   for signum in (signal.SIGTERM, signal.SIGINT):
     signal.signal(signum, request_stop)
+
+  checkpoint = initial
 
   def record(status, **fields):
     state = {"status": status, "pid": os.getpid(), "deadline_utc": deadline.isoformat(),
@@ -141,8 +143,10 @@ def main():
       "--envs-per-rank", "128", "--run-root", str(root), "--tag", tag]
     process = subprocess.Popen(command, cwd=source, stdout=subprocess.PIPE,
       stderr=subprocess.STDOUT, start_new_session=True)
+    stdout = process.stdout
+    assert stdout is not None
     selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
+    selector.register(stdout, selectors.EVENT_READ)
     progress = -1
     progress_time = time.monotonic()
     failure = None
@@ -151,7 +155,7 @@ def main():
     with (root / f"attempt{attempt}.log").open("ab", buffering=0) as output:
       while process.poll() is None:
         for key, _ in selector.select(timeout=5):
-          chunk = os.read(key.fileobj.fileno(), 65536)
+          chunk = os.read(key.fd, 65536)
           if chunk:
             output.write(chunk)
           else:
@@ -169,12 +173,12 @@ def main():
           stop_process(process, records)
           break
       while True:
-        chunk = process.stdout.read(65536)
+        chunk = stdout.read(65536)
         if not chunk:
           break
         output.write(chunk)
     selector.close()
-    process.stdout.close()
+    stdout.close()
     records = statuses(root, tag)
     checkpoint = select_checkpoint(root, initial)
     final = completed_checkpoint(records)

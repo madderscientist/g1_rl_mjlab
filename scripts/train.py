@@ -10,7 +10,7 @@ import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import mjlab
 import tyro
@@ -67,8 +67,10 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     if cfg.mirror_schedule:
       raise ValueError("Footstep observations require mirror_schedule=(); the velocity-task mirror layout is incompatible")
     # CLI 可覆盖生成器相位，必须同步到奖励窗口和模型导出元数据
-    phase_cfg = cfg.env.commands["footsteps"].manager.phase
-    cfg.agent.actor.phase_cfg = phase_cfg
+    footstep_cmd: Any = cfg.env.commands["footsteps"]
+    actor_cfg: Any = cfg.agent
+    phase_cfg = footstep_cmd.manager.phase
+    actor_cfg.actor.phase_cfg = phase_cfg
     for term in cfg.env.rewards.values():
       if "phase_cfg" in term.params:
         term.params["phase_cfg"] = phase_cfg
@@ -199,6 +201,7 @@ def launch_training(task_id: str, args: TrainConfig | None = None) -> None:
 def main() -> None:
   import g1_lower_rl.tasks  # noqa: F401  注册任务
 
+  _ = g1_lower_rl.tasks
   chosen_task, remaining_args = tyro.cli(
     tyro.extras.literal_type_from_choices(list_tasks()),
     add_help=False,

@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 
+from g1_lower_rl.tasks.footstep_tracking.commands import FootstepCommandCfg
 from g1_lower_rl.tasks.footstep_tracking.curriculum import FREQUENCY_RATE_STAGES, NUM_STEPS_PER_ENV, make_curriculum
 
 from .env_cfg import _staged_env_cfg
@@ -13,6 +14,7 @@ def precision_env_cfg(play: bool = False, *, landing_start_step: int = 0,
     raise ValueError("Landing ramp start must be nonnegative and duration positive")
   cfg = _staged_env_cfg(play)
   command = cfg.commands["footsteps"]
+  assert isinstance(command, FootstepCommandCfg)
   command.manager = replace(command.manager, frequency_range=(0.8, 1.8))
   command.source = replace(command.source, frequency_range=(0.8, 1.8),
                            frequency_rate_range=FREQUENCY_RATE_STAGES[0][1])

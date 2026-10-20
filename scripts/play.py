@@ -6,7 +6,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import mjlab
 import torch
@@ -44,8 +44,8 @@ def _dummy_policy(kind: str, env: RslRlVecEnvWrapper):
   shape: tuple[int, ...] = env.unwrapped.action_space.shape
   device = env.unwrapped.device
   if kind == "zero":
-    return lambda obs: torch.zeros(shape, device=device)
-  return lambda obs: 2 * torch.rand(shape, device=device) - 1
+    return lambda _obs: torch.zeros(shape, device=device)
+  return lambda _obs: 2 * torch.rand(shape, device=device) - 1
 
 
 def run_play(task_id: str, cfg: PlayConfig) -> None:
@@ -57,7 +57,8 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
   trained = cfg.agent == "trained"
 
   if cfg.motion_dir is not None:
-    env_cfg.commands["motion"].motion_dir = cfg.motion_dir
+    motion_cmd: Any = env_cfg.commands["motion"]
+    motion_cmd.motion_dir = cfg.motion_dir
 
   if cfg.no_terminations:
     env_cfg.terminations = {}
@@ -105,7 +106,7 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
   if trained:
     assert resume_path is not None
     runner = load_trained_runner(task_id, env, agent_cfg, resume_path, device)
-    policy = runner.get_inference_policy(device=device)
+    policy: Any = runner.get_inference_policy(device=device)
   else:
     policy = _dummy_policy(cfg.agent, env)
 
@@ -124,6 +125,7 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
 def main() -> None:
   import g1_lower_rl.tasks  # noqa: F401  注册任务
 
+  _ = g1_lower_rl.tasks
   chosen_task, remaining_args = tyro.cli(
     tyro.extras.literal_type_from_choices(list_tasks()),
     add_help=False,

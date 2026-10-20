@@ -55,6 +55,13 @@ class FootstepRewardState:
         raise ValueError("Reward state must be finite and on one device")
 
 
+def _reward_state(env: ManagerBasedRlEnv, command_name: str = "footsteps") -> FootstepRewardState:
+  state = getattr(env.command_manager.get_term(command_name), "reward_state", None)
+  if not isinstance(state, FootstepRewardState):
+    raise TypeError("Footstep command must publish a FootstepRewardState as reward_state")
+  return state
+
+
 class LowerBodyTorqueCost:
   """15轴实际执行器铜损，接近硬限位且继续向外施力时单独放大"""
 
@@ -108,12 +115,11 @@ class LowerBodyTorqueCost:
     self.at_lower_limit = positions <= limits[..., 0] + limit_margin
     self.at_upper_limit = positions >= limits[..., 1] - limit_margin
     self.pushing_limit = (self.at_lower_limit & (torques < 0)) | (self.at_upper_limit & (torques > 0))
-    if knee_limit_scale is not None:
-      limit_scale = torch.where(self.knee_mask, knee_limit_scale, limit_scale)
-    weights = self.weights * torch.where(self.pushing_limit, limit_scale, 1.0)
+    scale = limit_scale if knee_limit_scale is None else torch.where(self.knee_mask, knee_limit_scale, limit_scale)
+    weights = self.weights * torch.where(self.pushing_limit, scale, 1.0)
     cost = torque_square_cost(torques, weights, reference_torque)
     if standing_scale != 1.0:
-      frequency = env.command_manager.get_term(command_name).reward_state.frequency
+      frequency = _reward_state(env, command_name).frequency
       cost = cost * torch.where(frequency == 0, standing_scale, 1.0)
     return cost
 
@@ -153,7 +159,9 @@ def torso_heading_error_l2(
   data = env.scene[asset_cfg.name].data
   orientations = torch.cat((data.site_quat_w[:, asset_cfg.site_ids],
                             data.body_link_quat_w[:, asset_cfg.body_ids]), dim=1)
-  desired = env.command_manager.get_term(command_name).command[:, 0]
+  term = env.command_manager.get_term(command_name)
+  assert term is not None
+  desired = term.command[:, 0]
   cost = _compiled_torso_heading_cost if compile_backend and orientations.is_cuda else _torso_heading_cost
   return cost(orientations, desired)
 
@@ -164,7 +172,7 @@ def standing_pelvis_heading_error_l2(
   command_name: str = "footsteps",
 ) -> torch.Tensor:
   """零执行步频时惩罚刚体相对双脚圆周平均航向的偏角平方"""
-  frequency = env.command_manager.get_term(command_name).reward_state.frequency
+  frequency = _reward_state(env, command_name).frequency
   return torso_heading_error(env, asset_cfg).squeeze(-1).square() * (frequency == 0)
 
 
@@ -183,7 +191,7 @@ def standing_body_tilt_angle_l2(
   command_name: str = "footsteps",
 ) -> torch.Tensor:
   """零执行步频时直接惩罚相对竖直方向的倾角平方"""
-  frequency = env.command_manager.get_term(command_name).reward_state.frequency
+  frequency = _reward_state(env, command_name).frequency
   return body_tilt_angle_l2(env, asset_cfg) * (frequency == 0)
 
 
@@ -193,12 +201,12 @@ def standing_body_tilt_angle_l1(
   command_name: str = "footsteps",
 ) -> torch.Tensor:
   """零执行步频时惩罚相对竖直方向的线性倾角"""
-  frequency = env.command_manager.get_term(command_name).reward_state.frequency
+  frequency = _reward_state(env, command_name).frequency
   return body_tilt_angle_l2(env, asset_cfg).sqrt() * (frequency == 0)
 
 
 def _head_height_above_ground(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg, command_name: str) -> torch.Tensor:
-  state = env.command_manager.get_term(command_name).reward_state
+  state = _reward_state(env, command_name)
   data = env.scene[asset_cfg.name].data
   return data.geom_pos_w[:, asset_cfg.geom_ids, 2].squeeze(-1) - state.ground_height.mean(-1)
 
@@ -264,7 +272,7 @@ class FilteredPelvisUpright:
     data = env.scene[asset_cfg.name].data
     orientation = data.body_link_quat_w[:, asset_cfg.body_ids].squeeze(1)
     gravity = quat_apply_inverse(orientation, data.gravity_vec_w)
-    frequency = env.command_manager.get_term(command_name).reward_state.frequency
+    frequency = _reward_state(env, command_name).frequency
     cutoff = torch.where(frequency > 0, frequency * cutoff_ratio, standing_cutoff_hz)
     alpha = -torch.expm1(-2 * math.pi * cutoff * env.step_dt)
     fresh = ~self.initialized
@@ -281,7 +289,7 @@ def _standing_position_score(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg,
                              command_name: str, position_scale: float) -> torch.Tensor:
   if not math.isfinite(position_scale) or position_scale <= 0:
     raise ValueError("Standing position scale must be finite and positive")
-  state = env.command_manager.get_term(command_name).reward_state
+  state = _reward_state(env, command_name)
   position = env.scene[asset_cfg.name].data.site_pos_w[:, asset_cfg.site_ids, :2]
   error = (position - state.targets_w[..., :2]).square().sum(-1).mean(-1)
   return (1.0 + error / position_scale**2).reciprocal()
@@ -298,7 +306,7 @@ def standing_linear_velocity_reward(
   """零执行频率时奖励身体低线速度，并按双脚偏离冻结目标的距离衰减"""
   if not math.isfinite(std) or std <= 0 or not math.isfinite(z_penalty) or z_penalty < 0:
     raise ValueError("Velocity std must be positive and z penalty nonnegative; both must be finite")
-  state = env.command_manager.get_term(command_name).reward_state
+  state = _reward_state(env, command_name)
   velocity = env.scene[asset_cfg.name].data.root_link_lin_vel_b
   error = velocity[:, :2].square().sum(-1) + z_penalty * velocity[:, 2].square()
   position_score = _standing_position_score(env, asset_cfg, command_name, position_scale)
@@ -316,7 +324,7 @@ def standing_angular_velocity_reward(
   """零执行频率时奖励身体低角速度，并按双脚偏离冻结目标的距离衰减"""
   if not math.isfinite(std) or std <= 0 or not math.isfinite(xy_penalty) or xy_penalty < 0:
     raise ValueError("Velocity std must be positive and xy penalty nonnegative; both must be finite")
-  state = env.command_manager.get_term(command_name).reward_state
+  state = _reward_state(env, command_name)
   velocity = env.scene[asset_cfg.name].data.root_link_ang_vel_b
   error = velocity[:, 2].square() + xy_penalty * velocity[:, :2].square().sum(-1)
   position_score = _standing_position_score(env, asset_cfg, command_name, position_scale)
@@ -333,7 +341,7 @@ def feet_hold_position_cost(
   """停脚时限制相对冻结目标的水平漂移，保留小幅平衡调整空间"""
   if not math.isfinite(deadband) or deadband < 0 or not math.isfinite(distance_scale) or distance_scale <= 0:
     raise ValueError("Hold deadband must be nonnegative and distance scale positive; both must be finite")
-  state = env.command_manager.get_term(command_name).reward_state
+  state = _reward_state(env, command_name)
   position = env.scene[asset_cfg.name].data.site_pos_w[:, asset_cfg.site_ids, :2]
   distance = torch.linalg.vector_norm(position - state.targets_w[..., :2], dim=-1)
   cost = ((distance - deadband).clamp_min(0.0) / distance_scale).square().mean(-1)
@@ -351,7 +359,7 @@ def feet_flatness_cost(
   """计划支撑或实际触地时约束脚掌法向，静止检查双脚，不限制航向角"""
   if not math.isfinite(angle_scale) or angle_scale <= 0:
     raise ValueError("Flatness angle scale must be finite and positive")
-  state = env.command_manager.get_term(command_name).reward_state
+  state = _reward_state(env, command_name)
   data = env.scene[asset_cfg.name].data
   orientation = data.site_quat_w[:, asset_cfg.site_ids]
   gravity = data.gravity_vec_w.unsqueeze(1).expand(-1, 2, -1)
@@ -377,7 +385,7 @@ def stance_knee_bend_cost(
   if (not all(math.isfinite(value) and value >= 0 for value in (standing_limit, walking_limit))
       or not math.isfinite(angle_scale) or angle_scale <= 0):
     raise ValueError("Knee limits must be nonnegative and angle scale positive; all must be finite")
-  state = env.command_manager.get_term(command_name).reward_state
+  state = _reward_state(env, command_name)
   standing = state.frequency == 0
   stance, _ = phase_windows(state.phase, phase_cfg=phase_cfg)
   stance = stance | standing.unsqueeze(-1)
@@ -417,7 +425,7 @@ def fall_cost(env: ManagerBasedRlEnv) -> torch.Tensor:
 
 def soft_landing(env: ManagerBasedRlEnv, sensor_name: str, command_name: str = "footsteps") -> torch.Tensor:
   """复用速度任务的首次触地冲击代价，以脚步频率判断运动状态"""
-  moving = env.command_manager.get_term(command_name).reward_state.frequency > 0
+  moving = _reward_state(env, command_name).frequency > 0
   return velocity_soft_landing(env, sensor_name) * moving
 
 
@@ -475,9 +483,7 @@ class FootstepReward:
   ) -> torch.Tensor:
     if component != self.component:
       raise ValueError("Reward component must match its construction config")
-    state = env.command_manager.get_term(command_name).reward_state
-    if not isinstance(state, FootstepRewardState):
-      raise TypeError("Footstep command must publish a FootstepRewardState as reward_state")
+    state = _reward_state(env, command_name)
     if not all(math.isfinite(value) and value > 0 for value in (position_std, yaw_std, clearance)):
       raise ValueError("Invalid tracking or clearance parameters")
     timing = resolve_phase_cfg(stance_fraction, phase_cfg)
@@ -528,6 +534,8 @@ class FootstepReward:
       height = position[..., 2] - state.ground_height
       target = clearance * lift_profile * ~stance
       return ((height - target).abs() / clearance).sum(-1)
+    distance = torch.zeros_like(state.targets_w[..., 0])
+    yaw_error = torch.zeros_like(distance)
     if component != "swing_yaw":
       position = data.site_pos_w[:, asset_cfg.site_ids]
       distance = torch.linalg.vector_norm(position[..., :2] - state.targets_w[..., :2], dim=-1)

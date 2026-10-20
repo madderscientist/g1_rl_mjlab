@@ -54,6 +54,9 @@ class TorsoHeadingCommandCfg(CommandTermCfg):
 class TorsoHeadingCommand(CommandTerm):
   """均匀采样期望躯干偏角与速度，以限速连续过渡发布一维 rad 指令"""
 
+  cfg: TorsoHeadingCommandCfg
+  time_left: torch.Tensor
+
   def __init__(self, cfg: TorsoHeadingCommandCfg, env):
     super().__init__(cfg, env)
     if not math.isfinite(cfg.angle_limit) or not 0 < cfg.angle_limit < math.pi:
@@ -208,6 +211,7 @@ class FootstepCommand(CommandTerm):
 
   def compute(self, dt: float | torch.Tensor, env_ids: torch.Tensor | None = None) -> None:
     """默认步末回调只完成 reset，不推进时间或重采样行走意图"""
+    del dt
     self._update_command(env_ids)
 
   def _debug_vis_impl(self, visualizer) -> None:

@@ -24,6 +24,7 @@ class StepLandingBonus:
   """Pay each planned foot's first actual landing within the episode budget."""
 
   def __init__(self, cfg, env):
+    del cfg
     self.saw_air = torch.zeros((env.num_envs, 2), dtype=torch.bool, device=env.device)
     self.previous_contact = torch.ones_like(self.saw_air)
     self.claimed = torch.zeros_like(self.saw_air)
@@ -70,6 +71,7 @@ class ExtraContactCost:
   """Count confirmed extra landings, excluding each planned foot's first landing."""
 
   def __init__(self, cfg, env):
+    del cfg
     shape = (env.num_envs, 2)
     self.air = torch.zeros(shape, device=env.device)
     self.contact = torch.zeros_like(self.air)

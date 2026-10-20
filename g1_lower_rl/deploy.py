@@ -15,7 +15,9 @@ from __future__ import annotations
 
 from typing import NamedTuple, Sequence
 
-import mujoco
+from mujoco._enums import mjtBuiltin, mjtGeom, mjtObj, mjtTexture, mjtTextureRole
+from mujoco._functions import mj_forward, mj_name2id, mj_resetData, mj_step, mju_quat2Mat
+from mujoco._structs import MjModel
 import numpy as np
 import onnxruntime
 from mjlab.entity import Entity
@@ -43,25 +45,25 @@ _OBS_TERMS = (
 )
 
 
-def build_model() -> mujoco.MjModel:
+def build_model() -> MjModel:
   """训练用的机器人 + 一块地面。"""
   spec = Entity(get_robot_cfg()).spec
   # 棋盘纹理：跟拍镜头下机器人总在画面中心，没有地面参考就分不出“走了”和“原地踏步”。
   spec.add_texture(
     name="grid",
-    type=mujoco.mjtTexture.mjTEXTURE_2D,
-    builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER,
+    type=mjtTexture.mjTEXTURE_2D,
+    builtin=mjtBuiltin.mjBUILTIN_CHECKER,
     rgb1=[0.45, 0.50, 0.55],
     rgb2=[0.30, 0.34, 0.38],
     width=300,
     height=300,
   )
   spec.add_material(name="grid", texrepeat=[4, 4], reflectance=0.1).textures[
-    mujoco.mjtTextureRole.mjTEXROLE_RGB
+    mjtTextureRole.mjTEXROLE_RGB
   ] = "grid"
   spec.worldbody.add_geom(
     name="floor",
-    type=mujoco.mjtGeom.mjGEOM_PLANE,
+    type=mjtGeom.mjGEOM_PLANE,
     size=[0, 0, 0.05],
     condim=3,
     friction=[0.8, 0.005, 0.0001],
@@ -151,11 +153,11 @@ class Index:
   动作关节和观测关节分开索引：站立任务观测全身 29 轴、只驱动下肢 15 轴，混用会错位。
   """
 
-  def __init__(self, model: mujoco.MjModel, policy: Policy):
+  def __init__(self, model: MjModel, policy: Policy):
     def joints_of(names: Sequence[str], what: str) -> list[int]:
       # mj_name2id 找不到返回 -1，直接当下标用会静默地索到最后一个关节。
       ids = [
-        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name) for name in names
+        mj_name2id(model, mjtObj.mjOBJ_JOINT, name) for name in names
       ]
       unknown = [n for n, i in zip(names, ids) if i < 0]
       if unknown:
@@ -165,7 +167,7 @@ class Index:
     joint_names = policy.action_joint_names
     joints = joints_of(joint_names, "动作")
     actuators = [
-      mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+      mj_name2id(model, mjtObj.mjOBJ_ACTUATOR, name)
       for name in joint_names
     ]
     unknown = [n for n, a in zip(joint_names, actuators) if a < 0]
@@ -178,25 +180,25 @@ class Index:
     self.obs_qvel = model.jnt_dofadr[joints_of(policy.obs_vel_joint_names, "观测")]
     self.obs_default_pos = policy.obs_pos_default
     self.arm_actuator = [
-      mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+      mj_name2id(model, mjtObj.mjOBJ_ACTUATOR, name)
       for name in ARM_JOINTS
     ]
     self.foot_site = [
-      mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name) for name in FOOT_SITES
+      mj_name2id(model, mjtObj.mjOBJ_SITE, name) for name in FOOT_SITES
     ]
     self.joint_range = model.jnt_range[joints]
     self.ctrl_range = model.actuator_ctrlrange[actuators]
 
 
 def reset(model, data, names, defaults) -> None:
-  mujoco.mj_resetData(model, data)
+  mj_resetData(model, data)
   data.qpos[:3] = [0.0, 0.0, 0.793]
   data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
   for i, name in enumerate(names):
-    joint = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+    joint = mj_name2id(model, mjtObj.mjOBJ_JOINT, name)
     if joint >= 0:
       data.qpos[model.jnt_qposadr[joint]] = defaults[i]
-  mujoco.mj_forward(model, data)
+  mj_forward(model, data)
 
 
 def set_arm_mode(model, mode: str) -> None:
@@ -211,7 +213,7 @@ def set_arm_mode(model, mode: str) -> None:
   if mode != "limp":
     return
   arm = [
-    mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name) for name in ARM_JOINTS
+    mj_name2id(model, mjtObj.mjOBJ_ACTUATOR, name) for name in ARM_JOINTS
   ]
   model.actuator_gainprm[arm, 0] = 0.0
   model.actuator_biasprm[arm, 1] = 0.0
@@ -292,7 +294,7 @@ def rollout(model, data, session, index, default_pos, scale, command, seconds, v
     target = default_pos + scale * last_action  # 不裁剪，和训练一致
     data.ctrl[index.actuator] = target
 
-    mujoco.mju_quat2Mat(rotation, data.qpos[3:7])
+    mju_quat2Mat(rotation, data.qpos[3:7])
     foot_z = data.site_xpos[index.foot_site, 2]
     log["target"].append(target)
     log["vel_b"].append(rotation.reshape(3, 3).T @ data.qvel[:3])
@@ -304,7 +306,7 @@ def rollout(model, data, session, index, default_pos, scale, command, seconds, v
     log["qpos"].append(data.qpos.copy())
 
     for _ in range(DECIMATION):
-      mujoco.mj_step(model, data)
+      mj_step(model, data)
     if video is not None and step % 2 == 0:  # 25 fps
       video["renderer"].update_scene(data, camera=video["camera"])
       video["images"].append(video["renderer"].render())

@@ -19,9 +19,10 @@ import os
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
-from mjlab.rl import MjlabOnPolicyRunner, RslRlPpoAlgorithmCfg, RslRlVecEnvWrapper
+from mjlab.rl import MjlabOnPolicyRunner, RslRlPpoAlgorithmCfg
 from mjlab.rl.exporter_utils import attach_metadata_to_onnx
 from mjlab.tasks.registry import load_runner_cls
 from mjlab.tasks.velocity.rl.runner import VelocityOnPolicyRunner
@@ -163,11 +164,9 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
   否则落回基类就只存 .pt、没有 ONNX 和部署元数据。
   """
 
-  env: RslRlVecEnvWrapper
-
   def __init__(
     self,
-    env,
+    env: Any,
     train_cfg: dict,
     log_dir: str | None = None,
     device: str = "cpu",
@@ -207,7 +206,9 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
     """挂上判别器，并把风格奖励注入 env.step 的返回值。"""
     from g1_lower_rl.rl.amp import MotionExpertSampler, _local_features
 
-    robot = self.env.unwrapped.scene["robot"]
+    wrapper: Any = self.env
+    unwrapped: Any = wrapper.unwrapped
+    robot = unwrapped.scene["robot"]
     body_names = list(motion_cmd.cfg.body_names)
     robot_bi = [robot.body_names.index(n) for n in body_names]
     robot_ai = robot.body_names.index(motion_cmd.cfg.anchor_body_name)
@@ -215,7 +216,8 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
     motion_ai = motion_cmd.motion_anchor_body_index
 
     sampler = MotionExpertSampler(motion_cmd.motion, motion_bi, motion_ai)
-    self.alg.attach_amp(sampler.feature_dim(), sampler, self.device)
+    alg: Any = self.alg
+    alg.attach_amp(sampler.feature_dim(), sampler, self.device)
 
     def policy_features() -> torch.Tensor:
       d = robot.data
@@ -229,19 +231,18 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
         d.body_link_ang_vel_w[:, robot_ai],
       )
 
-    env = self.env
-    inner = env.step
+    inner = wrapper.step
 
     def step(actions):
       prev = policy_features()
       obs, rewards, dones, extras = inner(actions)
       cur = policy_features()
-      self.alg.record_amp_pair(prev, cur)
+      alg.record_amp_pair(prev, cur)
       # 官方 _combine_rewards 是加权和，不是直接相加：任务奖励要同步降权。
-      style = self.alg.style_reward(prev, cur).to(rewards.device)
-      return obs, self.alg.amp_task_w * rewards + style, dones, extras
+      style = alg.style_reward(prev, cur).to(rewards.device)
+      return obs, alg.amp_task_w * rewards + style, dones, extras
 
-    env.step = step
+    wrapper.step = step
 
   @staticmethod
   def _get_export_paths(checkpoint_path: str) -> tuple[Path, str, Path]:
@@ -251,7 +252,10 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
 
   def _stateful_curriculum_terms(self):
     """返回 (名字, 课程实例)——只挑实现了 state_dict 的。"""
-    manager = getattr(self.env.unwrapped, "curriculum_manager", None)
+    wrapper: Any = self.env
+    manager = getattr(wrapper.unwrapped, "curriculum_manager", None)
+    if manager is None:
+      return
     for name in getattr(manager, "active_terms", ()):
       func = manager.get_term_cfg(name).func
       if hasattr(func, "state_dict") and hasattr(func, "load_state_dict"):
@@ -325,7 +329,9 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
     if not onnx_path.exists():
       return  # 父类的导出是 try/except 包着的，失败时不该连累存档。
     try:
-      attach_metadata_to_onnx(str(onnx_path), deployment_metadata(self.env.unwrapped))
+      wrapper: Any = self.env
+      metadata: dict[str, list[Any] | str | float] = dict(deployment_metadata(wrapper.unwrapped))
+      attach_metadata_to_onnx(str(onnx_path), metadata)
     except Exception as e:
       print(f"[WARN] 写入部署元数据失败（训练继续）: {e}")
 

@@ -34,12 +34,13 @@ class gated_event_params(lower_body_mdp.gated_event_params):
   def _local_counts(
     self,
     env: ManagerBasedRlEnv,
-    event_name: str,
-    stages: list,
-    log_key: str,
-    gate: dict[str, Any],
+    event_name: str = "",
+    stages: list = (),  # type: ignore[assignment]
+    log_key: str = "",
+    gate: dict[str, Any] = {},
+    **params: Any,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    del event_name, stages, log_key
+    del event_name, stages, log_key, params
     gravity = env.scene["robot"].data.projected_gravity_b
     tilt = torch.norm(gravity[:, :2], dim=1)
     return (tilt < gate["max_tilt"]).sum(), tilt.new_tensor(tilt.numel())

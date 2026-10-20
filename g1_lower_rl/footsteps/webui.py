@@ -306,10 +306,11 @@ class PreviewServer(ThreadingHTTPServer):
 class PreviewHandler(BaseHTTPRequestHandler):
   """仅提供白名单静态资源和同源 JSON 预览接口"""
 
-  server: PreviewServer
+  server: PreviewServer  # type: ignore[assignment]
 
   def log_message(self, format: str, *args) -> None:
     """关闭高频预览请求的默认访问日志，避免刷屏"""
+    del format, args
 
   def reply(self, status: int, body: bytes, content_type: str) -> None:
     """发送带缓存禁用与内容安全策略的 HTTP 响应"""

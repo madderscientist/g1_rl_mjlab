@@ -20,6 +20,9 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import imageio.v2 as imageio  # noqa: E402
 import mujoco  # noqa: E402
+from mujoco._enums import mjtCamera  # noqa: E402
+from mujoco._functions import mj_forward  # noqa: E402
+from mujoco._structs import MjData, MjvCamera  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 
@@ -100,12 +103,12 @@ def configure_arms(model, data, index: Index, scenario: Scenario) -> None:
   joints = model.actuator_trnid[actuators, 0]
   data.qpos[model.jnt_qposadr[joints]] = target
   data.qvel[model.jnt_dofadr[joints]] = 0.0
-  mujoco.mj_forward(model, data)
+  mj_forward(model, data)
 
 
 def simulate(model, policy_path: str, tag: str):
   """只跑物理，返回每个场景的 qpos 轨迹（已按 STRIDE 抽到 25 Hz）。"""
-  data = mujoco.MjData(model)
+  data = MjData(model)
   policy = load_policy(policy_path)
   index = Index(model, policy)
   tracks = []
@@ -130,14 +133,14 @@ def simulate(model, policy_path: str, tag: str):
   return tracks
 
 
-def frame_camera(paths) -> mujoco.MjvCamera:
+def frame_camera(paths) -> MjvCamera:
   """一个覆盖所有给定轨迹的固定机位。45° 斜视角；就地场景给一个近景。"""
   xy = np.concatenate([p[:, :2] for p in paths])
   lo, hi = xy.min(axis=0), xy.max(axis=0)
   centre = (lo + hi) / 2
   extent = float(np.max(hi - lo))
-  camera = mujoco.MjvCamera()
-  camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+  camera = MjvCamera()
+  camera.type = mjtCamera.mjCAMERA_FREE
   camera.lookat[:] = [centre[0], centre[1], 0.65]
   camera.distance = float(np.clip(1.15 * extent + 2.2, 3.2, 9.0))
   camera.azimuth = 45.0
@@ -178,7 +181,7 @@ def main() -> None:
     runs.append((tag, PANEL_COLOURS[i % len(PANEL_COLOURS)], simulate(model, policy_path, tag)))
 
   print("渲染…")
-  data = mujoco.MjData(model)
+  data = MjData(model)
   renderer = mujoco.Renderer(model, height=HEIGHT, width=WIDTH)
   frame_count = 0
   writer_context = cast(Any, imageio.get_writer(str(out), fps=FPS, macro_block_size=1))
@@ -192,7 +195,7 @@ def main() -> None:
         panels = []
         for (tag, colour, _), (_, travel, qpos) in zip(runs, scenario_runs):
           data.qpos[:] = qpos[min(frame_index, len(qpos) - 1)]
-          mujoco.mj_forward(model, data)
+          mj_forward(model, data)
           renderer.update_scene(data, camera=camera)
           panels.append(
             annotate(

@@ -12,7 +12,6 @@ from mjlab.utils.lab_api.math import sample_uniform
 LINK_MASS_SCALE_RANGE = (0.95, 1.05)
 
 
-@requires_model_fields("body_mass", "body_inertia", recompute=RecomputeLevel.set_const)
 class RandomizeLinkMass:
   """Resample nominal link density while preserving startup additive payloads."""
 
@@ -46,16 +45,20 @@ class RandomizeLinkMass:
       self.nominal_mass = self.nominal_mass.to(dtype=model.body_mass.dtype)
       self.nominal_inertia = self.nominal_inertia.to(dtype=model.body_inertia.dtype)
       self.mass_offset = (model.body_mass[:, self.body_ids] - self.nominal_mass).clone()
+    assert self.mass_offset is not None
     scale = sample_uniform(lower, upper, (len(env_ids), len(self.body_ids)), device=env.device)
     env_grid, body_grid = torch.meshgrid(env_ids, self.body_ids, indexing="ij")
     model.body_mass[env_grid, body_grid] = self.nominal_mass * scale + self.mass_offset[env_ids]
     model.body_inertia[env_grid, body_grid] = self.nominal_inertia * scale.unsqueeze(-1)
 
 
+requires_model_fields("body_mass", "body_inertia", recompute=RecomputeLevel.set_const)(RandomizeLinkMass)  # type: ignore[arg-type]
+
+
 def make_link_mass_event() -> EventTermCfg:
   """Independent uniform +/-5% per robot body, held constant until its next reset."""
   return EventTermCfg(
-    func=RandomizeLinkMass,
+    func=RandomizeLinkMass,  # type: ignore[arg-type]
     mode="reset",
     params={"asset_cfg": SceneEntityCfg("robot"), "scale_range": LINK_MASS_SCALE_RANGE},
   )

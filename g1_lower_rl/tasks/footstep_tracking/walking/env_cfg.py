@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 
+from g1_lower_rl.tasks.footstep_tracking.commands import FootstepCommandCfg
 from g1_lower_rl.tasks.footstep_tracking.env_cfg import footstep_env_cfg
 
 from .curriculum import make_walk_first_curriculum
@@ -11,6 +12,7 @@ def _staged_env_cfg(play: bool):
   """两阶段共用固定请求步频和逐步扩展的脚印课程"""
   cfg = footstep_env_cfg(play=play)
   command = cfg.commands["footsteps"]
+  assert isinstance(command, FootstepCommandCfg)
   sampler = replace(
     command.manager.sampler,
     distance_range=(0.27, 0.27), distance_mean=0.27, distance_std=0.08,

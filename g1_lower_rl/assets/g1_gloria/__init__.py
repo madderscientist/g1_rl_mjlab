@@ -6,7 +6,7 @@
 
 import re
 
-import mujoco
+from mujoco._specs import MjSpec
 from mjlab.actuator import BuiltinPositionActuatorCfg
 from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
   ACTUATOR_4010,
@@ -21,8 +21,8 @@ XML = PKG_PATH / "assets" / "g1_gloria" / "xmls" / "g1_with_dual_gloria_m.xml"
 assert XML.exists(), XML
 
 
-def get_spec() -> mujoco.MjSpec:
-  return mujoco.MjSpec.from_file(str(XML))
+def get_spec() -> MjSpec:
+  return MjSpec.from_file(str(XML))
 
 
 GRIPPER_ACTUATOR = BuiltinPositionActuatorCfg(
@@ -101,9 +101,10 @@ ARM_JOINTS: tuple[str, ...] = tuple(
 
 _ACTION_SCALE: dict[str, float] = {}
 _EFFORT_LIMIT: dict[str, float] = {}
+assert ARTICULATION.actuators is not None
 for _a in ARTICULATION.actuators:
   assert isinstance(_a, BuiltinPositionActuatorCfg)
-  assert _a.effort_limit is not None
+  assert _a.effort_limit is not None and _a.stiffness is not None
   for _expr in _a.target_names_expr:
     _ACTION_SCALE[_expr] = 0.25 * _a.effort_limit / _a.stiffness
     _EFFORT_LIMIT[_expr] = _a.effort_limit

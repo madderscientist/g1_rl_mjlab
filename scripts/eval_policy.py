@@ -24,6 +24,7 @@ from g1_lower_rl.rl import latest_checkpoint, load_trained_runner  # noqa: E402
 from g1_lower_rl.tasks import DEFAULT_TASK  # noqa: E402
 from g1_lower_rl.tasks.lower_body.mdp import height_above_feet  # noqa: E402
 
+_ = g1_lower_rl.tasks
 TASK = DEFAULT_TASK
 STEPS = 1000
 NUM_ENVS = 256
@@ -72,11 +73,14 @@ def main() -> None:
     for _ in range(STEPS):
       obs, _, dones, extras = wrapped.step(policy(obs))
       twist = env.command_manager.get_command("twist")
-      h_cmd = env.command_manager.get_command("height")[:, 0]
+      height_cmd = env.command_manager.get_command("height")
+      assert twist is not None and height_cmd is not None
+      h_cmd = height_cmd[:, 0]
       h = height_above_feet(robot, site_ids)
       v = robot.data.root_link_lin_vel_b
       vel_err += (twist[:, :2] - v[:, :2]).norm(dim=1).mean().item()
       height_err += (h_cmd - h).abs().mean().item()
+      assert sensor.data.current_air_time is not None
       air_time += sensor.data.current_air_time.max(dim=1).values.mean().item()
       falls += int((dones.bool() & ~extras["time_outs"]).sum().item())
       for lo in h_by_band:

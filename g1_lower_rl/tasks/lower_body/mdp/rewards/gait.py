@@ -34,6 +34,7 @@ def feet_air_time(
   """
   sensor: ContactSensor = env.scene[sensor_name]
   data = sensor.data
+  assert data.current_contact_time is not None and data.current_air_time is not None
   in_contact = data.current_contact_time > 0.0
   in_mode_time = torch.where(in_contact, data.current_contact_time, data.current_air_time)
   single_stance = torch.mean(in_contact.float(), dim=1) == 0.5
@@ -65,7 +66,8 @@ def shifted_feet_gait(
   节拍对不上。
   """
   sensor: ContactSensor = env.scene[sensor_name]
-  in_contact = sensor.data.current_contact_time > 0  # type: ignore[operator]
+  assert sensor.data.current_contact_time is not None
+  in_contact = sensor.data.current_contact_time > 0
   clock = (env.episode_length_buf * env.step_dt) / period + gait_phase_offset(env)
   offsets = torch.as_tensor(offset, device=env.device, dtype=clock.dtype).view(1, -1)
   leg_phase = (clock.unsqueeze(1) + offsets) % 1.0
@@ -109,6 +111,7 @@ def feet_stationary(
   使得被推后迈一步仍然划算。
   """
   sensor: ContactSensor = env.scene[sensor_name]
+  assert sensor.data.current_contact_time is not None
   airborne = (~(sensor.data.current_contact_time > 0)).float().sum(dim=1)
   return airborne * (1.0 - moving(env, command_name, command_threshold))
 

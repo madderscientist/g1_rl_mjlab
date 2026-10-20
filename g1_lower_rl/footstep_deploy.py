@@ -150,7 +150,10 @@ class FootstepPolicy:
     validate_footstep_observation(raw)
     if raw[0, 71] == 0 and self.contract.get("phase", {}).get("standing_frequency") != 0.0:
       raise ValueError("This policy contract does not support zero-frequency standing; re-export a compatible model")
-    actions, next_hidden = self.session.run(["actions", "h_out"], {"obs": raw, "h_in": self.hidden_state})
+    actions, next_hidden = [
+      np.asarray(value, dtype=np.float32)
+      for value in self.session.run(["actions", "h_out"], {"obs": raw, "h_in": self.hidden_state})
+    ]
     targets = self.default_pos + self.action_scale * actions[0]
     if not all(np.isfinite(value).all() for value in (actions, next_hidden, targets)):
       raise RuntimeError("Non-finite policy output; do not send targets to the robot")

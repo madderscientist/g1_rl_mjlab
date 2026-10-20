@@ -31,7 +31,7 @@ class ScenarioVelocityCommand(UniformVelocityCommand):
   换来的连续性收益也存疑，2 s 相关时间下策略看到的仍然主要是噪声。
   """
 
-  cfg: ScenarioVelocityCommandCfg
+  cfg: ScenarioVelocityCommandCfg  # type: ignore[assignment]
 
   def __init__(self, cfg: ScenarioVelocityCommandCfg, env: ManagerBasedRlEnv):
     super().__init__(cfg, env)

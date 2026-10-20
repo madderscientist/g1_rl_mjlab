@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+from typing import Any
 import uuid
 
 import torch
@@ -45,7 +46,7 @@ def drain_pipe(stream, output, seconds=2.):
     selector.register(stream, selectors.EVENT_READ)
     while time.monotonic() < deadline:
       for key, _ in selector.select(timeout=min(.2, max(0., deadline - time.monotonic()))):
-        chunk = os.read(key.fileobj.fileno(), 65536)
+        chunk = os.read(key.fd, 65536)
         if not chunk:
           return
         output.write(chunk)
@@ -54,7 +55,7 @@ def drain_pipe(stream, output, seconds=2.):
 def aggregate_metrics(reports):
   values = [report["campaign_metrics"] for report in reports]
   seconds = sum(value["environment_seconds"] for value in values)
-  result = {key: sum(value[key] for value in values) for key in
+  result: dict[str, Any] = {key: sum(value[key] for value in values) for key in
     ("environment_seconds", "failures", "episodes", "completed", "precision_success", "landing_events")}
   result["failures_per_minute"] = result["failures"] * 60 / seconds
   for key in ("landing_xy_median_cm", "landing_yaw_median_deg", "torso_tilt_p90_deg",
@@ -112,7 +113,7 @@ def prune_owned(root, protected, owned_runs, keep_latest=8):
 
 
 def resource_snapshot(gpu, root):
-  result = {"free_disk_gb": shutil.disk_usage(root).free / 1024**3}
+  result: dict[str, Any] = {"free_disk_gb": shutil.disk_usage(root).free / 1024**3}
   result["load_average"] = list(os.getloadavg())
   for line in Path("/proc/meminfo").read_text().splitlines():
     if line.startswith("MemAvailable:"):
@@ -128,6 +129,8 @@ def resource_snapshot(gpu, root):
 
 
 class Campaign:
+  state: dict[str, Any]
+
   def __init__(self, args):
     self.args = args
     self.root = args.root.resolve()
@@ -138,12 +141,13 @@ class Campaign:
     self.deadline = datetime.fromisoformat(args.deadline).timestamp()
     self.initial = args.checkpoint.resolve(strict=True)
     self.path = self.root / "state.json"
-    self.state = json.loads(self.path.read_text()) if self.path.exists() else None
+    loaded_state = json.loads(self.path.read_text()) if self.path.exists() else None
     identity = {"profile": args.profile, "gpu": args.gpu, "deadline": args.deadline,
       "initial_checkpoint": str(self.initial), "source": str(self.source)}
-    if self.state:
-      if any(self.state.get(key) != value for key, value in identity.items()):
+    if loaded_state:
+      if any(loaded_state.get(key) != value for key, value in identity.items()):
         raise ValueError("Campaign identity or deadline cannot change on restart")
+      self.state = loaded_state
     else:
       if not valid_checkpoint(self.initial):
         raise ValueError("Initial checkpoint is invalid")
@@ -157,7 +161,7 @@ class Campaign:
       signal.signal(signum, self.request_stop)
     self.persist()
 
-  def request_stop(self, signum, frame):
+  def request_stop(self, _signum, _frame):
     self.requested = True
 
   def persist(self, **fields):
@@ -218,7 +222,7 @@ class Campaign:
       with Path(self.state["active_log"]).open("ab", buffering=0) as output:
         while process.poll() is None and time.monotonic() < deadline:
           for key, _ in selector.select(timeout=1):
-            chunk = os.read(key.fileobj.fileno(), 65536)
+            chunk = os.read(key.fd, 65536)
             if chunk:
               output.write(chunk)
             else:
@@ -236,10 +240,12 @@ class Campaign:
       OMP_NUM_THREADS="1", MUJOCO_GL="egl", PYTHONUNBUFFERED="1", PYTHONPATH=str(self.source))
     process = subprocess.Popen(command, cwd=self.source, env=environment, stdin=subprocess.DEVNULL,
       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+    stdout = process.stdout
+    assert stdout is not None
     self.process = process
     self.persist(phase=phase, child_pid=process.pid, active_tag=tag, active_log=str(logfile))
     selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
+    selector.register(stdout, selectors.EVENT_READ)
     started = last_progress = time.monotonic()
     next_status = started
     next_patrol = started
@@ -250,7 +256,7 @@ class Campaign:
       with logfile.open("ab", buffering=0) as output:
         while process.poll() is None:
           for key, _ in selector.select(timeout=5):
-            chunk = os.read(key.fileobj.fileno(), 65536)
+            chunk = os.read(key.fd, 65536)
             if chunk:
               output.write(chunk)
             else:
@@ -260,6 +266,7 @@ class Campaign:
             records = self.run_records(tag) if tag else []
             if records:
               status = records[-1][1]
+              assert status is not None
               current = status.get("completed_updates", -1)
               if current != progress:
                 progress, last_progress = current, current_time
@@ -294,11 +301,11 @@ class Campaign:
             deadline_stop = self.stop_requested() or time.time() >= self.deadline
             self.stop_child(process)
             break
-        drain_pipe(process.stdout, output)
+        drain_pipe(stdout, output)
     finally:
       selector.close()
       self.stop_child(process)
-      process.stdout.close()
+      stdout.close()
       self.process = None
       self.persist(child_pid=None)
     if error:
@@ -418,9 +425,10 @@ class Campaign:
             if not finished:
               break
             records = self.run_records(tag)
-            if not records or records[-1][1].get("status") != "completed":
+            last_record = records[-1][1] if records else None
+            if not last_record or last_record.get("status") != "completed":
               raise RuntimeError("Training exited without a completed save")
-            final_path = Path(records[-1][1]["final_checkpoint"])
+            final_path = Path(last_record["final_checkpoint"])
             if final_path.parent != records[-1][0].parent or not valid_checkpoint(final_path):
               raise RuntimeError("Reported final checkpoint is missing, invalid or outside the owned run")
             candidate = final_path.resolve()

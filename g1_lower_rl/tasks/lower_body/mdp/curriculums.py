@@ -14,6 +14,7 @@ import os
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import torch
+from mjlab.managers.curriculum_manager import CurriculumManager
 
 from g1_lower_rl.tasks.lower_body.mdp.observations import height_above_feet
 
@@ -98,14 +99,17 @@ class _GatedStages:
   def _local_counts(
     self, env: ManagerBasedRlEnv, **params: Any
   ) -> tuple[torch.Tensor, torch.Tensor]:
+    del env, params
     raise NotImplementedError
 
   def _advance_from_global(
     self, env: ManagerBasedRlEnv, good: float, **params: Any
   ) -> None:
+    del env, good, params
     raise NotImplementedError
 
   def _apply_stage(self, env: ManagerBasedRlEnv, **params: Any) -> torch.Tensor:
+    del env, params
     raise NotImplementedError
 
   def _clamp_stage(self, stages: list) -> None:
@@ -146,12 +150,13 @@ class gated_event_params(_GatedStages):
   def _local_counts(
     self,
     env: ManagerBasedRlEnv,
-    event_name: str,
-    stages: list[EventStage],
-    log_key: str,
-    gate: dict[str, Any],
+    event_name: str = "",
+    stages: list[EventStage] = (),  # type: ignore[assignment]
+    log_key: str = "",
+    gate: dict[str, Any] = {},
+    **params: Any,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    del event_name, stages, log_key
+    del event_name, stages, log_key, params
     command = env.command_manager.get_command(gate["command_name"])
     assert command is not None
     robot = env.scene["robot"]
@@ -163,23 +168,25 @@ class gated_event_params(_GatedStages):
     self,
     env: ManagerBasedRlEnv,
     good: float,
-    event_name: str,
-    stages: list[EventStage],
-    log_key: str,
-    gate: dict[str, Any],
+    event_name: str = "",
+    stages: list[EventStage] = (),  # type: ignore[assignment]
+    log_key: str = "",
+    gate: dict[str, Any] = {},
+    **params: Any,
   ) -> None:
-    del log_key
+    del log_key, params
     self._advance(env, event_name, good, stages, gate)
 
   def _apply_stage(
     self,
     env: ManagerBasedRlEnv,
-    event_name: str,
-    stages: list[EventStage],
-    log_key: str,
-    gate: dict[str, Any],
+    event_name: str = "",
+    stages: list[EventStage] = (),  # type: ignore[assignment]
+    log_key: str = "",
+    gate: dict[str, Any] = {},
+    **params: Any,
   ) -> torch.Tensor:
-    del gate
+    del gate, params
     self._clamp_stage(stages)
     cfg = env.event_manager.get_term_cfg(event_name)
     cfg.params.update(stages[self._stage]["params"])
@@ -241,12 +248,13 @@ class tightening_height_std(_GatedStages):
   def _local_counts(
     self,
     env: ManagerBasedRlEnv,
-    term_name: str,
-    command_name: str,
-    stages: list[StdStage],
-    gate: dict[str, Any],
+    term_name: str = "",
+    command_name: str = "",
+    stages: list[StdStage] = (),  # type: ignore[assignment]
+    gate: dict[str, Any] = {},
+    **params: Any,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    del stages
+    del stages, params
     cfg = env.reward_manager.get_term_cfg(term_name)
     asset_cfg = cfg.params["asset_cfg"]
     asset = env.scene[asset_cfg.name]
@@ -259,23 +267,25 @@ class tightening_height_std(_GatedStages):
     self,
     env: ManagerBasedRlEnv,
     good: float,
-    term_name: str,
-    command_name: str,
-    stages: list[StdStage],
-    gate: dict[str, Any],
+    term_name: str = "",
+    command_name: str = "",
+    stages: list[StdStage] = (),  # type: ignore[assignment]
+    gate: dict[str, Any] = {},
+    **params: Any,
   ) -> None:
-    del command_name
+    del command_name, params
     self._advance(env, term_name, good, stages, gate)
 
   def _apply_stage(
     self,
     env: ManagerBasedRlEnv,
-    term_name: str,
-    command_name: str,
-    stages: list[StdStage],
-    gate: dict[str, Any],
+    term_name: str = "",
+    command_name: str = "",
+    stages: list[StdStage] = (),  # type: ignore[assignment]
+    gate: dict[str, Any] = {},
+    **params: Any,
   ) -> torch.Tensor:
-    del command_name, gate
+    del command_name, gate, params
     self._clamp_stage(stages)
     cfg = env.reward_manager.get_term_cfg(term_name)
     cfg.params["std"] = stages[self._stage]["std"]
@@ -311,6 +321,8 @@ def synchronize_distributed_curriculum(env: ManagerBasedRlEnv) -> None:
     return
 
   manager = env.curriculum_manager
+  if not isinstance(manager, CurriculumManager):
+    return
   entries: list[tuple[_GatedStages, Any]] = []
   reset_count = env.reset_buf.sum()
   rows = [

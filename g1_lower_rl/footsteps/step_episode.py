@@ -40,13 +40,14 @@ class StepEpisodeManager(TensorFootstepManager):
       self._put(name, mask, value)
 
   def _sample(self, previous, side, uniform):
+    del previous, uniform
     return self._choose(self.state["terminal_feet"], side)
 
   def _source_advance(self, uniform):
-    pass
+    del uniform
 
   def _apply_request(self, uniform):
-    pass
+    del uniform
 
   def _start(self, mask):
     state, cfg = self.state, self.cfg

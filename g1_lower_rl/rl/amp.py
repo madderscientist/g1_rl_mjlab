@@ -111,6 +111,10 @@ class MotionExpertSampler:
 class _RunningMeanStd(nn.Module):
   """判别器观测的在线标准化，策略侧与专家侧共用同一份统计量。"""
 
+  mean: torch.Tensor
+  var: torch.Tensor
+  count: torch.Tensor
+
   def __init__(self, dim: int, eps: float = 1e-4) -> None:
     super().__init__()
     self.register_buffer("mean", torch.zeros(dim))
@@ -218,7 +222,7 @@ class AmpPPO(PPO):
     self._replay = (s, sn)
 
   def _update_discriminator(self) -> None:
-    assert self.discriminator is not None and self._amp_optim is not None
+    assert self.discriminator is not None and self._amp_optim is not None and self.expert_sampler is not None
     d = self.discriminator
     ps = torch.cat([p[0] for p in self._amp_buf])
     pn = torch.cat([p[1] for p in self._amp_buf])
@@ -227,6 +231,7 @@ class AmpPPO(PPO):
 
     bs = min(ps.shape[0], 4096)
     bce = nn.BCEWithLogitsLoss()
+    d_expert = d_agent = gp = loss = torch.zeros((), device=ps.device)
     for _ in range(self.amp_epochs):
       i = torch.randperm(ps.shape[0], device=ps.device)[:bs]
       agent_s, agent_n = ps[i], pn[i]
@@ -251,7 +256,7 @@ class AmpPPO(PPO):
       grad = torch.autograd.grad(
         d_expert, [es, en], grad_outputs=torch.ones_like(d_expert), create_graph=True
       )
-      gp = sum(g.square().sum(dim=-1).mean() for g in grad)
+      gp = torch.stack([g.square().sum(dim=-1).mean() for g in grad]).sum()
       loss = loss + self.amp_grad_penalty * gp + self.amp_logit_reg * d.logits.weight.square().sum()
 
       self._amp_optim.zero_grad()

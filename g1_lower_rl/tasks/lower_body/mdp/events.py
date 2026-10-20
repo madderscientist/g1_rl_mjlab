@@ -219,7 +219,7 @@ class scaled_body_impulse(apply_body_impulse):
   只在“本拍刚触发”的环境上重写一次力，所以不会逐拍复利地把力缩到零。
   """
 
-  def __call__(self, env: ManagerBasedRlEnv, env_ids, **kwargs) -> None:
+  def __call__(self, env: ManagerBasedRlEnv, env_ids, **kwargs) -> None:  # type: ignore[override]
     was_active = self._active.clone()
     super().__call__(env, env_ids, **kwargs)
     triggered = (self._active & ~was_active).nonzero(as_tuple=False).flatten()
@@ -244,6 +244,7 @@ class hold_arm_pose:
   def __init__(self, cfg: EventTermCfg, env: ManagerBasedRlEnv):
     asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
     asset: Entity = env.scene[asset_cfg.name]
+    assert asset_cfg.joint_names is not None
     ids, names = asset.find_joints(asset_cfg.joint_names)
     self.joint_ids = torch.tensor(ids, device=env.device)
     ranges = cfg.params.get("ranges")
@@ -298,6 +299,7 @@ class hold_arm_pose:
     ramp = self
     if defer_during_ramp is not None:
       ramp_cfg = env.event_manager.get_term_cfg(defer_during_ramp)
+      assert isinstance(ramp_cfg.func, hold_arm_pose)
       ramp = ramp_cfg.func
       if interpolate and (ramp.ramp_duration_s <= 0
                           or ramp_cfg.params["asset_cfg"].name != asset_cfg.name
@@ -367,6 +369,7 @@ def advance_arm_pose(env: ManagerBasedRlEnv, env_ids=None, reset_event_name: str
   """在控制拍末更新下一拍手臂目标，不改实际关节状态或已完成的渐变"""
   del env_ids
   cfg = env.event_manager.get_term_cfg(reset_event_name)
+  assert isinstance(cfg.func, hold_arm_pose)
   cfg.func.advance(env, cfg.params["asset_cfg"])
 
 
@@ -380,6 +383,7 @@ class arm_torque_impulse:
   def __init__(self, cfg: EventTermCfg, env: ManagerBasedRlEnv):
     asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
     asset: Entity = env.scene[asset_cfg.name]
+    assert asset_cfg.joint_names is not None
     ids, _ = asset.find_joints(asset_cfg.joint_names)
     joint_ids = torch.tensor(ids, device=env.device)
     self.dof_ids = asset.data.indexing.joint_v_adr[joint_ids]

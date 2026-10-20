@@ -33,6 +33,7 @@ from g1_lower_rl.tasks import DEFAULT_TASK  # noqa: E402
 from g1_lower_rl.tasks.lower_body.cfg import max_out_curriculum  # noqa: E402
 from g1_lower_rl.tasks.lower_body.mdp import disturbance_level  # noqa: E402
 
+_ = g1_lower_rl.tasks
 TASK = DEFAULT_TASK
 COLS, ROWS = 3, 2
 NUM_ENVS = COLS * ROWS
@@ -125,6 +126,7 @@ def main() -> None:
   policy = runner.get_inference_policy(device=device)
 
   # 离屏渲染器持有的就是这个 ViewerConfig 实例，逐格改 env_idx 即可换视角。
+  assert raw_env._offline_renderer is not None
   view_cfg = raw_env._offline_renderer._cfg  # noqa: SLF001
 
   steps = int(seconds / raw_env.step_dt)
@@ -146,15 +148,20 @@ def main() -> None:
         reset_flash = np.maximum(reset_flash - 1, 0)
         continue
 
-      twist = raw_env.command_manager.get_command("twist").cpu().numpy()
-      height = raw_env.command_manager.get_command("height").cpu().numpy()
+      twist_cmd = raw_env.command_manager.get_command("twist")
+      height_cmd = raw_env.command_manager.get_command("height")
+      assert twist_cmd is not None and height_cmd is not None
+      twist = twist_cmd.cpu().numpy()
+      height = height_cmd.cpu().numpy()
       level = disturbance_level(raw_env).cpu().numpy()
       panels = []
       for i in range(NUM_ENVS):
         view_cfg.env_idx = i
+        rendered = raw_env.render()
+        assert rendered is not None
         panels.append(
           annotate(
-            raw_env.render(),
+            rendered,
             i,
             twist[i],
             float(height[i, 0]),
