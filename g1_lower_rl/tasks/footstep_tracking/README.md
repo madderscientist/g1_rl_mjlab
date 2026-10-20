@@ -133,7 +133,14 @@ OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python scripts/train_footst
 
 首次迁移设定新增第0轮；续训保留课程原点和进度。第四阶段仅由 `infos.theta_stage` 显式启用，默认任务不含theta。
 
-可在阶段元数据中显式加入 `standing_torso_upright: {"weight": -1.0}`，为连续走与单步任务同时增加静止torso线性倾角惩罚。设世界竖直倾角为 `alpha`（rad），新增奖励率为 `-alpha * (execution_frequency == 0)`；保留全时段原有 `-2 * alpha^2`，按控制步长积分。不增加角度死区、接触门控或完成条件，省略该字段时保持原行为。
+`infos.theta_stage` 还可按需显式启用以下附加奖励（省略对应字段时完全保持旧阶段配置，无角度死区、不替代腰关节控制，均按控制步长积分）：
+
+| 字段 | 作用域 | 奖励率公式 | 说明 |
+| --- | --- | --- | --- |
+| `standing_torso_upright` | 连续 + 单步，`f=0` | `w * alpha_torso * (f == 0)` | 静止torso相对世界竖直的线性倾角惩罚（rad），与全程 `-2 * alpha_torso^2` 叠加；不限制yaw |
+| `standing_pelvis_upright_linear` | 连续 + 单步，`f=0` | `w * alpha_pelvis * (f == 0)` | 静止骨盆相对世界竖直的线性倾角惩罚（rad），可与torso项独立或同时配置（如各配 `-20.0`） |
+| `standing_pelvis_feet_heading` | 连续 + 单步，`f=0` | `w * wrap(yaw_pelvis - mean_yaw_feet)^2 * (f == 0)` | 静止骨盆朝向实际左右脚yaw圆周均值的平方惩罚（rad，反向双脚退回左脚）；不跟随theta指令 |
+| `step_extra_contact` | 仅单步 | 见[单步额外触地说明](step_episode/README.md#可选额外触地惩罚) | 首次正常落脚后的重复离地再触地或支撑脚额外触地事件惩罚 |
 
 ## 续训与运行管理
 

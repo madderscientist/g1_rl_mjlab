@@ -9,8 +9,19 @@ from mjlab.managers.observation_manager import ObservationTermCfg
 from . import make_footstep_env_cfg
 from .commands import TorsoHeadingCommandCfg
 from .curriculum import FREQUENCY_RATE_STAGES, NUM_STEPS_PER_ENV, _select_stage, arm_target_scale, torso_heading_range
-from .rewards_cfg import make_standing_torso_upright_reward, make_torso_heading_reward
+from .rewards_cfg import (
+  make_standing_pelvis_heading_reward,
+  make_standing_pelvis_upright_reward,
+  make_standing_torso_upright_reward,
+  make_torso_heading_reward,
+)
 from .walking.curriculum import WALK_FIRST_STAGES, WALK_FIRST_YAW_STAGES
+
+_OPTIONAL_STANDING_REWARDS = (
+  ("standing_torso_upright", make_standing_torso_upright_reward),
+  ("standing_pelvis_upright_linear", make_standing_pelvis_upright_reward),
+  ("standing_pelvis_feet_heading", make_standing_pelvis_heading_reward),
+)
 
 
 def make_theta_stage_env_cfg(profile, theta_stage, rank, play=False, *, precision_stage=None):
@@ -44,9 +55,9 @@ def make_theta_stage_env_cfg(profile, theta_stage, rank, play=False, *, precisio
   cfg.rewards.pop("waist_yaw_zero")
   cfg.rewards.pop("standing_pelvis_upright", None)
   cfg.rewards["torso_feet_heading"] = make_torso_heading_reward(theta_stage.get("heading_reward_weight", -2.0))
-  if theta_stage.get("standing_torso_upright") is not None:
-    cfg.rewards["standing_torso_upright"] = make_standing_torso_upright_reward(
-      **theta_stage["standing_torso_upright"])
+  for name, factory in _OPTIONAL_STANDING_REWARDS:
+    if (reward_cfg := theta_stage.get(name)) is not None:
+      cfg.rewards[name] = factory(**reward_cfg)
   iteration = origin // NUM_STEPS_PER_ENV
   if profile == "precision":
     _, angle, distance, width, change = _select_stage(WALK_FIRST_STAGES, iteration)

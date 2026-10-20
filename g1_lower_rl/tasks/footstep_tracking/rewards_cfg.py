@@ -19,22 +19,45 @@ from g1_lower_rl.tasks.motion_tracking.mdp.terminations import with_probabilisti
 
 
 PROB_TERMINATION = 1.0 / (50.0 * 4.0)
+_FEET_SITES = ("left_foot", "right_foot")
+
+
+def _require_negative_weight(weight: float, label: str) -> float:
+  if not math.isfinite(weight) or weight >= 0:
+    raise ValueError(f"{label} weight must be finite and negative")
+  return weight
 
 
 def make_torso_heading_reward(weight: float = -2.0) -> RewardTermCfg:
-  if not math.isfinite(weight) or weight >= 0:
-    raise ValueError("Theta heading reward weight must be finite and negative")
-  return RewardTermCfg(func=rewards.torso_heading_error_l2, weight=weight, params={"asset_cfg": SceneEntityCfg(
-    "robot", body_names=("torso_link",), site_names=("left_foot", "right_foot"), preserve_order=True,
-  )})
+  return RewardTermCfg(
+    func=rewards.torso_heading_error_l2,
+    weight=_require_negative_weight(weight, "Theta heading reward"),
+    params={"asset_cfg": SceneEntityCfg("robot", body_names=("torso_link",), site_names=_FEET_SITES, preserve_order=True)},
+  )
+
+
+def _make_standing_upright_reward(body_name: str, weight: float, label: str) -> RewardTermCfg:
+  return RewardTermCfg(
+    func=rewards.standing_body_tilt_angle_l1,
+    weight=_require_negative_weight(weight, label),
+    params={"asset_cfg": SceneEntityCfg("robot", body_names=(body_name,))},
+  )
 
 
 def make_standing_torso_upright_reward(weight: float = -1.0) -> RewardTermCfg:
-  if not math.isfinite(weight) or weight >= 0:
-    raise ValueError("Standing torso upright weight must be finite and negative")
-  return RewardTermCfg(func=rewards.standing_body_tilt_angle_l1, weight=weight, params={
-    "asset_cfg": SceneEntityCfg("robot", body_names=("torso_link",)),
-  })
+  return _make_standing_upright_reward("torso_link", weight, "Standing torso upright")
+
+
+def make_standing_pelvis_upright_reward(weight: float = -1.0) -> RewardTermCfg:
+  return _make_standing_upright_reward("pelvis", weight, "Standing pelvis upright")
+
+
+def make_standing_pelvis_heading_reward(weight: float = -1.0) -> RewardTermCfg:
+  return RewardTermCfg(
+    func=rewards.standing_pelvis_heading_error_l2,
+    weight=_require_negative_weight(weight, "Standing pelvis heading"),
+    params={"asset_cfg": SceneEntityCfg("robot", body_names=("pelvis",), site_names=_FEET_SITES, preserve_order=True)},
+  )
 
 
 def make_rewards(

@@ -366,7 +366,7 @@ OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_mode
 
 规则、保持时长与完成判据见[单步说明](step_episode/README.md)。当前连续31项、单步34项；共同姿态和限位倍率不因任务切换改变。
 
-独立theta阶段以原150351为基线：移除 `waist_yaw_zero`，替换为 `torso_feet_heading`，权重-2.0、原始值 `wrap(actual_offset-theta)^2`，站立和行走均启用。不带入150351之后添加的 `standing_pelvis_upright`；其余奖励保持基线，因此连续30项、单步33项。此差异仅由显式阶段工厂应用，默认 `make_rewards` 不变。
+独立theta阶段以原150351为基线：移除 `waist_yaw_zero`，替换为 `torso_feet_heading`（默认权重-2.0，支持 `heading_reward_weight` 覆盖，原始值 `wrap(actual_offset-theta)^2`，站立和行走均启用）。不带入150351之后添加的 `standing_pelvis_upright`；其余奖励保持基线，基础配置下连续30项、单步33项。元数据还可按需显式附加静止姿态项（`standing_torso_upright`、`standing_pelvis_upright_linear`、`standing_pelvis_feet_heading`）及单步 `step_extra_contact`，详见[第四阶段说明](README.md#第四阶段theta迁移与训练)。此差异仅由显式阶段工厂应用，默认 `make_rewards` 不变。
 
 这是带权 RL 目标，而非保证不摔的约束优化或安全证明。以可达脚印下的落地精度和存活为主要目标，
 再降低能耗。能耗项过重可能导致不愿迈步，过轻则可能动作剧烈，需要结合实际训练调权。

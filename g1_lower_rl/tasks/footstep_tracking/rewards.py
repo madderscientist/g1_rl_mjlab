@@ -137,7 +137,7 @@ _compiled_torso_heading_cost = torch.compile(_torso_heading_cost, fullgraph=True
 
 
 def torso_heading_error(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-  """返回 torso 相对实际双脚圆周平均航向的偏角，反向双脚时以左脚为基准"""
+  """返回指定刚体相对实际双脚圆周平均航向的偏角，反向双脚时以左脚为基准"""
   data = env.scene[asset_cfg.name].data
   orientations = torch.cat((data.site_quat_w[:, asset_cfg.site_ids],
                             data.body_link_quat_w[:, asset_cfg.body_ids]), dim=1)
@@ -156,6 +156,16 @@ def torso_heading_error_l2(
   desired = env.command_manager.get_term(command_name).command[:, 0]
   cost = _compiled_torso_heading_cost if compile_backend and orientations.is_cuda else _torso_heading_cost
   return cost(orientations, desired)
+
+
+def standing_pelvis_heading_error_l2(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg,
+  command_name: str = "footsteps",
+) -> torch.Tensor:
+  """零执行步频时惩罚刚体相对双脚圆周平均航向的偏角平方"""
+  frequency = env.command_manager.get_term(command_name).reward_state.frequency
+  return torso_heading_error(env, asset_cfg).squeeze(-1).square() * (frequency == 0)
 
 
 def body_tilt_angle_l2(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -182,6 +192,7 @@ def standing_body_tilt_angle_l1(
   asset_cfg: SceneEntityCfg,
   command_name: str = "footsteps",
 ) -> torch.Tensor:
+  """零执行步频时惩罚相对竖直方向的线性倾角"""
   frequency = env.command_manager.get_term(command_name).reward_state.frequency
   return body_tilt_angle_l2(env, asset_cfg).sqrt() * (frequency == 0)
 
