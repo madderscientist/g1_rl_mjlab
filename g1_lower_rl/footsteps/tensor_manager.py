@@ -17,7 +17,6 @@ import torch
 from g1_lower_rl.footsteps.config import FootstepManagerCfg, RandomCommandCfg
 from g1_lower_rl.footsteps.tensor_math import TensorFootstepSampler, from_local, to_local, wrap
 
-
 WALKING, STARTING, STOPPING, STANDING, FAULT, SETTLING = range(6)
 
 
@@ -52,6 +51,7 @@ class TensorFootstepManager:
       ("first_side", (), torch.long), ("next_id", (), torch.long), ("anchor", (3,), torch.float64),
       ("pending_anchor", (), torch.long), ("contact_count", (), torch.long),
       ("terminal_feet", (2, 3), torch.float64), ("stop_target_id", (), torch.long),
+      ("stop_closing", (), torch.bool),
       ("stop_wait", (), torch.float64), ("start_progress", (), torch.float64),
       ("stop_phase", (), torch.float64), ("stop_ramp_start", (), torch.float64), ("stop_initial_frequency", (), torch.float64),
       # 随机源的意图与执行器的实际频率及模式分开保存
@@ -193,7 +193,7 @@ class TensorFootstepManager:
       ("mode", torch.where(standing, STANDING, WALKING)), ("elapsed", 0.0),
       ("supports", feet), ("targets", feet), ("target_ids", self.sides), ("next_id", torch.where(standing, 6, 2)),
       ("terminal_feet", feet), ("anchor", self._choose(feet, 1 - first_side)), ("pending_anchor", -1), ("contact_count", 0),
-      ("stop_target_id", -1), ("stop_wait", -1.0), ("start_progress", 0.0),
+      ("stop_target_id", -1), ("stop_closing", False), ("stop_wait", -1.0), ("start_progress", 0.0),
       ("stop_phase", 0.0), ("stop_ramp_start", 0.0), ("stop_initial_frequency", 0.0),
       ("rate", 0.0), ("rate_remaining", 0.0), ("restart_at", -1.0), ("failed", False),
       ("command_at", self.source_cfg.command_interval_s[0] + uniform[:, 2] * (self.source_cfg.command_interval_s[1] - self.source_cfg.command_interval_s[0])),
@@ -219,20 +219,25 @@ class TensorFootstepManager:
     """将行走意图转换为起停状态切换，不重置相位"""
     state, cfg = self.state, self.cfg
     stopping = ~state["request_walking"] & ((state["mode"] == WALKING) | (state["mode"] == STARTING))
-    # 保留队列中的四步，再让异侧脚在队尾落点旁完成收步
+    stop_closing = uniform[:, 0] < cfg.stop_closing_probability
+    self._put("stop_closing", stopping, stop_closing)
     last = state["queue"][:, -1]
     closing_side = state["first_side"]
     offsets = torch.stack((torch.zeros_like(state["phase"]), (1 - 2 * closing_side).to(state["phase"].dtype) * cfg.hold_width,
                            torch.zeros_like(state["phase"])), dim=-1)
     closing = from_local(offsets, last)
-    terminal = torch.where((self.sides[None, :] == closing_side[:, None])[:, :, None], closing[:, None], last[:, None])
+    selected = self.sides[None, :] == closing_side[:, None]
+    terminal = torch.where(selected[:, :, None], state["queue"][:, -2, None], last[:, None])
+    terminal = torch.where((selected & stop_closing[:, None])[:, :, None], closing[:, None], terminal)
     self._put("terminal_feet", stopping, terminal)
-    self._put("stop_target_id", stopping, state["next_id"])
+    self._put("stop_target_id", stopping, torch.where(stop_closing, state["next_id"], state["queue_ids"][:, -1]))
     self._put("stop_wait", stopping, -1.0)
-    center = self.centers[closing_side]
-    closing_touchdown = center + ((state["phase"] - center).div(2 * math.pi).floor() + 3) * (2 * math.pi)
-    # 在收步双支撑窗口内、再次抬脚前结束；线性减速的相位增量为同时间恒频的一半，因此提前 T/2 开始
-    stop_phase = closing_touchdown + 0.5 * cfg.phase.contact_half_width
+    first_center = self.centers[state["first_side"]]
+    first_touchdown = first_center + ((state["phase"] - first_center).div(2 * math.pi).floor() + 1) * (2 * math.pi)
+    # 第四步到异侧末脚，第五步回同侧；左右落地间隔不一定相等。
+    fourth_offset = 2 * math.pi + (self.centers[1 - closing_side] - first_center).remainder(2 * math.pi)
+    last_touchdown = first_touchdown + torch.where(stop_closing, 4 * math.pi, fourth_offset)
+    stop_phase = last_touchdown + 0.5 * cfg.phase.contact_half_width
     self._put("stop_phase", stopping, stop_phase)
     self._put("stop_initial_frequency", stopping, state["frequency"])
     self._put("stop_ramp_start", stopping, state["elapsed"] + (stop_phase - state["phase"]) / (2 * math.pi * state["frequency"].clamp_min(1e-12)) - 0.5 * cfg.stop_duration_s)
@@ -249,6 +254,7 @@ class TensorFootstepManager:
     self._put("start_progress", starting, min(cfg.control_dt / cfg.start_duration_s, 1.0))
     self._put("frequency", starting, state["request_frequency"] * state["start_progress"])
     self._put("stop_target_id", starting, -1)
+    self._put("stop_closing", starting, False)
     self._put("stop_wait", starting, -1.0)
     self._fill_queue(starting, first, distance < liftoff_distance, uniform[:, :12])
 

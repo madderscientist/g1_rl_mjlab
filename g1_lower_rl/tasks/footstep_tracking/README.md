@@ -138,9 +138,49 @@ OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python scripts/train_footst
 | 字段 | 作用域 | 奖励率公式 | 说明 |
 | --- | --- | --- | --- |
 | `standing_torso_upright` | 连续 + 单步，`f=0` | `w * alpha_torso * (f == 0)` | 静止torso相对世界竖直的线性倾角惩罚（rad），与全程 `-2 * alpha_torso^2` 叠加；不限制yaw |
-| `standing_pelvis_upright_linear` | 连续 + 单步，`f=0` | `w * alpha_pelvis * (f == 0)` | 静止骨盆相对世界竖直的线性倾角惩罚（rad），可与torso项独立或同时配置（如各配 `-20.0`） |
-| `standing_pelvis_feet_heading` | 连续 + 单步，`f=0` | `w * wrap(yaw_pelvis - mean_yaw_feet)^2 * (f == 0)` | 静止骨盆朝向实际左右脚yaw圆周均值的平方惩罚（rad，反向双脚退回左脚）；不跟随theta指令 |
+| `standing_pelvis_upright_linear` | 连续 + 单步，`f=0` | `w * alpha_pelvis * (f == 0)` | 静止骨盆相对世界竖直的线性倾角惩罚（rad），可与torso项独立或同时配置（如各配 `-10.0`） |
+| `standing_pelvis_feet_heading` | 连续 + 单步，`f=0` | 旧式 `w * e^2`；并列线性 `w * abs(e) * aligned`；实测法线 `w * abs(e_bisector)` | 默认参考实际双脚yaw圆周均值（反向双脚退回左脚）；显式 `reference="feet_bisector", linear=true` 改用实测双脚水平连线的前向法线，取消前后差门控；均不跟随theta |
+| `feet_contact_yaw_rate` | 连续 + 单步，所有步频 | `w * sum(contact * abs(omega_world_z)) / radians(yaw_rate_scale_deg_s)` | 实测触地脚绕世界竖直轴的转速绝对值，无死区；空中不罚，不直接限制抬跟/落掌的俯仰和横滚 |
 | `step_extra_contact` | 仅单步 | 见[单步额外触地说明](step_episode/README.md#可选额外触地惩罚) | 首次正常落脚后的重复离地再触地或支撑脚额外触地事件惩罚 |
+
+落脚精度可通过 `infos.theta_stage["landing_reward_weight"] = -0.5` 显式加强：
+连续走和单步的 `footstep_landing` 权重由默认 `-0.1` 改为 `-0.5`，省略字段的旧模型保持原值。
+保留5 cm位置尺度、0.2 rad航向尺度、渐入进度及离地后首次触地计分规则。
+这是每次落脚的事件代价，内部除以控制步长后由奖励管理器乘回，不是每秒持续扣分。
+
+行走触地平移可通过 `infos.theta_stage["linear_walking_slip_weight"] = -0.1` 显式改为线性：
+连续走和单步在 `f > 0` 时使用 `-0.1 * sum(contact * norm(v_xy))`，速度单位为 m/s；
+省略字段的历史模型仍为 `-2 * sum(contact * norm(v_xy)^2)`。两者在单脚5 cm/s时均扣0.005/秒，
+1 cm/s时则由0.0002/秒增强到0.001/秒。此项只罚实际触地脚的水平速度，不追踪绝对位置；
+静止平移和接触采样方式不变。
+
+两项均由训练、回放和导出共用的阶段工厂解析，不改变其余奖励。
+联合训练的 `initialization.json.reward_weights` 记录实际权重，`foot_slip` 另记录线性开关。
+更改需从完整存档建立新训练，不修改历史快照或运行中进程。
+
+上述三个 `standing_*` 阶段姿态项严格按刚执行拍的 `reward_state.frequency == 0` 门控；
+任意正执行步频（包括极小正数）时三项均为零，不按接触状态或步态相位代替该条件。
+原有全程姿态项和独立的触地转脚惩罚不受此门控影响。
+
+静止并列站姿模式使用 `linear=true`，默认 `standing_fore_aft_tolerance=0.05`。
+`aligned` 用奖励快照里的规划左右落点差，在规划航向轴上投影后取绝对值，≤5 cm启用；与双腿对称项共用投影计算。
+不按实测脚位判门控，避免挪脚规避惩罚；错步站立及 `f>0` 的行走均不启用此项。
+
+实测双脚垂直平分线模式配置为
+`standing_pelvis_feet_heading={"weight": -10.0, "linear": True, "reference": "feet_bisector"}`。
+设 `d = actual_left_xy - actual_right_xy`，候选前向为 `(d_y, -d_x)`，在两个相反法向中选与规划航向更接近的一侧；
+奖励率为 `w * abs(wrap(yaw_pelvis - yaw_reference)) * (f == 0)`（rad）。
+所有静止站姿均启用，包括前后错步，不再应用5 cm门控；基准随实测脚位变化，不使用脚自身yaw。
+若双脚水平距离≤1 µm，法线无定义，暂用规划航向，并通过 `Metrics/pelvis_bisector/fallback_fraction` 记录回退比例。
+旧检查点省略 `linear` 时保留原平方惩罚，省略 `reference` 时保留实际双脚yaw圆周均值参考。
+这些模式只更改静止骨盆偏航项，不改变torso的theta参考或双腿对称项。
+
+触地抗转动需另行显式配置
+`feet_contact_yaw_rate={"weight": -0.005, "yaw_rate_scale_deg_s": 1.0}`。
+接触使用 `feet_ground_contact.found > 0`，与行走擦地项一致，不要求先离地，也不设接触力门槛。
+世界系竖直轴角速度从足底site读取，按左右脚求和；行走及静止均启用，离地脚不计。
+上述权重下每只触地脚以1°/s转动时扣0.005/秒；停转后不追罚累计偏角。
+旧阶段省略该字段时不增加此项；示例权重不改变工厂默认值或历史模型行为。
 
 ## 续训与运行管理
 
@@ -180,6 +220,26 @@ OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python scripts/train_footst
 - **审计**：`initialization.json`核对模型与Adam恢复；`status_rank_*.json`看进度，`launch.json`看命令。TensorBoard与环境配置由rank0写入。
 - **源码快照**：不改写运行中或历史快照；换实现时另建快照并完整恢复。一个run目录只供一份训练写入。
 
+### 奖励失衡后的隔离恢复
+
+[恢复监督入口](../../../scripts/recover_footstep_joint.py)从指定的完整联合检查点另建实验，
+保留共享actor、两个critic、Adam动量和任务计数，仅显式替换奖励阶段元数据与学习率。
+默认候选将触地脚转速项权重从-1降到-0.005，学习率改为2e-6；不是全任务默认奖励变更，
+也不改历史检查点。连续50/50停步、单步70/30及actor/ONNX输入保持不变。
+
+转速项按1度/秒归一化：单只触地脚转动30度/秒时，权重-1产生-30的奖励率，
+不能按普通弧度单位的-1理解。它在行走时同样启用，必须先检查相对跟踪奖励的量级。
+
+监督每50次更新暂停训练，以固定种子的冻结策略分别评估混合停步、纯不并脚、纯并脚和单步。
+验收看落脚位置/朝向、失败、抬落脚事件、姿态和单步完成，不用总奖励上涨代替能力改善。
+精确完成使用成功回合占比而不是孤立计数，允许3个百分点波动，避免把6次降到5次误当作确定性退化；
+几何误差、失败和动作事件仍分别验收。
+退化候选保留但不晋升，并从最佳已评估状态降低学习率重试；连续三次退化停止。
+监督最长12小时，可在其输出目录创建`STOP`停止；状态和最佳路径写入`status.json`。
+显式`--resume`可在停止后恢复同一目录，不延长原截止时间，且记录源码修订和历史候选的门槛重评。
+评测入口按检查点theta阶段恢复79维观测、奖励和课程，旧78维模型保持原分支。
+训练源码变化会使监督明确停止，避免无人值守时混用实现。通过这些仿真门槛仍不代表真机安全。
+
 ## 策略接口
 
 | 接口 | 第一至第三阶段、可选单步预训练 | 第四阶段 |
@@ -197,6 +257,22 @@ Actor使用GRU(64)和MLP(256,256,128)，输出15轴位置增量；critic使用ML
 ### 指令与完成时序
 
 连续任务reset时站立/行走各50%，随机起脚侧。指令每3–8秒更新，停止概率30%，站立保持2–5秒；起停渐变各0.5秒，停脚需2拍双接触确认，超时0.5秒判故障。f为左右完整周期/s，f=0站立。单步时序见[单步场景规则](step_episode/README.md)。
+
+**连续任务每次有效停步事件50%不并脚、50%并脚**：两者都先执行请求时已承诺的四个落点。
+不并脚以第四步结束，各脚分别保持其最后计划落点的XY/yaw，允许前后错位及不同朝向；并脚追加异侧第五步后结束，间距仍为 `hold_width`。
+选择只在WALKING/STARTING首次进入STOPPING时抽一次，重复请求不重选、不改目标和停止时钟。
+两种方式均在实际末步的理论落地中心之后半个接触半宽处冻结，精确发布f=0，等待双接触而不补踩。
+
+实际配置位于共享 [env_cfg.py](env_cfg.py) 的 `FootstepManagerCfg(stop_closing_probability=0.5)`，
+由tracking、walk-first、precision和联合训练连续分支继承；profile替换采样器/步频或按theta阶段恢复时保留该字段。
+独立管理器默认1.0；在构建环境后用 `dataclasses.replace(command.manager, stop_closing_probability=0.0/1.0)` 可切换纯不并脚/纯并脚。
+单步任务仍为70%单脚一步、30%两脚收齐，起停、保持、完成规则及奖励均不受影响。
+
+续训入口重新构建当前profile，不从旧模型权重推断停步方式：旧检查点在新连续profile下运行会采用0.5，
+而独立反序列化缺少该字段的旧管理器配置仍默认1.0。
+单任务的 `launch.json.command_config` 和联合训练每个任务的 `initialization.json.command_config` 记录实际管理器/source配置。
+已有训练进程不会因源码修改而热切换；已有检查点也不会自动学会新停步方式，仍需评测并视结果续训。
+调度器单元测试只验证计划与时钟，不代表策略或真机已能稳定不补踩；actor、ONNX输入形状和奖励权重均未因此改变。
 
 奖励读完成拍目标，actor读下一拍next目标；reset后刷新实测脚位，普通换步和停走保持GRU状态。[TensorFootstepManager](../../footsteps/tensor_manager.py)在CUDA上默认编译，NumPy版本用于部署与Web预览。
 

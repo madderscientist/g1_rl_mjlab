@@ -8,18 +8,19 @@ from typing import TYPE_CHECKING
 
 import torch
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.utils.lab_api.math import quat_apply_inverse
+from mjlab.utils.lab_api.math import euler_xyz_from_quat, quat_apply_inverse
 
 from g1_lower_rl.assets import LOWER_BODY_JOINTS
 from g1_lower_rl.footstep_phase import FootstepPhaseCfg, resolve_phase_cfg
-from g1_lower_rl.tasks.lower_body.mdp import soft_landing as velocity_soft_landing
 from g1_lower_rl.tasks.footstep_tracking.reward_math import (
   footprint_accuracy_cost,
   joint_edge_cost,
   phase_windows,
+  stance_fore_aft_offset,
   swing_tracking_score,
   torque_square_cost,
 )
+from g1_lower_rl.tasks.lower_body.mdp import soft_landing as velocity_soft_landing
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -174,6 +175,50 @@ def standing_pelvis_heading_error_l2(
   """零执行步频时惩罚刚体相对双脚圆周平均航向的偏角平方"""
   frequency = _reward_state(env, command_name).frequency
   return torso_heading_error(env, asset_cfg).squeeze(-1).square() * (frequency == 0)
+
+
+def standing_pelvis_heading_error_l1(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg,
+  command_name: str = "footsteps",
+  standing_fore_aft_tolerance: float = 0.05,
+) -> torch.Tensor:
+  """零步频且规划双脚接近并列时，惩罚骨盆相对实际双脚平均朝向的绝对偏角"""
+  if not math.isfinite(standing_fore_aft_tolerance) or standing_fore_aft_tolerance <= 0:
+    raise ValueError("Standing fore-aft tolerance must be finite and positive")
+  state = _reward_state(env, command_name)
+  command = env.command_manager.get_term(command_name)
+  fore_aft = stance_fore_aft_offset(state.targets_w, command.symmetry_state["heading"])
+  # Compare in target precision: planning headings are float64, reward targets float32.
+  fore_aft = fore_aft.to(state.targets_w.dtype)
+  active = (state.frequency == 0) & (fore_aft.abs() <= standing_fore_aft_tolerance)
+  return torso_heading_error(env, asset_cfg).squeeze(-1).abs() * active
+
+
+def standing_pelvis_bisector_heading_error_l1(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg,
+  command_name: str = "footsteps",
+) -> torch.Tensor:
+  """零步频时惩罚骨盆相对实测双脚连线前向法线的绝对偏角"""
+  state = _reward_state(env, command_name)
+  command = env.command_manager.get_term(command_name)
+  data = env.scene[asset_cfg.name].data
+  feet = data.site_pos_w[:, asset_cfg.site_ids, :2]
+  displacement = feet[:, 0] - feet[:, 1]
+  heading = command.symmetry_state["heading"].to(feet.dtype)
+  normal_heading = torch.atan2(-displacement[:, 0], displacement[:, 1])
+  forward_projection = displacement[:, 1] * heading.cos() - displacement[:, 0] * heading.sin()
+  reference = torch.where(forward_projection < 0, normal_heading + math.pi, normal_heading)
+  valid = displacement.square().sum(-1) > 1e-12
+  reference = torch.where(valid, reference, heading)
+  _, _, yaw = euler_xyz_from_quat(data.body_link_quat_w[:, asset_cfg.body_ids].squeeze(1))
+  error = torch.remainder(yaw - reference + math.pi, 2 * math.pi) - math.pi
+  standing = state.frequency == 0
+  env.extras.setdefault("log", {})["Metrics/pelvis_bisector/fallback_fraction"] = (
+    (standing & ~valid).float().mean()
+  )
+  return error.abs() * standing
 
 
 def body_tilt_angle_l2(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -348,6 +393,23 @@ def feet_hold_position_cost(
   return cost * (state.frequency == 0)
 
 
+def feet_contact_yaw_rate_cost(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg,
+  sensor_name: str = "feet_ground_contact",
+  yaw_rate_scale_deg_s: float = 1.0,
+) -> torch.Tensor:
+  """实际触地时线性惩罚脚绕世界竖直轴的转速，行走和静止均无死区"""
+  if not math.isfinite(yaw_rate_scale_deg_s) or yaw_rate_scale_deg_s <= 0:
+    raise ValueError("Foot yaw-rate scale must be finite and positive")
+  data = env.scene[asset_cfg.name].data
+  yaw_rate = data.site_ang_vel_w[:, asset_cfg.site_ids, 2]
+  contact = env.scene[sensor_name].data.found > 0
+  if contact.shape != (env.num_envs, 2) or yaw_rate.shape != contact.shape:
+    raise ValueError("Foot contacts and selected sites must have matching [num_envs, 2] shapes")
+  return (yaw_rate.abs() * contact).sum(-1) / math.radians(yaw_rate_scale_deg_s)
+
+
 def feet_flatness_cost(
   env: ManagerBasedRlEnv,
   asset_cfg: SceneEntityCfg,
@@ -479,7 +541,7 @@ class FootstepReward:
     swing_progress_power: float = 2.0,
     landing_start_step: int | None = None,
     landing_ramp_steps: int = 1,
-    still_speed_deadband: float = 0.02,
+    slip_linear: bool = False,
   ) -> torch.Tensor:
     if component != self.component:
       raise ValueError("Reward component must match its construction config")
@@ -497,13 +559,12 @@ class FootstepReward:
       in_contact = sensor.current_contact_time > 0
       return (~in_contact).float().sum(-1) * ~moving
     if component == "slip_still":
-      if not math.isfinite(still_speed_deadband) or still_speed_deadband < 0:
-        raise ValueError("Standing speed deadband must be finite and nonnegative")
       speed = torch.linalg.vector_norm(data.site_lin_vel_w[:, asset_cfg.site_ids], dim=-1)
-      return (speed - still_speed_deadband).clamp_min(0.0).sum(-1) * ~moving
+      return speed.sum(-1) * ~moving
     if component == "slip":
       speed = torch.linalg.vector_norm(data.site_lin_vel_w[:, asset_cfg.site_ids, :2], dim=-1)
-      return (speed.square() * contact).sum(-1) * moving
+      cost = speed if slip_linear else speed.square()
+      return (cost * contact).sum(-1) * moving
     stance, swing_progress = phase_windows(state.phase, phase_cfg=timing)
     standing = state.frequency == 0
     stance = stance | standing.unsqueeze(-1)

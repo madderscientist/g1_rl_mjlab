@@ -134,6 +134,7 @@ class FootstepManager:
     self.pending_anchor_side = None
     self.contact_count = 0
     self.stop_target_id = None
+    self.stop_closing: bool | None = None
     self.stop_wait_started = None
     self.stop_phase = 0.0
     self.stop_ramp_start = 0.0
@@ -170,22 +171,29 @@ class FootstepManager:
     self.apply_request(replace(self.request, movement_direction=movement_direction, foot_heading=foot_heading))
 
   def request_stop(self) -> None:
-    """保留承诺四步，末段减速对齐收脚相位，再冻结并等待双接触确认"""
+    """每次有效停步选择是否追加并脚，保留四步并在实际末步之后冻结"""
     self._require_ready()
     self.request = replace(self.request, walking=False)
     if self.mode in ("stopping", "settling", "standing"):
       return
+    probability = self.cfg.stop_closing_probability
+    self.stop_closing = probability == 1.0 or (probability > 0.0 and self.sampler.rng.random() < probability)
     last = self.queue[-1]
-    self.terminal_feet = np.repeat(last.pose_w[None, :], 2, axis=0)
     closing_side = 1 - last.side
-    sign = 1 if closing_side == 0 else -1
-    self.terminal_feet[closing_side] = from_local([0.0, sign * self.cfg.hold_width, 0.0], last.pose_w)
-    # 首个新追加目标负责收步，已经发布的四步仍按原计划执行
-    self.stop_target_id = self.next_id
+    self.terminal_feet = np.empty_like(self.supports)
+    self.terminal_feet[last.side] = last.pose_w
+    self.terminal_feet[closing_side] = self.queue[-2].pose_w
+    if self.stop_closing:
+      self.terminal_feet[closing_side] = from_local([0.0, (1 - 2 * closing_side) * self.cfg.hold_width, 0.0], last.pose_w)
+    self.stop_target_id = self.next_id if self.stop_closing else last.target_id
     self.stop_wait_started = None
-    center = (self.cfg.phase.left_stance_phase, self.cfg.phase.right_stance_phase)[closing_side]
-    closing_touchdown = center + (math.floor((self.phase - center) / (2 * math.pi)) + 3) * (2 * math.pi)
-    self.stop_phase = closing_touchdown + 0.5 * self.cfg.phase.contact_half_width
+    centers = (self.cfg.phase.left_stance_phase, self.cfg.phase.right_stance_phase)
+    first_side = self.queue[0].side
+    first_center = centers[first_side]
+    first_touchdown = first_center + (math.floor((self.phase - first_center) / (2 * math.pi)) + 1) * (2 * math.pi)
+    fourth_offset = 2 * math.pi + (centers[last.side] - first_center) % (2 * math.pi)
+    last_touchdown = first_touchdown + (4 * math.pi if self.stop_closing else fourth_offset)
+    self.stop_phase = last_touchdown + 0.5 * self.cfg.phase.contact_half_width
     self.stop_initial_frequency = self.frequency
     self.stop_ramp_start = self.elapsed + (self.stop_phase - self.phase) / (2 * math.pi * self.frequency) - 0.5 * self.cfg.stop_duration_s
     self.mode = "stopping"
@@ -221,6 +229,7 @@ class FootstepManager:
     self.start_progress = min(self.cfg.control_dt / self.cfg.start_duration_s, 1.0)
     self.frequency = self.request.frequency * self.start_progress
     self.stop_target_id = None
+    self.stop_closing = None
     self.stop_wait_started = None
     # 若落地中心先于下一次起脚到来，必须保留原地目标而不是提前消费新步
     self._fill_queue(first_side, hold_first=touchdown_distance < liftoff_distance)
@@ -346,4 +355,9 @@ class FootstepManager:
     """恢复相同配置下已初始化的完整快照，拒绝配置不一致的状态"""
     if state.get("cfg") != self.cfg or not state.get("initialized"):
       raise ValueError("Manager checkpoint must be initialized and use the same configuration")
-    self.__dict__.update(copy.deepcopy(state))
+    restored = copy.deepcopy(state)
+    if "stop_closing" not in restored:
+      if self.cfg.stop_closing_probability != 1.0:
+        raise ValueError("Footstep checkpoint is missing stop_closing")
+      restored["stop_closing"] = True if restored.get("stop_target_id") is not None else None
+    self.__dict__.update(restored)

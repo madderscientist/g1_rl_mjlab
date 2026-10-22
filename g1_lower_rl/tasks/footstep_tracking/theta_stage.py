@@ -10,6 +10,8 @@ from . import make_footstep_env_cfg
 from .commands import FootstepCommandCfg, TorsoHeadingCommandCfg
 from .curriculum import FREQUENCY_RATE_STAGES, NUM_STEPS_PER_ENV, _select_stage, arm_target_scale, torso_heading_range
 from .rewards_cfg import (
+  _require_negative_weight,
+  make_feet_contact_yaw_rate_reward,
   make_standing_pelvis_heading_reward,
   make_standing_pelvis_upright_reward,
   make_standing_torso_upright_reward,
@@ -17,10 +19,11 @@ from .rewards_cfg import (
 )
 from .walking.curriculum import WALK_FIRST_STAGES, WALK_FIRST_YAW_STAGES
 
-_OPTIONAL_STANDING_REWARDS = (
+_OPTIONAL_REWARDS = (
   ("standing_torso_upright", make_standing_torso_upright_reward),
   ("standing_pelvis_upright_linear", make_standing_pelvis_upright_reward),
   ("standing_pelvis_feet_heading", make_standing_pelvis_heading_reward),
+  ("feet_contact_yaw_rate", make_feet_contact_yaw_rate_reward),
 )
 
 
@@ -33,6 +36,11 @@ def make_theta_stage_env_cfg(profile, theta_stage, rank, play=False, *, precisio
   cfg = make_footstep_env_cfg(profile, play=play, precision_stage=precision_stage)
   if theta_stage.get("step_landing_stability") is not None:
     raise ValueError("Landing stability stage was withdrawn; use a pre-stage checkpoint")
+  if (landing_weight := theta_stage.get("landing_reward_weight")) is not None:
+    cfg.rewards["footstep_landing"].weight = _require_negative_weight(landing_weight, "Landing accuracy")
+  if (slip_weight := theta_stage.get("linear_walking_slip_weight")) is not None:
+    cfg.rewards["foot_slip"].weight = _require_negative_weight(slip_weight, "Linear walking slip")
+    cfg.rewards["foot_slip"].params["slip_linear"] = True
   if profile == "step-episode" and theta_stage.get("step_extra_contact") is not None:
     from .step_episode.env_cfg import configure_extra_contacts
 
@@ -55,7 +63,7 @@ def make_theta_stage_env_cfg(profile, theta_stage, rank, play=False, *, precisio
   cfg.rewards.pop("waist_yaw_zero")
   cfg.rewards.pop("standing_pelvis_upright", None)
   cfg.rewards["torso_feet_heading"] = make_torso_heading_reward(theta_stage.get("heading_reward_weight", -2.0))
-  for name, factory in _OPTIONAL_STANDING_REWARDS:
+  for name, factory in _OPTIONAL_REWARDS:
     if (reward_cfg := theta_stage.get(name)) is not None:
       cfg.rewards[name] = factory(**reward_cfg)
   iteration = origin // NUM_STEPS_PER_ENV

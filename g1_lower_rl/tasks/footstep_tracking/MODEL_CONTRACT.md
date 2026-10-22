@@ -332,9 +332,9 @@ OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_mode
 | `swing_clearance` | -0.5 | 双脚计划足高绝对误差除以0.11m后求和；摆动峰值0.11m，支撑及停脚为0 |
 | `swing_contact` | -0.5 | 计划摆动脚实际触地的sin平方相位加权代价；起落边界为0、中点为1 |
 | `foot_slip` | -2.0 | 实际触地脚的 XY 速度平方和，f>0启用 |
-| `feet_slip_still` | -1.0 | 双脚世界系XYZ速度模长超过0.02m/s的部分求和，包含离地脚，f=0启用 |
+| `feet_slip_still` | -1.0 | 双脚世界系XYZ速度模长直接求和，无死区，包含离地脚，f=0启用 |
 | `stand_still_feet` | -0.5 | 未接触脚数，f=0启用 |
-| `feet_hold_position` | -0.2 | 仅f=0，双脚相对冻结停脚目标的XY距离超过3cm部分按10cm归一化平方后取平均 |
+| `feet_hold_position` | -0.2 | 仅f=0，双脚相对冻结停脚目标的XY距离按10cm归一化平方后取平均；连续场景先扣除3cm死区，单步场景无死区 |
 | `feet_flatness` | -0.2 | 计划支撑或实测接触脚的法向倾角，按15°归一化平方后按脚平均；f=0约束双脚 |
 | `soft_landing` | -0.002 | 首次触地接触力模长惩罚，f>0启用，持续支撑不收费 |
 | `lower_body_copper_proxy` | -0.25（基础） | 15个受控腿腰执行器的实际力矩统一尺度平方和；f=0乘2，有效权重-0.5 |
@@ -364,9 +364,20 @@ OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_mode
 | `standing_joint_velocity` | -0.2 | 零步频时15轴速度平方均值，原始值封顶4，0.3秒渐入 |
 | `standing_action_change` | -0.04 | 零步频时动作差分平方和，原始值封顶25，0.3秒渐入；与全程-0.02项叠加 |
 
-规则、保持时长与完成判据见[单步说明](step_episode/README.md)。当前连续31项、单步34项；共同姿态和限位倍率不因任务切换改变。
+规则、保持时长与完成判据见[单步说明](step_episode/README.md)。奖励项数量取决于精度阶段及显式附加配置，以实际 `cfg.rewards` 为准；共同姿态和限位倍率不因任务切换改变。
 
-独立theta阶段以原150351为基线：移除 `waist_yaw_zero`，替换为 `torso_feet_heading`（默认权重-2.0，支持 `heading_reward_weight` 覆盖，原始值 `wrap(actual_offset-theta)^2`，站立和行走均启用）。不带入150351之后添加的 `standing_pelvis_upright`；其余奖励保持基线，基础配置下连续30项、单步33项。元数据还可按需显式附加静止姿态项（`standing_torso_upright`、`standing_pelvis_upright_linear`、`standing_pelvis_feet_heading`）及单步 `step_extra_contact`，详见[第四阶段说明](README.md#第四阶段theta迁移与训练)。此差异仅由显式阶段工厂应用，默认 `make_rewards` 不变。
+独立theta阶段以原150351为基线：移除 `waist_yaw_zero`，替换为 `torso_feet_heading`（默认权重-2.0，支持 `heading_reward_weight` 覆盖，原始值 `wrap(actual_offset-theta)^2`，站立和行走均启用）。不带入150351之后添加的 `standing_pelvis_upright`，其余奖励保持基线。元数据可显式附加三个静止姿态项（`standing_torso_upright`、`standing_pelvis_upright_linear`、`standing_pelvis_feet_heading`）及单步 `step_extra_contact`。骨盆偏航仅在 `linear=true` 时切换为绝对角度惩罚；旧参考的线性模式按规划双脚前后差≤`standing_fore_aft_tolerance`（默认5 cm）门控，旧元数据仍保持原平方惩罚。详见[第四阶段说明](README.md#第四阶段theta迁移与训练)。所有覆盖仅由显式阶段工厂应用，默认 `make_rewards` 不变。
+
+静止骨盆偏航可进一步显式指定 `linear=true, reference="feet_bisector"`，基准改为实测左右脚水平连线的法向，选取更接近规划航向的一侧，所有 `f=0` 站姿均启用，不再应用5 cm前后差门控。水平脚距≤1 µm时使用规划航向并记录回退比例；torso的theta参考及其他奖励不变。旧检查点省略 `reference` 时保留原定义。
+
+三个阶段附加姿态项（静止torso竖直、静止pelvis竖直和静止pelvis偏航）均严格使用奖励快照的 `frequency == 0` 门控；任何正执行步频时为零，不包含原有全程姿态项或触地转脚项。
+
+阶段可显式配置 `feet_contact_yaw_rate={"weight": -0.005, "yaw_rate_scale_deg_s": 1.0}`：
+奖励率为 `weight * sum_feet((found > 0) * abs(foot_angular_velocity_world_z)) / radians(yaw_rate_scale_deg_s)`。
+只罚实测触地脚的世界竖直轴角速度，初始支撑、落地后、行走及静止均启用，无死区，离地脚不罚；
+不直接惩罚横滚/俯仰角速度，也不记录相对落地瞬间的累计偏角。
+上述权重下，一只脚以1°/s转动时为-0.005/s，两只脚相加，再由奖励管理器乘控制步长。
+省略字段的旧检查点和默认任务不新增该项；示例可搭配实测双脚法线骨盆偏航权重-10，两项独立配置，均不改变工厂默认值。
 
 这是带权 RL 目标，而非保证不摔的约束优化或安全证明。以可达脚印下的落地精度和存活为主要目标，
 再降低能耗。能耗项过重可能导致不愿迈步，过轻则可能动作剧烈，需要结合实际训练调权。
@@ -412,12 +423,12 @@ reward_landing_per_step = -0.1 * landing_ramp * raw_landing * step_dt
 P_hold = 1 / (1 + mean(d_left^2, d_right^2) / 0.10^2)
 stand_still_linear_velocity = 2.0 * exp(-(vx^2 + vy^2 + 1.5*vz^2) / 0.2) * P_hold * (f == 0)
 stand_still_angular_velocity = 0.5 * exp(-(wz^2 + 0.05*(wx^2 + wy^2)) / 0.49) * P_hold * (f == 0)
-feet_slip_still = -sum_feet(max(norm(foot_velocity_world_xyz) - 0.02, 0)) * (f == 0)
+feet_slip_still = -sum_feet(norm(foot_velocity_world_xyz)) * (f == 0)
 ```
 
 门控使用本拍冻结执行频率，精确f=0（包括settling）启用，任意正频率关闭。
 双脚在目标处且身体静止时正奖励满分，双脚均偏离10cm时减半、30cm时剩10%；不依赖实际接触，不改变冻结目标。
-脚速代价覆盖触地和离地运动，保留0.02m/s容差。两项均为连续奖励率；当前参数需通过站立漂移和再起步测试验证，已有冻结训练保持其原配置。
+脚速代价覆盖触地和离地运动，不设速度死区，任意非零速度均产生代价。上述项均为连续奖励率；当前参数需通过站立漂移和再起步测试验证。修改奖励不会改变历史冻结策略的动作，运行中的训练进程需重启后才会采用新计算。
 
 两只脚的 yaw 均为 `left_foot/right_foot` site 的世界 yaw，使用 wxyz 四元数转换，并将角差 wrap。
 默认单脚支撑占一个完整周期的 0.6，摆动占 0.4，总双支撑占 0.2；
@@ -632,10 +643,18 @@ OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python -m pytest -q \
   行走组直接使用抽取的正频率，从随机选中脚的抬脚边界开始，默认左脚288°或右脚108°，不经过等待及起步斜坡
   两组都独立随机选择左右起脚，队头、当前执行目标和参考脚与相位一致；站立组90°后右脚先抬、270°后左脚先抬
   局部重置只重采样所选环境，不改物理初始姿态或速度；命令为行走不代表已处于稳定行走状态，f=0也不保证已经站稳
-2. 保留已经承诺的四步，在远端补可站立的终止脚印。选择完成必要收步后的双支撑窗口，
-  当前实现先执行原四步，再补一个与远端末脚对齐的收步，随后重复双脚终止目标。
+2. 每次从WALKING/STARTING首次进入STOPPING时，按 `stop_closing_probability` 独立选择停止方式。
+  连续训练共享配置为0.5，即50%不并脚、50%并脚；两种方式都完整保留原四步位姿和编号，包括正在摆动的目标。
+  并脚时追加异侧第五步，沿用 `hold_width` 的几何规则；不并脚以原第四步为末步，
+  各脚分别保持原四步中该脚最后计划落点的XY/yaw，允许前后错位及不同yaw，不用实测脚位替换。
+  后续队列只重复各脚终止目标；`stop_target_id` 指向本次实际末步。
+  STOPPING/SETTLING期间重复停止或收到行走意图均不重新抽样、不改停止目标和时钟。
+  独立管理器及缺字段的旧配置默认1.0；配置0.0/1.0可固定不并脚/并脚。
+  单步任务独立的70%单脚一步、30%两脚收齐分布不变，不新增actor输入或修改ONNX形状。
 3. STOPPING 前段保持请求时的频率，末段用 `stop_duration_s=0.5` 线性减速至零。
-  终点取最后收脚的理论落地中心之后半个双支撑半宽，保证已经消费收脚目标、但尚未进入下一次起脚。
+  从队头下一落地开始，按左右实际相位中心和队列时序累计四步或五步，支持非默认、非对称相位；
+  终点取本次实际末步的理论落地中心之后半个接触半宽，保证已经消费末步目标、但尚未进入下一次起脚。
+  默认冻结相位仍为99度或279度；不并脚对应第四步，而非额外第五步。
   连续线性减速的相位积分为 `pi*f_start*stop_duration_s`，据此安排开始减速的时刻；每拍发布该拍的平均频率，
   精确积分包含减速起止边界的控制拍，并在终拍锁定停止相位，避免离散步长越过窗口。
   已删除旧 `stop_deceleration`、`stop_frequency_floor` 参数；停步时长仍包含承诺四步与必要收步，不是立即停车。
@@ -649,6 +668,8 @@ OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python -m pytest -q \
   例如目标1.6667Hz，首拍约0.0667Hz、之后每拍增加约0.0667Hz；不再使用固定 `start_acceleration`。
 
 `stop_probability=0.30` 已由独立模块读取执行，不是每个控制拍的概率；站立后仍保持2–5s并自动再起步。
+停止方式选择及相应目标/时钟纳入管理器快照和reset；完整恢复不能只保存对外command。
+旧策略不会随调度代码改变自动获得不并脚停止能力，须评测并视结果续训；计划冻结不保证物理上不补踩。
 现有 lower_body 速度跟踪任务在观测与步态奖励中使用完整左右周期 `period=0.6 s`，
 对应本契约 `f=1/0.6=1.6667 Hz`，左右合计 `2*f=3.3333 步/秒`（200 步/分钟）。
 这是起步后的目标节拍，不是重置时实际频率或已测得的落地频率。默认重置 f=0，正常行走慢变范围为0.8-1.8Hz，

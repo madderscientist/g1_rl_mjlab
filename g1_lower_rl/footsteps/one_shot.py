@@ -1,11 +1,11 @@
 """单环境预览用的一次或两次落脚计划"""
 
-from dataclasses import replace
 import math
+from dataclasses import replace
 
 import torch
 
-from g1_lower_rl.footsteps.tensor_manager import TensorFootstepManager, STARTING, WALKING, STOPPING, STANDING
+from g1_lower_rl.footsteps.tensor_manager import STANDING, STARTING, STOPPING, WALKING, TensorFootstepManager
 
 
 class OneShotFootstepManager(TensorFootstepManager):
@@ -99,6 +99,7 @@ class OneShotFootstepManager(TensorFootstepManager):
     state["anchor"].copy_(feet[:, 1 - first_side])
     state["pending_anchor"].fill_(-1)
     state["stop_target_id"].fill_(next_id + int(close_stance))
+    state["stop_closing"].fill_(close_stance)
     state["stop_phase"].fill_(stop_phase)
     state["stop_ramp_start"].fill_(self.motion_start + self.cfg.start_duration_s + cruise)
     state["stop_initial_frequency"].fill_(frequency)

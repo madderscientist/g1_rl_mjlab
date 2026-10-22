@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
-from datetime import datetime
 import hashlib
 import json
 import logging
 import math
 import os
-from pathlib import Path
 import subprocess
 import sys
 import threading
+from dataclasses import asdict, replace
+from datetime import datetime
+from pathlib import Path
 from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,14 +22,13 @@ sys.path.insert(0, str(ROOT))
 import torch
 import torch.distributed as distributed
 import torchrunx
+import train
 from mjlab.rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from rsl_rl.algorithms import PPO
 from torch.multiprocessing.spawn import spawn
+from train_footstep_resume import FootstepResumeRunner, assert_same_state, restore_fixed_exploration, write_json
 
 from g1_lower_rl.footstep_contract import ENCODED_OBS_DIM, RAW_OBS_DIM
-
-import train
-from train_footstep_resume import FootstepResumeRunner, assert_same_state, restore_fixed_exploration, write_json
 
 
 def validate_task_weights(weights):
@@ -230,11 +229,18 @@ class JointRunner(FootstepResumeRunner):
     infos = walking.get("infos") or {}
     self.alg.joint_stage = infos.get("precision_stage", {})
     self.alg.joint_theta_stage = infos.get("theta_stage")
+    from g1_lower_rl.tasks.footstep_tracking.commands import FootstepCommand
     from g1_lower_rl.tasks.footstep_tracking.initialization import RandomizeFootstepInitialization
 
     initialization = self.env.unwrapped.event_manager.get_term_cfg("reset_initialization")
     if not isinstance(initialization.func, RandomizeFootstepInitialization):
       raise TypeError("Joint training requires mixed footstep initialization")
+    reward_manager = self.env.unwrapped.reward_manager
+    hold = reward_manager.get_term_cfg("feet_hold_position")
+    slip = reward_manager.get_term_cfg("foot_slip")
+    footsteps = self.env.unwrapped.command_manager.get_term("footsteps")
+    if not isinstance(footsteps, FootstepCommand):
+      raise TypeError("Joint training requires a footstep command")
     receipt = {"rank": self.gpu_global_rank, "actor_checkpoint": str(path),
       "critic_checkpoint": str(path) if self.gpu_global_rank == 0 else step_path,
       "actor_mean_exact": True, "critic_exact": True, "optimizer_reset": not joint_resume,
@@ -245,6 +251,11 @@ class JointRunner(FootstepResumeRunner):
       "link_mass_scale_range": list(self.env.unwrapped.event_manager.get_term_cfg("link_mass").params["scale_range"]),
       "reset_initialization": initialization.params,
       "initialization_mode_counts": torch.bincount(initialization.func.modes, minlength=3).cpu().tolist(),
+      "feet_hold_position": {"weight": hold.weight, "deadband": hold.params["deadband"],
+        "distance_scale": hold.params["distance_scale"]},
+      "foot_slip": {"weight": slip.weight, "linear": slip.params.get("slip_linear", False)},
+      "command_config": {"manager": asdict(footsteps.cfg.manager), "source": asdict(footsteps.cfg.source)},
+      "reward_weights": {name: reward_manager.get_term_cfg(name).weight for name in reward_manager.active_terms},
       "theta_stage": self.alg.joint_theta_stage, "actor_raw_obs_dim": actor.raw_obs_dim}
     write_json(self.task_log_dir / "initialization.json", receipt)
     print("JOINT_INITIALIZATION " + json.dumps(receipt), flush=True)
@@ -252,7 +263,6 @@ class JointRunner(FootstepResumeRunner):
 
   def save(self, path, infos=None):
     del path, infos
-    return None
 
   def learn(self, num_learning_iterations, init_at_random_ep_len=False):
     del init_at_random_ep_len
@@ -286,8 +296,8 @@ def worker(args, run_dir):
   stage_config = (saved.get("infos") or {}).get("precision_stage", {}) if rank == 0 else None
   theta_stage = (saved.get("infos") or {}).get("theta_stage")
   if theta_stage is not None:
-    from g1_lower_rl.tasks.footstep_tracking.theta_stage import make_theta_stage_env_cfg
     from g1_lower_rl.rl.footstep_model import FootstepModelCfg
+    from g1_lower_rl.tasks.footstep_tracking.theta_stage import make_theta_stage_env_cfg
 
     env_cfg = make_theta_stage_env_cfg(profile, theta_stage, rank, precision_stage=stage_config)
     agent.actor = FootstepModelCfg()

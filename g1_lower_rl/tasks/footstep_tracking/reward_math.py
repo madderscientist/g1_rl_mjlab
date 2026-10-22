@@ -10,6 +10,11 @@ import torch
 from g1_lower_rl.footstep_phase import FootstepPhaseCfg, resolve_phase_cfg
 
 
+def stance_fore_aft_offset(targets_w: torch.Tensor, heading: torch.Tensor) -> torch.Tensor:
+  displacement = targets_w[:, 0, :2] - targets_w[:, 1, :2]
+  return displacement[:, 0] * heading.cos() + displacement[:, 1] * heading.sin()
+
+
 @lru_cache(maxsize=32)
 def _phase_constants(cfg: FootstepPhaseCfg, device: torch.device, dtype: torch.dtype):
   with torch.inference_mode(False):

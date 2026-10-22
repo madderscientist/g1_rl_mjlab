@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -16,7 +17,6 @@ from g1_lower_rl.tasks.footstep_tracking.terminations import footstep_distance_e
 from g1_lower_rl.tasks.lower_body import mdp
 from g1_lower_rl.tasks.lower_body.cfg.terminations import make_terminations as lower_body_terminations
 from g1_lower_rl.tasks.motion_tracking.mdp.terminations import with_probabilistic_termination
-
 
 PROB_TERMINATION = 1.0 / (50.0 * 4.0)
 _FEET_SITES = ("left_foot", "right_foot")
@@ -52,11 +52,43 @@ def make_standing_pelvis_upright_reward(weight: float = -1.0) -> RewardTermCfg:
   return _make_standing_upright_reward("pelvis", weight, "Standing pelvis upright")
 
 
-def make_standing_pelvis_heading_reward(weight: float = -1.0) -> RewardTermCfg:
+def make_standing_pelvis_heading_reward(
+  weight: float = -1.0, *, linear: bool = False, standing_fore_aft_tolerance: float = 0.05,
+  reference: Literal["feet_yaw", "feet_bisector"] = "feet_yaw",
+) -> RewardTermCfg:
+  if reference not in ("feet_yaw", "feet_bisector"):
+    raise ValueError("Standing pelvis heading reference must be feet_yaw or feet_bisector")
+  if reference == "feet_bisector" and not linear:
+    raise ValueError("Feet-bisector heading requires linear=True")
+  if not math.isfinite(standing_fore_aft_tolerance) or standing_fore_aft_tolerance <= 0:
+    raise ValueError("Standing fore-aft tolerance must be finite and positive")
+  func = rewards.standing_pelvis_heading_error_l2
+  if linear:
+    func = (rewards.standing_pelvis_bisector_heading_error_l1 if reference == "feet_bisector"
+      else rewards.standing_pelvis_heading_error_l1)
   return RewardTermCfg(
-    func=rewards.standing_pelvis_heading_error_l2,
+    func=func,
     weight=_require_negative_weight(weight, "Standing pelvis heading"),
-    params={"asset_cfg": SceneEntityCfg("robot", body_names=("pelvis",), site_names=_FEET_SITES, preserve_order=True)},
+    params={
+      "asset_cfg": SceneEntityCfg("robot", body_names=("pelvis",), site_names=_FEET_SITES, preserve_order=True),
+      **({"standing_fore_aft_tolerance": standing_fore_aft_tolerance} if linear and reference == "feet_yaw" else {}),
+    },
+  )
+
+
+def make_feet_contact_yaw_rate_reward(
+  weight: float = -1.0, *, yaw_rate_scale_deg_s: float = 1.0,
+) -> RewardTermCfg:
+  if not math.isfinite(yaw_rate_scale_deg_s) or yaw_rate_scale_deg_s <= 0:
+    raise ValueError("Foot yaw-rate scale must be finite and positive")
+  return RewardTermCfg(
+    func=rewards.feet_contact_yaw_rate_cost,
+    weight=_require_negative_weight(weight, "Foot contact yaw rate"),
+    params={
+      "asset_cfg": SceneEntityCfg("robot", site_names=_FEET_SITES, preserve_order=True),
+      "sensor_name": "feet_ground_contact",
+      "yaw_rate_scale_deg_s": yaw_rate_scale_deg_s,
+    },
   )
 
 
@@ -103,7 +135,6 @@ def make_rewards(
       ("stand_still_feet", "stationary", -0.5),
     )
   }
-  terms["feet_slip_still"].params["still_speed_deadband"] = 0.02
   terms.update(
     {
       "stand_still_linear_velocity": RewardTermCfg(

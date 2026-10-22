@@ -12,9 +12,14 @@ from mjlab.utils.lab_api.math import quat_apply_inverse
 from mjlab.utils.noise import NoiseModelWithAdditiveBiasCfg
 
 from g1_lower_rl.assets import WHOLE_BODY_JOINTS
-from g1_lower_rl.footsteps import RandomCommandCfg
+from g1_lower_rl.footsteps import FootstepManagerCfg, RandomCommandCfg
 from g1_lower_rl.tasks.footstep_tracking.commands import FootstepCommandCfg, footstep_execution_failed
-from g1_lower_rl.tasks.footstep_tracking.curriculum import DIRECTION_CHANGE_STAGES, FREQUENCY_RATE_STAGES, arm_target_scale, make_curriculum
+from g1_lower_rl.tasks.footstep_tracking.curriculum import (
+  DIRECTION_CHANGE_STAGES,
+  FREQUENCY_RATE_STAGES,
+  arm_target_scale,
+  make_curriculum,
+)
 from g1_lower_rl.tasks.footstep_tracking.initialization import RandomizeFootstepInitialization
 from g1_lower_rl.tasks.footstep_tracking.numerical_safety import NumericalSafety
 from g1_lower_rl.tasks.footstep_tracking.rewards_cfg import make_rewards, make_terminations
@@ -61,7 +66,8 @@ def footstep_env_cfg(play: bool = False):
   cfg.decimation = 8
   cfg.sim.njmax = 1024
   cfg.scene.num_envs = 1 if play else 64
-  footstep_command = FootstepCommandCfg(debug_vis=play, source=RandomCommandCfg(
+  footstep_command = FootstepCommandCfg(debug_vis=play,
+    manager=FootstepManagerCfg(stop_closing_probability=0.5), source=RandomCommandCfg(
     initial_frequency=None, initial_standing_probability=0.5,
     direction_change_range=DIRECTION_CHANGE_STAGES[0][1],
     frequency_rate_range=FREQUENCY_RATE_STAGES[0][1],

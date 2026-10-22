@@ -4,7 +4,7 @@ import math
 
 import torch
 
-from g1_lower_rl.footsteps.tensor_manager import TensorFootstepManager, STARTING, WALKING, STOPPING, STANDING
+from g1_lower_rl.footsteps.tensor_manager import STANDING, STARTING, STOPPING, WALKING, TensorFootstepManager
 
 
 class StepEpisodeManager(TensorFootstepManager):
@@ -76,7 +76,8 @@ class StepEpisodeManager(TensorFootstepManager):
       ("terminal_feet", terminal), ("queue", terminal.gather(1, queue_sides[:, :, None].expand(-1, -1, 3))),
       ("queue_ids", next_id[:, None] + torch.arange(4, device=self.device)), ("next_id", next_id + 4),
       ("first_side", side), ("phase", start_phase), ("anchor", support), ("pending_anchor", -1),
-      ("stop_target_id", next_id + state["episode_aligned"].long()), ("stop_phase", stop_phase),
+      ("stop_target_id", next_id + state["episode_aligned"].long()), ("stop_closing", state["episode_aligned"]),
+      ("stop_phase", stop_phase),
       ("motion_start", state["elapsed"]), ("cruise_duration", cruise),
       ("stop_ramp_start", state["elapsed"] + cfg.start_duration_s + cruise),
       ("stop_initial_frequency", state["motion_frequency"]), ("stop_wait", -1.),

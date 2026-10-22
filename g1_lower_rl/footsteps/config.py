@@ -94,7 +94,7 @@ class RandomCommandCfg:
 
 @dataclass(frozen=True)
 class FootstepManagerCfg:
-  """执行器的步态时序与输入限幅，不包含随机指令分布"""
+  """执行器的步态时序、停步方式与输入限幅"""
 
   phase: FootstepPhaseCfg = field(default_factory=FootstepPhaseCfg)
   sampler: FootstepSamplerCfg = field(default_factory=FootstepSamplerCfg)
@@ -108,23 +108,31 @@ class FootstepManagerCfg:
   contact_confirm_steps: int = 2
   landing_timeout_s: float = 0.5
   require_contact_confirmation: bool = True
+  stop_closing_probability: float = 1.0
 
   def __post_init__(self) -> None:
     """验证频率、停走和时间参数，防止单个控制拍跳过接触事件"""
     ordered_range("frequency_range", self.frequency_range, positive=True)
     if not self.sampler.min_width <= self.hold_width <= self.sampler.max_width:
       raise ValueError("hold_width must lie within the sampler width range")
+    if not 0 <= self.stop_closing_probability <= 1:
+      raise ValueError("stop_closing_probability must lie in [0,1]")
     for name in ("control_dt", "frequency_slew_rate", "start_duration_s", "stop_duration_s", "landing_timeout_s"):
       if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
         raise ValueError(f"{name} must be finite and positive")
     if not self.frequency_range[0] <= self.initial_frequency <= self.frequency_range[1]:
       raise ValueError("initial_frequency must lie within frequency_range")
-    if self.stop_duration_s * self.frequency_range[1] > 4.0:
+    width = self.phase.contact_half_width
+    gap = self.phase.right_stance_phase - self.phase.left_stance_phase
+    shortest_gap = min(gap, 2 * math.pi - gap)
+    stop_cycles = 4.0
+    if self.stop_closing_probability < 1.0:
+      # Four landings span one cycle plus the shorter inter-foot gap at minimum.
+      stop_cycles = 2.0 + (2 * shortest_gap + width) / (2 * math.pi)
+    if self.stop_duration_s * self.frequency_range[1] > stop_cycles:
       raise ValueError("stop_duration_s must fit within the four committed footsteps")
     if not isinstance(self.contact_confirm_steps, int) or self.contact_confirm_steps < 1:
       raise ValueError("contact_confirm_steps must be a positive integer")
-    width = self.phase.contact_half_width
-    centers = self.phase.right_stance_phase - self.phase.left_stance_phase
-    smallest_interval = min(width, centers - 2 * width, 2 * math.pi - centers - 2 * width)
+    smallest_interval = min(width, shortest_gap - 2 * width)
     if 2 * math.pi * self.frequency_range[1] * self.control_dt >= smallest_interval:
       raise ValueError("control_dt/frequency may skip contact events; reduce dt or the frequency maximum")

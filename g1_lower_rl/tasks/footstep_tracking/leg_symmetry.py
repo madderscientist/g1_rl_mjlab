@@ -5,6 +5,7 @@ import math
 import torch
 
 from g1_lower_rl.footsteps.tensor_manager import STANDING, WALKING
+from g1_lower_rl.tasks.footstep_tracking.reward_math import stance_fore_aft_offset
 
 LEG_JOINTS = tuple(f"{side}_{joint}_joint" for side in ("left", "right")
   for joint in ("hip_pitch", "hip_roll", "hip_yaw", "knee", "ankle_pitch", "ankle_roll"))
@@ -55,8 +56,7 @@ class LegSymmetryEMA:
     wrap = lambda angle: torch.atan2(angle.sin(), angle.cos())
     forward = wrap(direction - heading).abs() <= direction_tolerance
     yaw_symmetric = wrap(targets[..., 2].sum(-1) - 2 * heading).abs() <= target_yaw_tolerance
-    displacement = targets[:, 0, :2] - targets[:, 1, :2]
-    fore_aft = displacement[:, 0] * heading.cos() + displacement[:, 1] * heading.sin()
+    fore_aft = stance_fore_aft_offset(targets, heading)
     standing = (frequency == 0) & (mode == STANDING) & (fore_aft.abs() <= standing_fore_aft_tolerance)
     walking = (frequency > 0) & (mode == WALKING) & forward
     eligible = (standing | walking) & yaw_symmetric
