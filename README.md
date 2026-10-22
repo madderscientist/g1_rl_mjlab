@@ -128,7 +128,8 @@ python scripts/train.py G1-Gloria-MotionTracking \
 
 原有 G1 任务（下肢 MLP/GRU、站立、脚步、全身动作跟踪）的训练和回放配置，
 默认启用 `events["link_mass"]`。每个环境、每个机器人刚体独立均匀采样
-`scale ~ U(0.95, 1.05)`，每回合 reset 重采，回合内保持不变；左右连杆不共享系数。
+`scale ~ U(0.90, 1.05)`，即 -10% 至 +5%，包括连续走和单步脚步任务的各训练阶段。
+每回合 reset 重采，回合内保持不变；左右连杆不共享系数。
 
 - 连杆质量和惯量使用同一个系数：`mass = nominal_mass * scale + payload`，
   `inertia = nominal_inertia * scale`，不改变质心位置或惯性主轴。
@@ -141,7 +142,7 @@ python scripts/train.py G1-Gloria-MotionTracking \
 需要仅评估名义连杆参数时，在创建环境前设
 `cfg.events["link_mass"].params["scale_range"] = (1.0, 1.0)`；这不会关闭额外负载。
 已初始化的训练进程不会自动应用新的源码或配置，需在下一次创建环境时生效。
-独立逐连杆的 ±5% 不等于每回合整机总质量也按 ±5% 均匀变化。
+独立逐连杆的缩放范围不等于每回合整机总质量也在该范围内均匀变化。
 
 ## 训练数据（motions/，不入库）
 

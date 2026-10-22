@@ -4,6 +4,7 @@ import copy
 
 import torch
 from mjlab.envs.mdp import generated_commands, last_action
+from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
@@ -14,6 +15,7 @@ from g1_lower_rl.assets import WHOLE_BODY_JOINTS
 from g1_lower_rl.footsteps import RandomCommandCfg
 from g1_lower_rl.tasks.footstep_tracking.commands import FootstepCommandCfg, footstep_execution_failed
 from g1_lower_rl.tasks.footstep_tracking.curriculum import DIRECTION_CHANGE_STAGES, FREQUENCY_RATE_STAGES, arm_target_scale, make_curriculum
+from g1_lower_rl.tasks.footstep_tracking.initialization import RandomizeFootstepInitialization
 from g1_lower_rl.tasks.footstep_tracking.numerical_safety import NumericalSafety
 from g1_lower_rl.tasks.footstep_tracking.rewards_cfg import make_rewards, make_terminations
 from g1_lower_rl.tasks.lower_body.cfg.env_cfg import make_lower_body_env_cfg
@@ -119,5 +121,15 @@ def footstep_env_cfg(play: bool = False):
   )
   cfg.events.pop("gait_phase")
   cfg.events.pop("push_robot")
+  if not play:
+    cfg.events["reset_initialization"] = EventTermCfg(
+      func=RandomizeFootstepInitialization,  # type: ignore[arg-type]
+      mode="reset",
+      params={
+        "probabilities": (0.5, 0.4, 0.1),
+        "pelvis_height_range": (0.50, 0.79),
+        "airborne_clearance_range": (0.02, 0.10),
+      },
+    )
   cfg.episode_length_s = 60.0
   return cfg

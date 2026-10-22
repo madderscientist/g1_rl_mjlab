@@ -9,7 +9,7 @@ from mjlab.managers.event_manager import EventTermCfg, RecomputeLevel, requires_
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.utils.lab_api.math import sample_uniform
 
-LINK_MASS_SCALE_RANGE = (0.95, 1.05)
+LINK_MASS_SCALE_RANGE = (0.90, 1.05)
 
 
 class RandomizeLinkMass:
@@ -56,7 +56,7 @@ requires_model_fields("body_mass", "body_inertia", recompute=RecomputeLevel.set_
 
 
 def make_link_mass_event() -> EventTermCfg:
-  """Independent uniform +/-5% per robot body, held constant until its next reset."""
+  """Independent uniform -10% to +5% per robot body, fixed until its next reset."""
   return EventTermCfg(
     func=RandomizeLinkMass,  # type: ignore[arg-type]
     mode="reset",

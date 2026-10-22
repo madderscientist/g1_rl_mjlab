@@ -230,6 +230,11 @@ class JointRunner(FootstepResumeRunner):
     infos = walking.get("infos") or {}
     self.alg.joint_stage = infos.get("precision_stage", {})
     self.alg.joint_theta_stage = infos.get("theta_stage")
+    from g1_lower_rl.tasks.footstep_tracking.initialization import RandomizeFootstepInitialization
+
+    initialization = self.env.unwrapped.event_manager.get_term_cfg("reset_initialization")
+    if not isinstance(initialization.func, RandomizeFootstepInitialization):
+      raise TypeError("Joint training requires mixed footstep initialization")
     receipt = {"rank": self.gpu_global_rank, "actor_checkpoint": str(path),
       "critic_checkpoint": str(path) if self.gpu_global_rank == 0 else step_path,
       "actor_mean_exact": True, "critic_exact": True, "optimizer_reset": not joint_resume,
@@ -237,6 +242,9 @@ class JointRunner(FootstepResumeRunner):
       "actor_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
       "fixed_std": .25, "actor_normalizer_frozen": True, "task_weight": self.alg.task_weight,
       "learning_rate": self.alg.learning_rate, "counter": counter,
+      "link_mass_scale_range": list(self.env.unwrapped.event_manager.get_term_cfg("link_mass").params["scale_range"]),
+      "reset_initialization": initialization.params,
+      "initialization_mode_counts": torch.bincount(initialization.func.modes, minlength=3).cpu().tolist(),
       "theta_stage": self.alg.joint_theta_stage, "actor_raw_obs_dim": actor.raw_obs_dim}
     write_json(self.task_log_dir / "initialization.json", receipt)
     print("JOINT_INITIALIZATION " + json.dumps(receipt), flush=True)

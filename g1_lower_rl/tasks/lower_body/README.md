@@ -314,6 +314,10 @@ episode。
 
 `push_robot` 不走扰动课程，训练时始终开启；play 配置会删除它。
 
+连杆质量/惯量 `link_mass` 使用[共享事件](../domain_randomization.py)：每环境、每连杆独立
+按 `U(0.90, 1.05)` 缩放（-10% 至 +5%），每回合 reset 重采、回合内固定。
+额外夹爪负载不参与缩放；训练与 play 配置均启用。
+
 ### Startup 随机化
 
 这些事件在环境创建时采样，不是每个 episode 重采：
