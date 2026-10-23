@@ -193,8 +193,10 @@ for frame in range(3000):  # 60秒模拟时间，概率停止不保证每次短�
 
 ```bash
 OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest -q \
-  tests/test_tensor_footsteps.py tests/test_footstep_visualization.py tests/test_footstep_width.py
+  tests/test_tensor_footsteps.py
 ```
+
+仅保留固定随机数下的NumPy/Tensor完整状态对照、起停循环及停止快照兼容回归；不再保留独立预览、几何组合和benchmark测试。
 
 ## 使用边界
 

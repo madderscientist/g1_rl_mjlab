@@ -26,7 +26,7 @@ def make_fixture():
   return env, cfg, term
 
 
-@pytest.mark.parametrize("scale", [0.90, 1.05])
+@pytest.mark.parametrize("scale", [0.75, 1.05])
 def test_partial_reset_preserves_payload_and_never_accumulates(scale):
   env, cfg, term = make_fixture()
   initial_mass = env.sim.model.body_mass.clone()
@@ -49,7 +49,7 @@ def test_partial_reset_preserves_payload_and_never_accumulates(scale):
   torch.testing.assert_close(env.sim.model.body_inertia, initial_inertia, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("scale_range", [(0.95, 1.05), (0.90, 1.05)])
+@pytest.mark.parametrize("scale_range", [(0.90, 1.05), (0.75, 1.05)])
 def test_independent_uniform_samples_are_bounded_and_scale_inertia_together(scale_range):
   torch.manual_seed(42)
   env, cfg, term = make_fixture()
@@ -64,10 +64,11 @@ def test_independent_uniform_samples_are_bounded_and_scale_inertia_together(scal
     torch.testing.assert_close(actual_inertia, term.nominal_inertia * scale.unsqueeze(-1))
     draws.append(scale.flatten())
   values = torch.cat(draws)
-  assert abs(values.mean().item() - (lower + upper) / 2) < 0.003
-  assert abs(values.std().item() - (upper - lower) / 12**0.5) < 0.003
-  assert values.min().item() < lower + 0.003
-  assert values.max().item() > upper - 0.003
+  normalized = (values - lower) / (upper - lower)
+  assert abs(normalized.mean().item() - 0.5) < 0.02
+  assert abs(normalized.std().item() - 1 / 12**0.5) < 0.02
+  assert normalized.min().item() < 0.02
+  assert normalized.max().item() > 0.98
   assert not torch.equal(draws[0], draws[1])
   assert torch.unique(draws[0]).numel() == draws[0].numel()
 
@@ -89,7 +90,7 @@ def test_every_task_uses_shared_reset_randomization(task, play):
   term = cfg.events["link_mass"]
   assert term.func is RandomizeLinkMass
   assert term.mode == "reset" and term.min_step_count_between_reset == 0
-  assert term.params["scale_range"] == (0.90, 1.05)
+  assert term.params["scale_range"] == (0.75, 1.05)
   assert term.params["asset_cfg"].name == "robot"
   assert "link_inertia" not in cfg.events
   assert sum(event.func is RandomizeLinkMass for event in cfg.events.values()) == 1
@@ -101,7 +102,7 @@ def test_all_footstep_profiles_use_wider_mass_range(profile, play):
   from g1_lower_rl.tasks.footstep_tracking import make_footstep_env_cfg
 
   cfg = make_footstep_env_cfg(profile, play=play)
-  assert cfg.events["link_mass"].params["scale_range"] == (0.90, 1.05)
+  assert cfg.events["link_mass"].params["scale_range"] == (0.75, 1.05)
 
 
 @pytest.mark.parametrize("payload_source", ["lower_body", "motion_tracking"])
@@ -145,7 +146,7 @@ def test_real_environment_reset_recomputes_constants_and_holds_mass(payload_sour
       torch.testing.assert_close(model.body_mass[untouched], before_mass[untouched], rtol=0, atol=0)
       torch.testing.assert_close(model.body_inertia[untouched], before_inertia[untouched], rtol=0, atol=0)
       scale = (model.body_mass[:, term.body_ids] - initial_offset[:, term.body_ids]) / term.nominal_mass
-      assert (scale >= 0.90 - 1e-6).all() and (scale <= 1.05 + 1e-6).all()
+      assert (scale >= 0.75 - 1e-6).all() and (scale <= 1.05 + 1e-6).all()
       torch.testing.assert_close(model.body_inertia[:, term.body_ids], term.nominal_inertia * scale.unsqueeze(-1))
       root_id = env.scene["robot"].indexing.body_ids[0]
       torch.testing.assert_close(model.body_subtreemass[:, root_id], model.body_mass[:, term.body_ids].sum(-1))

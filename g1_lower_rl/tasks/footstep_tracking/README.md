@@ -289,7 +289,7 @@ Actor使用GRU(64)和MLP(256,256,128)，输出15轴位置增量；critic使用ML
 - 半蹲直接均匀采样骨盆离地高度 0.50–0.79 m，不采样膝关节角；按模型真实关节锚点做矢状面解析 IK，固定名义双脚水平位置和脚掌朝向，求髋、膝、踝角及骨盆水平位置。必要时小幅前后移动骨盆以满足髋/踝软限位，同时保持采样高度；按真实足底碰撞胶囊最低点校验地面高度，不可达高度明确报错。当前模型双脚贴地、脚掌放平时的骨盆最高约0.792 m，因此不使用0.80 m上限。
 - 悬空采用默认站姿，最低足底离地均匀采样 2–10 cm，随后正常重力落地；半蹲与悬空均保持躯干初始竖直、保留根 yaw，根和腿初速度为零。play 保留原有初始化，不启用该混合采样。
 - 手臂14轴reset归零，5秒过渡到随机PD目标；每8–12秒采样新姿势，再插值5秒。幅度在0/1500/2000轮对应0.2/0.5/1.0，前800轮保持0.2。
-- 连续走与单步的每环境、每连杆质量/惯量独立按 `U(0.90, 1.05)` 缩放（-10% 至 +5%），reset 重采、回合内固定；额外负载不缩放。其他随机化见 [lower_body事件](../lower_body/cfg/events.py)。
+- 连续走与单步的每环境、每连杆质量/惯量独立按 `U(0.75, 1.05)` 缩放（-25% 至 +5%），reset 重采、回合内固定；额外负载不缩放。其他随机化见 [lower_body事件](../lower_body/cfg/events.py)。
 - Actor训练启用观测噪声与回合IMU偏置；critic和play关闭观测噪声，保留编码器偏置，观测延迟为0。
 
 ### 终止与数值保护
@@ -309,18 +309,10 @@ CUDA 上用 `torch.compile(fullgraph=True)` 融合数值保护的状态掩码计
 
 ## 验证
 
-分进程运行，避免共享Dynamo缓存触及重编译上限：
+核心回归仅保留初始化、质量随机化、停步规划和奖励/阶段兼容四个文件；历史实验、benchmark和大规模重复参数组合已移除。
 
 ```bash
-OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python -m pytest -q \
-  tests/test_footstep_precision.py tests/test_footstep_resume.py tests/test_footstep_supervised.py \
-  tests/test_footstep_walk_first.py tests/test_footstep_walk_curriculum.py tests/test_step_episode.py \
-  tests/test_footstep_posture.py tests/test_footstep_standing_copper.py \
-  tests/test_footstep_tracking_objectives.py tests/test_footstep_leg_symmetry.py \
-  tests/test_arm_reset_ranges.py tests/test_footstep_arm_curriculum.py
-
-OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python -m pytest -q \
-  tests/test_footstep_still_velocity.py tests/test_footstep_numerical_safety.py
+OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python -m pytest tests -q
 
 # CPU双进程：actor加权同步、私有critic/Adam及联合恢复自测，不启动正式训练
 OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python scripts/train_footstep_joint.py --self-test

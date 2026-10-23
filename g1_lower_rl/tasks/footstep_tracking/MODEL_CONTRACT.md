@@ -30,9 +30,9 @@ v6 中 theta 表示实际偏角，v7 改为期望偏角指令；即使维度相�
 - [模型和导出](../../rl/footstep_model.py)：`FootstepActor`、`FootstepModelCfg`、`export_footstep_policy`。
 - [部署输入和推理](../../footstep_deploy.py)：`pack_footstep_observation`、`FootstepPolicy`。
 - [相位配置](../../footstep_phase.py)：`FootstepPhaseCfg`，奖励与模型导出共用的理论双支撑窗口。
-- [测试](../../../tests/test_footstep_model.py)：输入布局、编码、网络容量、环境时序、导出和连续推理。
+- [规划核心回归](../../../tests/test_tensor_footsteps.py)：NumPy/Tensor状态对照、起停及停止快照兼容。
 - [奖励配置](rewards_cfg.py)：`make_rewards`、`make_terminations`。
-- [奖励实现](rewards.py)及[测试](../../../tests/test_footstep_tracking_objectives.py)：摆动指数奖励、落地锁定线性代价与计划接触节拍。
+- [奖励实现](rewards.py)及[核心回归](../../../tests/test_footstep_precision.py)：阶段配置兼容、线性擦地、首次落地及静止/触地门控。
 
 ## 1. 任务边界
 
@@ -297,12 +297,11 @@ actions, q_des = policy.step(obs)
 ## 9. 验证
 
 ```bash
-OMP_NUM_THREADS=1 micromamba run -n mj python -m pytest tests/test_footstep_model.py tests/test_tensor_footsteps.py -q
+OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python -m pytest tests -q
 ```
 
-测试包括79/82维布局、扩容网络、固定左右next槽位、theta圆周均值/单角度透传/共同旋转不变性、GRU reset、ONNX Runtime
-多拍动作/隐状态对齐、接口校验及真实环境下一落点输入与完成拍执行奖励的分离。
-规划器测试覆盖NumPy/编译GPU状态一致性、摆动期间基准冻结、计划落地更新和仅预览最近两步及局部重置；不验证策略已学会行走。
+仅保留初始化、质量随机化、NumPy/Tensor规划状态和奖励/阶段兼容核心回归。
+历史网络、导出、预览及实验组合测试已移除；此命令不代表完整部署验证，也不验证策略已学会行走。
 
 评测分别报告实际首次落脚XY/yaw误差、存活时间、起停成功率、力矩和关节对称性，不用不同配方的总奖励直接比较优劣。
 第二阶段保留手臂幅度课程及8–12秒换姿势、5秒插值；参数和阈值仍需训练验证。力矩平方仅称为铜损代理，不等于标定后的能耗。
@@ -620,14 +619,11 @@ mjlab 当前步序为 termination -> reward -> reset -> command update -> observ
 
 ```bash
 OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python -m pytest -q \
-  tests/test_footstep_tracking_objectives.py tests/test_footstep_posture.py \
-  tests/test_footstep_standing_copper.py tests/test_step_episode.py
+  tests/test_footstep_precision.py
 ```
 
-覆盖执行器乱序和上肢排除、腰边缘曲线、绝对 yaw 回零、角度 wrap、首次落地锁分、早/迟落地、
-按环境 reset、抬脚和滑移、完整 RewardManager 调用、与 dt 无关的终止代价及 time-out 排除。
-落地力度测试覆盖首次接触逐脚选择、两脚合计、力幅值比例、持续支撑零罚分、日志指标和自定义传感器名。
-另有真实 CPU 环境及短 PPO 更新测试，均不代表收敛训练，尚不能据此宣称已学会精准低铜损行走
+覆盖两任务阶段配置兼容、线性/历史平方擦地、首次落地事件及dt积分、静止姿态和触地转速门控。
+这些核心回归不代表完整奖励、PPO或真机安全验证，也不能据此宣称策略已经收敛。
 
 ## 11. 停走过渡与站立奖励
 

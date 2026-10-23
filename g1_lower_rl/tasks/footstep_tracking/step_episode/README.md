@@ -72,4 +72,4 @@
 
 ## 验证
 
-规则与隔离测试见[单步测试](../../../../tests/test_step_episode.py)；共享姿态和限位倍率见[姿态测试](../../../../tests/test_footstep_posture.py)与[铜损测试](../../../../tests/test_footstep_standing_copper.py)。这些验证覆盖实现，不代表稳定保持或真机精度已经达标。
+两任务阶段配置及奖励的核心回归见[精度测试](../../../../tests/test_footstep_precision.py)。历史独立单步、姿态和铜损实验测试已移除；保留的核心回归不代表完整隔离验证，也不代表稳定保持或真机精度已经达标。
