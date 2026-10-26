@@ -365,18 +365,16 @@ OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python -m pytest tests -q
 
 规则、保持时长与完成判据见[单步说明](step_episode/README.md)。奖励项数量取决于精度阶段及显式附加配置，以实际 `cfg.rewards` 为准；共同姿态和限位倍率不因任务切换改变。
 
-独立theta阶段以原150351为基线：移除 `waist_yaw_zero`，替换为 `torso_feet_heading`（默认权重-2.0，支持 `heading_reward_weight` 覆盖，原始值 `wrap(actual_offset-theta)^2`，站立和行走均启用）。不带入150351之后添加的 `standing_pelvis_upright`，其余奖励保持基线。元数据可显式附加三个静止姿态项（`standing_torso_upright`、`standing_pelvis_upright_linear`、`standing_pelvis_feet_heading`）及单步 `step_extra_contact`。骨盆偏航仅在 `linear=true` 时切换为绝对角度惩罚；旧参考的线性模式按规划双脚前后差≤`standing_fore_aft_tolerance`（默认5 cm）门控，旧元数据仍保持原平方惩罚。详见[第四阶段说明](README.md#第四阶段theta迁移与训练)。所有覆盖仅由显式阶段工厂应用，默认 `make_rewards` 不变。
+独立theta阶段移除 `waist_yaw_zero`，替换为 `torso_feet_heading`（默认权重-2.0，支持 `heading_reward_weight` 覆盖，原始值 `wrap(actual_offset-theta)^2`，站立和行走均启用）。不叠加基础 `standing_pelvis_upright`，元数据可显式附加两个静止姿态项（`standing_torso_upright`、`standing_pelvis_upright_linear`）及单步 `step_extra_contact`。骨盆仅约束竖直倾角，不设置水平偏航奖励。详见[第四阶段说明](README.md#第四阶段theta迁移与训练)。所有覆盖仅由显式阶段工厂应用，默认 `make_rewards` 不变。
 
-静止骨盆偏航可进一步显式指定 `linear=true, reference="feet_bisector"`，基准改为实测左右脚水平连线的法向，选取更接近规划航向的一侧，所有 `f=0` 站姿均启用，不再应用5 cm前后差门控。水平脚距≤1 µm时使用规划航向并记录回退比例；torso的theta参考及其他奖励不变。旧检查点省略 `reference` 时保留原定义。
-
-三个阶段附加姿态项（静止torso竖直、静止pelvis竖直和静止pelvis偏航）均严格使用奖励快照的 `frequency == 0` 门控；任何正执行步频时为零，不包含原有全程姿态项或触地转脚项。
+两个阶段附加姿态项（静止torso竖直、静止pelvis竖直）均严格使用奖励快照的 `frequency == 0` 门控；任何正执行步频时为零，不包含原有全程姿态项或触地转脚项。
 
 阶段可显式配置 `feet_contact_yaw_rate={"weight": -0.005, "yaw_rate_scale_deg_s": 1.0}`：
 奖励率为 `weight * sum_feet((found > 0) * abs(foot_angular_velocity_world_z)) / radians(yaw_rate_scale_deg_s)`。
 只罚实测触地脚的世界竖直轴角速度，初始支撑、落地后、行走及静止均启用，无死区，离地脚不罚；
 不直接惩罚横滚/俯仰角速度，也不记录相对落地瞬间的累计偏角。
 上述权重下，一只脚以1°/s转动时为-0.005/s，两只脚相加，再由奖励管理器乘控制步长。
-省略字段的旧检查点和默认任务不新增该项；示例可搭配实测双脚法线骨盆偏航权重-10，两项独立配置，均不改变工厂默认值。
+省略字段时不增加该项；示例权重需显式配置。
 
 这是带权 RL 目标，而非保证不摔的约束优化或安全证明。以可达脚印下的落地精度和存活为主要目标，
 再降低能耗。能耗项过重可能导致不愿迈步，过轻则可能动作剧烈，需要结合实际训练调权。

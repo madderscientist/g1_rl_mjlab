@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.utils.lab_api.math import euler_xyz_from_quat, quat_apply_inverse
+from mjlab.utils.lab_api.math import quat_apply_inverse
 
 from g1_lower_rl.assets import LOWER_BODY_JOINTS
 from g1_lower_rl.footstep_phase import FootstepPhaseCfg, resolve_phase_cfg
@@ -16,7 +16,6 @@ from g1_lower_rl.tasks.footstep_tracking.reward_math import (
   footprint_accuracy_cost,
   joint_edge_cost,
   phase_windows,
-  stance_fore_aft_offset,
   swing_tracking_score,
   torque_square_cost,
 )
@@ -165,60 +164,6 @@ def torso_heading_error_l2(
   desired = term.command[:, 0]
   cost = _compiled_torso_heading_cost if compile_backend and orientations.is_cuda else _torso_heading_cost
   return cost(orientations, desired)
-
-
-def standing_pelvis_heading_error_l2(
-  env: ManagerBasedRlEnv,
-  asset_cfg: SceneEntityCfg,
-  command_name: str = "footsteps",
-) -> torch.Tensor:
-  """零执行步频时惩罚刚体相对双脚圆周平均航向的偏角平方"""
-  frequency = _reward_state(env, command_name).frequency
-  return torso_heading_error(env, asset_cfg).squeeze(-1).square() * (frequency == 0)
-
-
-def standing_pelvis_heading_error_l1(
-  env: ManagerBasedRlEnv,
-  asset_cfg: SceneEntityCfg,
-  command_name: str = "footsteps",
-  standing_fore_aft_tolerance: float = 0.05,
-) -> torch.Tensor:
-  """零步频且规划双脚接近并列时，惩罚骨盆相对实际双脚平均朝向的绝对偏角"""
-  if not math.isfinite(standing_fore_aft_tolerance) or standing_fore_aft_tolerance <= 0:
-    raise ValueError("Standing fore-aft tolerance must be finite and positive")
-  state = _reward_state(env, command_name)
-  command = env.command_manager.get_term(command_name)
-  fore_aft = stance_fore_aft_offset(state.targets_w, command.symmetry_state["heading"])
-  # Compare in target precision: planning headings are float64, reward targets float32.
-  fore_aft = fore_aft.to(state.targets_w.dtype)
-  active = (state.frequency == 0) & (fore_aft.abs() <= standing_fore_aft_tolerance)
-  return torso_heading_error(env, asset_cfg).squeeze(-1).abs() * active
-
-
-def standing_pelvis_bisector_heading_error_l1(
-  env: ManagerBasedRlEnv,
-  asset_cfg: SceneEntityCfg,
-  command_name: str = "footsteps",
-) -> torch.Tensor:
-  """零步频时惩罚骨盆相对实测双脚连线前向法线的绝对偏角"""
-  state = _reward_state(env, command_name)
-  command = env.command_manager.get_term(command_name)
-  data = env.scene[asset_cfg.name].data
-  feet = data.site_pos_w[:, asset_cfg.site_ids, :2]
-  displacement = feet[:, 0] - feet[:, 1]
-  heading = command.symmetry_state["heading"].to(feet.dtype)
-  normal_heading = torch.atan2(-displacement[:, 0], displacement[:, 1])
-  forward_projection = displacement[:, 1] * heading.cos() - displacement[:, 0] * heading.sin()
-  reference = torch.where(forward_projection < 0, normal_heading + math.pi, normal_heading)
-  valid = displacement.square().sum(-1) > 1e-12
-  reference = torch.where(valid, reference, heading)
-  _, _, yaw = euler_xyz_from_quat(data.body_link_quat_w[:, asset_cfg.body_ids].squeeze(1))
-  error = torch.remainder(yaw - reference + math.pi, 2 * math.pi) - math.pi
-  standing = state.frequency == 0
-  env.extras.setdefault("log", {})["Metrics/pelvis_bisector/fallback_fraction"] = (
-    (standing & ~valid).float().mean()
-  )
-  return error.abs() * standing
 
 
 def body_tilt_angle_l2(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:

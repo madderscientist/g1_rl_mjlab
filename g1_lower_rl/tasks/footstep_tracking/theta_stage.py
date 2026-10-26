@@ -12,7 +12,6 @@ from .curriculum import FREQUENCY_RATE_STAGES, NUM_STEPS_PER_ENV, _select_stage,
 from .rewards_cfg import (
   _require_negative_weight,
   make_feet_contact_yaw_rate_reward,
-  make_standing_pelvis_heading_reward,
   make_standing_pelvis_upright_reward,
   make_standing_torso_upright_reward,
   make_torso_heading_reward,
@@ -22,7 +21,6 @@ from .walking.curriculum import WALK_FIRST_STAGES, WALK_FIRST_YAW_STAGES
 _OPTIONAL_REWARDS = (
   ("standing_torso_upright", make_standing_torso_upright_reward),
   ("standing_pelvis_upright_linear", make_standing_pelvis_upright_reward),
-  ("standing_pelvis_feet_heading", make_standing_pelvis_heading_reward),
   ("feet_contact_yaw_rate", make_feet_contact_yaw_rate_reward),
 )
 

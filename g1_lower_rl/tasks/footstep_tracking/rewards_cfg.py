@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from typing import Literal
 
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -50,30 +49,6 @@ def make_standing_torso_upright_reward(weight: float = -1.0) -> RewardTermCfg:
 
 def make_standing_pelvis_upright_reward(weight: float = -1.0) -> RewardTermCfg:
   return _make_standing_upright_reward("pelvis", weight, "Standing pelvis upright")
-
-
-def make_standing_pelvis_heading_reward(
-  weight: float = -1.0, *, linear: bool = False, standing_fore_aft_tolerance: float = 0.05,
-  reference: Literal["feet_yaw", "feet_bisector"] = "feet_yaw",
-) -> RewardTermCfg:
-  if reference not in ("feet_yaw", "feet_bisector"):
-    raise ValueError("Standing pelvis heading reference must be feet_yaw or feet_bisector")
-  if reference == "feet_bisector" and not linear:
-    raise ValueError("Feet-bisector heading requires linear=True")
-  if not math.isfinite(standing_fore_aft_tolerance) or standing_fore_aft_tolerance <= 0:
-    raise ValueError("Standing fore-aft tolerance must be finite and positive")
-  func = rewards.standing_pelvis_heading_error_l2
-  if linear:
-    func = (rewards.standing_pelvis_bisector_heading_error_l1 if reference == "feet_bisector"
-      else rewards.standing_pelvis_heading_error_l1)
-  return RewardTermCfg(
-    func=func,
-    weight=_require_negative_weight(weight, "Standing pelvis heading"),
-    params={
-      "asset_cfg": SceneEntityCfg("robot", body_names=("pelvis",), site_names=_FEET_SITES, preserve_order=True),
-      **({"standing_fore_aft_tolerance": standing_fore_aft_tolerance} if linear and reference == "feet_yaw" else {}),
-    },
-  )
 
 
 def make_feet_contact_yaw_rate_reward(
