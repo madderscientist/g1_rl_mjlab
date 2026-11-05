@@ -14,4 +14,12 @@ export/
 .vscode/
 motions/
 .ruff_cache/
-tests/
+tests/*
+!tests/test_world_model.py
+!tests/test_wm_collection.py
+!tests/test_wm_training.py
+!tests/test_world_model_adapters.py
+!tests/test_world_model_checkpoint.py
+
+# Published WM weights belong in release assets, not Git.
+g1_lower_rl/world_model/checkpoints/*.pt

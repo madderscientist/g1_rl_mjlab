@@ -8,11 +8,30 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
 import torch
+
+from g1_lower_rl.world_model.model import JOINT_NAMES
+
+logger = logging.getLogger(__name__)
+
+
+def canonical_joint_motion(position: np.ndarray, velocity: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+  """Read canonical29, discarding both gripper coordinates from known legacy31 data."""
+  if position.ndim != 2 or position.shape != velocity.shape:
+    raise ValueError("Motion joint position and velocity must be matching [frames, joints] arrays")
+  if position.shape[1] == 31:
+    selected = [index for index in range(31) if index not in (22, 30)]
+    position, velocity = position[:, selected], velocity[:, selected]
+  elif position.shape[1] != len(JOINT_NAMES):
+    raise ValueError(f"Expected canonical29 or legacy31 motion, got {position.shape}")
+  if not np.isfinite(position).all() or not np.isfinite(velocity).all():
+    raise ValueError("Motion joint position and velocity must be finite")
+  return position, velocity
 
 
 class MotionBins(NamedTuple):
@@ -56,6 +75,7 @@ class MotionCorpus:
     body_pos, body_quat, body_lin, body_ang = [], [], [], []
     num_frames, names = [], []
 
+    legacy_clips = 0
     for f in files:
       data = np.load(f)
       bp = torch.tensor(data["body_pos_w"], dtype=torch.float32)
@@ -65,8 +85,10 @@ class MotionCorpus:
 
       # 刚体维先按 body_indexes 切了再存：整段语料只用其中 14 个刚体，
       # 而 NPZ 里是全部 44 个。不先切的话 80 段语料光刚体数组就要几个 GB。
-      joint_pos.append(torch.tensor(data["joint_pos"], dtype=torch.float32))
-      joint_vel.append(torch.tensor(data["joint_vel"], dtype=torch.float32))
+      qp, qv = canonical_joint_motion(data["joint_pos"], data["joint_vel"])
+      legacy_clips += data["joint_pos"].shape[1] == 31
+      joint_pos.append(torch.tensor(qp, dtype=torch.float32))
+      joint_vel.append(torch.tensor(qv, dtype=torch.float32))
       body_pos.append(bp[:, body_indexes.cpu()])
       body_quat.append(
         torch.tensor(data["body_quat_w"], dtype=torch.float32)[:, body_indexes.cpu()]
@@ -80,6 +102,11 @@ class MotionCorpus:
       num_frames.append(int(joint_pos[-1].shape[0]))
       names.append(f.stem)
 
+    if legacy_clips:
+      logger.warning(
+        "Projected %d legacy31 motion clips into canonical29; ignored both gripper positions and velocities",
+        legacy_clips,
+      )
     self.names: list[str] = names
     self.joint_pos = torch.cat(joint_pos).to(device)
     self.joint_vel = torch.cat(joint_vel).to(device)

@@ -1,7 +1,7 @@
-"""标定过的 31 自由度 Unitree G1 + 双 Gloria-M 夹爪。
+"""标定过的 29 自由度 Unitree G1 + 固定闭合的双 Gloria-M 夹爪。
 
 执行器/碰撞/关节体定义直接复用 mjlab 自带的 G1 资产常量，本文件只补三样东西：
-自己的 MJCF、夹爪偏心关节的执行器、以及为长夹爪加宽的初始姿态。
+自己的 MJCF、保留质量和惯量的闭合夹爪、以及为长夹爪加宽的初始姿态。
 """
 
 import re
@@ -9,7 +9,6 @@ import re
 from mujoco._specs import MjSpec
 from mjlab.actuator import BuiltinPositionActuatorCfg
 from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
-  ACTUATOR_4010,
   FULL_COLLISION,
   G1_ARTICULATION,
 )
@@ -25,16 +24,8 @@ def get_spec() -> MjSpec:
   return MjSpec.from_file(str(XML))
 
 
-GRIPPER_ACTUATOR = BuiltinPositionActuatorCfg(
-  target_names_expr=("left_eccentric_joint", "right_eccentric_joint"),
-  stiffness=10.0,
-  damping=0.5,
-  effort_limit=10.0,
-  armature=ACTUATOR_4010.reflected_inertia,
-)
-
 ARTICULATION = EntityArticulationInfoCfg(
-  actuators=(*G1_ARTICULATION.actuators, GRIPPER_ACTUATOR),
+  actuators=G1_ARTICULATION.actuators,
   soft_joint_pos_limit_factor=0.9,
 )
 
@@ -50,7 +41,6 @@ HOME_KEYFRAME = EntityCfg.InitialStateCfg(
     ".*_elbow_joint": 0.87,
     "left_shoulder_roll_joint": 0.25,
     "right_shoulder_roll_joint": -0.25,
-    ".*_eccentric_joint": 0.0,
   },
   joint_vel={".*": 0.0},
 )
@@ -127,7 +117,7 @@ LOWER_BODY_EFFORT_LIMIT: dict[str, float] = {
 }
 
 # 全身 29 个 G1 关节（下肢 15 + 手臂 14），顺序与真机电机编号 0..28 一致。
-# 动作跟踪任务用它；两个 Gloria-M 夹爪关节由真机上独立的控制器驱动，不属于策略动作空间。
+# 两个 Gloria-M 夹爪在仿真中固定闭合，不占物理或策略自由度。
 WHOLE_BODY_JOINTS: tuple[str, ...] = LOWER_BODY_JOINTS + ARM_JOINTS
 
 WHOLE_BODY_ACTION_SCALE: dict[str, float] = {

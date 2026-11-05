@@ -1,4 +1,4 @@
-<mujoco model="g1_with_dual_gloria_m_31dof">
+<mujoco model="g1_with_dual_gloria_m_fixed29dof">
   <compiler angle="radian" meshdir="assets" autolimits="true"/>
 
   <default>
@@ -215,7 +215,6 @@
                               <geom name="left_camera_collision" class="collision" type="box" size="0.0373 0.0554 0.02965" pos="0 0.0209 0.04955"/>
                               <geom name="left_finger_collision" class="collision" type="box" size="0.0785 0.0217 0.03" pos="0 -0.0036 0.1"/>
                               <body name="left_eccentric" pos="0 -0.0035753 0.058" euler="0 0 -4.33457105169236">
-                                <joint name="left_eccentric_joint" axis="0 0 1" range="0 2.76377472169236"/>
                                 <inertial pos="-5.9e-7 3e-7 -0.00523699" mass="0.027974822850963324" fullinertia="5.2792611128879429e-06 3.1541914497254537e-06 7.7250960082259002e-06 -1.4434435447896147e-06 0 0"/>
                                 <geom class="visual" mesh="gloria_m_eccentric"/>
                               </body>
@@ -288,7 +287,6 @@
                               <geom name="right_camera_collision" class="collision" type="box" size="0.0373 0.0554 0.02965" pos="0 0.0209 0.04955"/>
                               <geom name="right_finger_collision" class="collision" type="box" size="0.0785 0.0217 0.03" pos="0 -0.0036 0.1"/>
                               <body name="right_eccentric" pos="0 -0.0035753 0.058" euler="0 0 -4.33457105169236">
-                                <joint name="right_eccentric_joint" axis="0 0 1" range="0 2.76377472169236"/>
                                 <inertial pos="-5.9e-7 3e-7 -0.00523699" mass="0.027974822850963324" fullinertia="5.2792611128879429e-06 3.1541914497254537e-06 7.7250960082259002e-06 -1.4434435447896147e-06 0 0"/>
                                 <geom class="visual" mesh="gloria_m_eccentric"/>
                               </body>

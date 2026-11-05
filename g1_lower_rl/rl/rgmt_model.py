@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
@@ -24,6 +25,15 @@ from mjlab.rl import RslRlModelCfg
 from rsl_rl.models import MLPModel
 from tensordict import TensorDict
 from torch import nn
+
+
+def actor_checkpoint_dtype(state: Mapping[str, torch.Tensor]) -> torch.dtype:
+  dtypes = {value.dtype for value in state.values() if value.is_floating_point()}
+  if torch.float64 in dtypes:
+    if dtypes != {torch.float64}:
+      raise ValueError("Mixed FP64/other floating actor checkpoint dtypes are not supported")
+    return torch.float64
+  return torch.float32
 
 
 def _encoder(in_dim: int, hidden: int, out_dim: int, activation: str) -> nn.Module:
@@ -184,6 +194,7 @@ class RgmtActor(MLPModel):
     prop, act = self._split_history(obs)
     n = prop.shape[0]
 
+    prop, act = prop.to(self.pos_embedding.dtype), act.to(self.pos_embedding.dtype)
     z_o = self.state_encoder(prop)
     z_a = self.action_encoder(act)
     # 交错成 [a_{τ-1}, o_τ, ...]：动作在前，因为它是产生该观测的原因。
@@ -193,7 +204,7 @@ class RgmtActor(MLPModel):
       seq = block(seq, self.causal_mask, last_only=self.fast_last_layer and i == last)
     h = self.history_norm(seq[:, -1:, :])
 
-    ref = obs[self._reference_group].view(n, self._num_ref_tokens, self._reference_dim)
+    ref = obs[self._reference_group].view(n, self._num_ref_tokens, self._reference_dim).to(self.pos_embedding.dtype)
     z_g = self.command_encoder(ref) + self.pos_embedding
     u = self.cross_attn(h, z_g).squeeze(1)
     u_hat = _fsq(u, self.fsq_levels)
