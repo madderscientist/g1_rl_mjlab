@@ -83,7 +83,7 @@ def test_invalid_ranges_rejected(scale_range):
 @pytest.mark.parametrize("play", [False, True])
 @pytest.mark.parametrize("task", [
   "G1-Gloria-LowerBody-Flat", "G1-Gloria-LowerBody-Flat-GRU", "G1-Gloria-Stand",
-  "G1-Gloria-FootstepTracking", "G1-Gloria-FootstepEpisode", "G1-Gloria-MotionTracking",
+  "G1-Gloria-FootstepTracking", "G1-Gloria-FootstepEpisode",
 ])
 def test_every_task_uses_shared_reset_randomization(task, play):
   cfg = load_env_cfg(task, play=play)
@@ -105,17 +105,14 @@ def test_all_footstep_profiles_use_wider_mass_range(profile, play):
   assert cfg.events["link_mass"].params["scale_range"] == (0.75, 1.05)
 
 
-@pytest.mark.parametrize("payload_source", ["lower_body", "motion_tracking"])
 @torch.inference_mode()
-def test_real_environment_reset_recomputes_constants_and_holds_mass(payload_source):
+def test_real_environment_reset_recomputes_constants_and_holds_mass():
   from mjlab.envs import ManagerBasedRlEnv
 
   cfg = load_env_cfg("G1-Gloria-LowerBody-Flat", play=True)
   cfg.scene.num_envs = 4
   cfg.seed = 42
   cfg.terminations = {}
-  if payload_source == "motion_tracking":
-    cfg.events["payload_mass"] = load_env_cfg("G1-Gloria-MotionTracking").events["payload"]
   device = "cuda:0" if torch.cuda.is_available() else "cpu"
   env = ManagerBasedRlEnv(cfg, device=device)
   try:

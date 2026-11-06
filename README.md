@@ -2,6 +2,10 @@
 
 Unitree G1 + 双 Gloria-M 夹爪的强化学习项目，包含下肢行走、分阶段脚步跟踪和全身动作跟踪，基于 [mjlab](https://github.com/mujocolab/mjlab) 1.6.0。
 
+当前资产为**29个可动关节、夹爪固定闭合**。两个夹爪的实体、质量、惯量、碰撞和相机均保留，
+不是换成原厂橡胶手。旧31关节物理状态/WM权重不能直接复用；闭合夹爪的旧动作数据会校验后
+正确投影到29关节，右臂不截列。详见[资产契约](g1_lower_rl/assets/g1_gloria/README.md)。
+
 ## 脚步跟踪
 
 控制12腿轴和3腰轴，手臂由独立PD驱动。策略的演进路线为：
@@ -21,6 +25,19 @@ Unitree G1 + 双 Gloria-M 夹爪的强化学习项目，包含下肢行走、分
 - [模型与部署契约](g1_lower_rl/tasks/footstep_tracking/MODEL_CONTRACT.md)：输入布局、网络、ONNX、执行器与奖励公式。
 
 日志和模型保存在 `logs/`，不随源码提交。
+
+## 全身动作跟踪
+
+正式任务 `G1-Gloria-MotionTracking` 统一为 **MLP + SuperMimic + 位置WM v3**，
+不再注册旧RGMT/PPO任务，也不保留LegacyPPO任务别名。脚步、速度和站立任务不受影响。
+策略使用798维参考、10帧本体/原始动作历史，输出29维参考相对残差，共9,132,861参数。
+训练使用全部98,049条动作的固定训练/验证划分；actor经WM做640ms BPTT，critic使用GAE。
+
+交付基线为 [MLP14160](export/mocap_mlp_14160/)：
+[ONNX](export/mocap_mlp_14160/policy.onnx)、[部署契约](export/mocap_mlp_14160/policy_contract.json)、
+[完整双卡训练权重](export/mocap_mlp_14160/training/update_00014160/)和原始冻结runtime。
+**当前不启动训练**。原生回放、导出、严格续训和外部依赖见
+[任务说明](g1_lower_rl/tasks/motion_tracking/README.md)。
 
 ## 环境
 
@@ -82,6 +99,24 @@ python scripts/disturb_video.py <run>/model_8800.pt out.mp4 20
 
 动作跟踪任务另有一组脚本，见 [`tasks/motion_tracking/README.md`](g1_lower_rl/tasks/motion_tracking/README.md)。
 
+可复用的[位置控制WM v3](g1_lower_rl/world_model/README.md)采用2048维主干和三个
+1024维门控残差块，网络输入145维，输出70维速度/积分修正与左右脚6维地面合力。
+每次预测推进20ms；配套隔离位置目标采集、自回归训练基础设施及动作/脚步/下肢速度
+可微任务适配，不自动替换现有仿真、PPO或旧策略。
+v3全量mocap预训练已结束，初始化来源保存在
+[预训练目录](logs/world_model/full_mocap22650_v3_4h_20261102/capacity8192/)。
+尚未发布默认兼容权重，无参`load_world_model()`仍明确报缺失，
+不会拿旧权重或随机网络兜底。旧力矩权重及其他历史训练产物已清理，
+只保留[22650完整基线](logs/evaluation/fixed29_stopped35957_baseline_20261102/baseline)
+及其必要溯源依赖；它仍是独立的133维实现，不是v3初始化。
+
+正式全身mocap入口为 `scripts/train.py G1-Gloria-MotionTracking`，
+与 `scripts/train_mocap.py` 使用同一MLP/SuperMimic实现。该任务不走PPO runner。
+MLP14160包含已经在线更新的WM、critic和三套Adam；继续训练不会退回最早的预训练WM。
+原生22650教师只用于独立WM预训练；策略训练采集当前MLP。
+工作区不再包含RGMT、门控actor、PPO混合更新、蒸馏重启和历史迁移实现。
+已交付结果的冻结runtime与权重保持原样。
+
 ### 通用场景 CUDA Graph
 
 `scripts/train.py` 和联合训练入口默认开启
@@ -102,27 +137,23 @@ python scripts/train.py G1-Gloria-LowerBody-Flat --scene-cuda-graphs False
 # 联合训练对照：在原有参数后加 --no-scene-cuda-graphs
 ```
 
-**全身动作跟踪最终成果**：GitHub Release `model-215787`。仓库内的
-`artifacts/final_model_215787/` 保留 manifest 和部署契约，checkpoint 与 ONNX 作为
-Release 资产发布。在 80 条 LAFAN1、8 env、250 s 无删失协议下，平均存活 **163.7 s**，
-体位误差 **0.081 m**。
-有效配方见[任务 README](g1_lower_rl/tasks/motion_tracking/README.md)，完整实验过程见流水账。
-
-走过的弯路与全部已排除方向按时间顺序记在 [`EXPERIMENTS.md`](EXPERIMENTS.md)。
+**全身动作跟踪基线**：
+[MLP14160完整交付](export/mocap_mlp_14160/)包含ONNX、控制契约、
+双rank完整训练权重及经校验的冻结runtime。
+用法与验证边界见[任务 README](g1_lower_rl/tasks/motion_tracking/README.md)。
 
 ### 动作跟踪的训练命令
 
 ```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-python scripts/train.py G1-Gloria-MotionTracking \
-    --gpu-ids '[0]' --env.scene.num-envs 768 --mirror-schedule '()'
+python scripts/train_mocap.py \
+    --world-model path/to/position_v3_pretraining.pt \
+    --replica-source path/to/pinned/SuperMimic-Reproduced \
+    --mocap-dir motions/mocap_supermimic_v1 \
+    --output logs/supermimic/new_mlp --iterations 0
 ```
 
-> `--mirror-schedule '()'` 必须带：镜像增广是按 15 自由度下肢写的，29 自由度会**静默
-> 镜错手臂**。
-
-奖励、终止和 68 维参考 token 配方已固化进 `env_cfg.py`。`GRU_ACTOR=1` 仅用于
-把 actor 换成 GRU 做架构对照。
+该命令从头训练MLP，不走PPO runner，也不使用下肢镜像调度。
+继续MLP14160必须使用任务文档中的双rank `--resume` 命令，以保留在线WM和全部Adam状态。
 
 ## 连杆质量随机化
 

@@ -15,8 +15,6 @@ mjlab 的 ``MjlabOnPolicyRunner`` 只把 ``common_step_counter`` 存进 checkpoi
 
 from __future__ import annotations
 
-import os
-import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -26,7 +24,6 @@ from mjlab.rl import MjlabOnPolicyRunner, RslRlPpoAlgorithmCfg
 from mjlab.rl.exporter_utils import attach_metadata_to_onnx
 from mjlab.tasks.registry import load_runner_cls
 from mjlab.tasks.velocity.rl.runner import VelocityOnPolicyRunner
-from torch import nn
 
 
 @dataclass
@@ -103,58 +100,6 @@ def load_trained_runner(task_id: str, env, agent_cfg, checkpoint: Path, device: 
   return runner
 
 
-def _widen_reference_encoder(path: str, policy, map_location: str) -> str:
-  """把旧存档的 ``command_encoder`` 输入层零填充到新 token 维度，返回可加载的路径。
-
-  参考 token 加了「机器人坐标系下的 key body 位置」后维度从 38 涨到 53，旧权重直接
-  加载会形状不匹配。新增列**置零**，于是加载瞬间策略行为与旧版严格等价，再由训练
-  自己学会用这几维——否则只能从零重训，而那要吃掉整个时间预算。
-
-  扩容结果写临时文件，**不动原存档**。
-  """
-  first = getattr(policy, "command_encoder", None)
-  if first is None:
-    return path
-  layer = next((m for m in first.modules() if isinstance(m, nn.Linear)), None)
-  if layer is None:
-    return path
-
-  ckpt = torch.load(path, map_location=map_location, weights_only=False)
-  sd = ckpt.get("actor_state_dict")
-  if sd is None:
-    return path
-  key = next(
-    (k for k in sd if k.startswith("command_encoder") and k.endswith(".weight")), None
-  )
-  if key is None:
-    return path
-
-  old, new = sd[key].shape[1], layer.weight.shape[1]
-  if old == new:
-    return path
-  if old > new:
-    raise ValueError(f"存档 token 维度 {old} 大于当前 {new}，不支持收窄")
-
-  def _pad(t: torch.Tensor) -> torch.Tensor:
-    out = torch.zeros(t.shape[0], new, dtype=t.dtype)
-    out[:, :old] = t
-    return out
-
-  shape = sd[key].shape
-  sd[key] = _pad(sd[key])
-
-  # Adam 的 exp_avg / exp_avg_sq 同样按旧维度存着，不一起扩容会在 optimizer.step()
-  # 撞形状；丢弃优化器状态则会重置动量，实测那会推高 σ（见 eval-gotchas 第 29 条）。
-  osd = ckpt.get("optimizer_state_dict") or {}
-  for st in (osd.get("state") or {}).values():
-    for k, v in st.items():
-      if torch.is_tensor(v) and v.dim() == 2 and tuple(v.shape) == tuple(shape):
-        st[k] = _pad(v)
-
-  tmp = Path(tempfile.gettempdir()) / f"widen_{Path(path).stem}_{os.getpid()}.pt"
-  torch.save(ckpt, tmp)
-  print(f"[INFO]: 参考 token {old} -> {new} 维，command_encoder 零填充扩容（初始行为不变）")
-  return str(tmp)
 
 
 class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
@@ -322,7 +267,8 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
       name: term.state_dict() for name, term in self._stateful_curriculum_terms()
     }
     # 父类会覆盖 infos["env_state"]，但其余键原样保留，所以另起一个键。
-    super().save(path, {**(infos or {}), "curriculum_state": curriculum_state})
+    checkpoint_infos = {**(infos or {}), "curriculum_state": curriculum_state}
+    super().save(path, checkpoint_infos)
 
     # 父类导出时不写这几项，不补的话只有手动跑 export_onnx.py 的产物才带。
     _, _, onnx_path = self._get_export_paths(path)
@@ -342,7 +288,6 @@ class GloriaOnPolicyRunner(VelocityOnPolicyRunner):
     strict: bool = True,
     map_location: str | None = None,
   ) -> dict:
-    path = _widen_reference_encoder(path, self.alg.actor, map_location or self.device)
     infos = super().load(path, load_cfg, strict, map_location)
     saved = (infos or {}).get("curriculum_state") or {}
     restored, missing = [], []

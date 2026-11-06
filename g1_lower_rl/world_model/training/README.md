@@ -1,5 +1,11 @@
 # Position-WM training
 
+For the official full-body **MLP + SuperMimic** policy task, native playback,
+ONNX and complete policy/online-WM/critic/Adam continuation, use the
+[mocap task guide](../../tasks/motion_tracking/README.md).
+The WM-only commands below are not policy continuation and must not replace
+the online WM in a full policy checkpoint.
+
 The [v3 contract](../README.md) uses 145 neural inputs, 76 raw outputs and one
 held-position-target transition every 20ms. The release contains FP32 weights,
 all frozen normalization buffers and physical provenance, **not an optimizer**.
@@ -9,15 +15,16 @@ all frozen normalization buffers and physical provenance, **not an optimizer**.
 ```bash
 python scripts/train_wm.py \
   --initialize path/to/g1_wm.pt \
-  --checkpoint path/to/frozen_rgmt_teacher.pt \
-  --motion-dir path/to/manifest_backed_teacher_corpus \
+  --checkpoint path/to/audited_native22650/checkpoint.pt \
+  --replica-source path/to/pinned/SuperMimic-Reproduced \
+  --motion-dir motions/mocap_supermimic_v1 \
   --fixed-validation \
   --output-dir logs/world_model/finetune \
   --device cuda:0 --hours 1
 ```
 
-The action-generating teacher, its reference-layout metadata (or `params/env.yaml`),
-mocap data and simulator must be supplied separately.
+The audited native22650 teacher/lineage reports, full mmap mocap data and
+pinned simulator source must be supplied separately.
 `--initialize` retains model/scales and starts fresh Adam and counters.
 Inputs remain in physical units: do not normalize twice or refit the scales.
 For custom training, use `load_world_model(...)` and create an optimizer on
@@ -50,10 +57,9 @@ Shared native loading/reset helpers live in [`native.py`](../native.py).
   normalized state/force errors; evaluation also reports physical-unit errors,
   contacts and a constant-velocity baseline.
 
-`MotionCollector` is the separate RGMT-teacher path. In its isolated environment
-it fixes unconditioned PD/motor/friction/armature parameters, samples shared foot
-friction and rejects unconditioned external forces. Encoder/optional GC target
-processing happens once, then the target is held for four 5ms substeps.
+`MotionCollector` is the common native recording base, not another teacher.
+It records the actual clamped position target held for four 5ms substeps,
+checks shared foot friction and rejects unconditioned external forces.
 Data must match the recorded geometry, actuator parameters and physical contract.
 Custom sources can supply batches via `run_training(..., collector_factory=...)`.
 

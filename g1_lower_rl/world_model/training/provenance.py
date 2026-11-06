@@ -20,26 +20,16 @@ def snapshot_sources(output_dir: Path, *, write: bool) -> dict[str, Any]:
     *sorted(training.glob("*.py")),
     *sorted((model_package / "adapters").glob("*.py")),
     *sorted((repository / "g1_lower_rl/tasks/motion_tracking/mdp").glob("*.py")),
-    repository / "g1_lower_rl/tasks/motion_tracking/env_cfg.py",
     repository / "g1_lower_rl/tasks/motion_tracking/corpus.py",
     repository / "g1_lower_rl/tasks/domain_randomization.py",
-    repository / "g1_lower_rl/rl/rgmt_model.py",
-    repository / "g1_lower_rl/rl/motion_reference.py",
+    repository / "g1_lower_rl/rl/supermimic.py",
+    *sorted((repository / "g1_lower_rl/tasks/motion_tracking/training").glob("*.py")),
   ]
   script = repository / "scripts" / "train_wm.py"
   if script.is_file():
     paths.append(script)
-  native_training = repository / "scripts/train_supermimic29.py"
-  if native_training.is_file():
-    paths.append(native_training)
-  policy_training = repository / "scripts/train_position_mocap.py"
-  if policy_training.is_file():
-    paths.extend([
-      repository / "g1_lower_rl/rl/supermimic.py",
-      repository / "scripts/train_position_mocap.py",
-      repository / "g1_lower_rl/tasks/motion_tracking/training/graphs.py",
-      *sorted((repository / "g1_lower_rl/tasks/motion_tracking/training").glob("position_*.py")),
-    ])
+  for name in ("train_mocap.py", "package_mocap.py", "eval_corpus.py", "render_policy.py"):
+    paths.append(repository / "scripts" / name)
   contents = {str(path.relative_to(repository)): path.read_bytes() for path in paths}
   hashes = {name: hashlib.sha256(data).hexdigest() for name, data in sorted(contents.items())}
   digest = hashlib.sha256(json.dumps(hashes, sort_keys=True, separators=(",", ":")).encode()).hexdigest()

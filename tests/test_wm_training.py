@@ -615,7 +615,8 @@ def test_manifest_provenance_is_saved_and_checked_on_resume(run_dir):
   corpus.mkdir()
   manifest = {"clips": [{"name": "bounded_clip.npz", "sha256": "test-content-hash"}], "version": 1}
   (corpus / "manifest.json").write_text(json.dumps(manifest))
-  cfg = replace(tiny_config(run_dir), synthetic=False, checkpoint="test_teacher.pt", motion_dir=str(corpus))
+  cfg = replace(tiny_config(run_dir), synthetic=False, checkpoint="test_teacher.pt", motion_dir=str(corpus),
+                replica_source="test_native_source")
 
   def factory(config, context, seed):
     return SyntheticCollector(num_envs=config.num_envs, device=context.device, seed=seed, physics_dt=config.physics_dt)
@@ -631,7 +632,8 @@ def test_manifest_provenance_is_saved_and_checked_on_resume(run_dir):
 
 
 def test_missing_bounded_corpus_fails_before_constructing_collector(run_dir):
-  cfg = replace(tiny_config(run_dir), synthetic=False, checkpoint="test_teacher.pt", motion_dir=str(run_dir / "missing"))
+  cfg = replace(tiny_config(run_dir), synthetic=False, checkpoint="test_teacher.pt", motion_dir=str(run_dir / "missing"),
+                replica_source="test_native_source")
 
   def factory(*_):
     raise AssertionError("Missing corpus must be rejected before collection")

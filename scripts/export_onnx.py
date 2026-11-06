@@ -10,13 +10,12 @@ ONNX 的 metadata，读的时候对不上就拒绝启动。
 
 from __future__ import annotations
 
-import copy
 import json
 from pathlib import Path
 
 import tyro
 
-import g1_lower_rl.tasks  # noqa: F401  注册任务
+import g1_lower_rl.tasks
 from g1_lower_rl.rl import deployment_metadata, load_trained_runner
 
 _ = g1_lower_rl.tasks
@@ -44,31 +43,6 @@ def _resolve_task_id(checkpoint: Path, task_id: str | None) -> str:
   return matches[0]
 
 
-def _restore_actor_group(cfg) -> None:
-  """训练时 ``actor`` 组被删掉（死代码，每步白算，删掉提速 12.9%），导出得补回来。
-
-  mjlab 的 ``get_base_metadata`` 和本仓的 ``deployment_metadata`` 都按
-  ``active_terms["actor"]`` 取观测规格来生成部署契约。没有它会 KeyError，
-  ONNX 照样导得出来但契约是空的，部署端不知道观测该怎么喂——是个静默的坑。
-
-  用 ``rg_*`` 各组的并集重建，而不是拿 critic 当模板：critic 含 command、body_pos
-  这些特权信息，写进部署契约会误导部署端去准备它拿不到的量。rg_* 的并集才是
-  策略真正消费的本体观测。
-  """
-  from mjlab.managers.observation_manager import ObservationGroupCfg
-
-  if "actor" in cfg.observations:
-    return
-  terms = {}
-  for group in ("rg_projected_gravity", "rg_base_ang_vel", "rg_joint_pos", "rg_joint_vel", "rg_actions"):
-    if group in cfg.observations:
-      for name, term in cfg.observations[group].terms.items():
-        terms[name] = copy.deepcopy(term)
-  if not terms:
-    raise KeyError("没有可用于重建 actor 组的 rg_* 观测组")
-  cfg.observations["actor"] = ObservationGroupCfg(
-    terms=terms, concatenate_terms=True, enable_corruption=False
-  )
 
 
 def main(
@@ -76,6 +50,7 @@ def main(
   output_dir: str | None = None,
   device: str = "cpu",
   task_id: str | None = None,
+  native_inputs: str | None = None,
 ) -> None:
   """导出 ONNX 到 ``output_dir``（默认与检查点同目录）。"""
   from mjlab.envs import ManagerBasedRlEnv
@@ -84,6 +59,29 @@ def main(
   from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
 
   checkpoint_path = Path(checkpoint)
+  import torch
+
+  probe = torch.load(
+    checkpoint_path / "rank_0.pt" if checkpoint_path.is_dir() else checkpoint_path,
+    weights_only=True, map_location="cpu",
+  )
+  position_checkpoint = probe.get("format") == "full_mocap_position_v3_continuous_rgmt_v1"
+  del probe
+  if position_checkpoint:
+    from g1_lower_rl.tasks import MOCAP_TASK
+    from g1_lower_rl.tasks.motion_tracking.training.export import export_onnx
+
+    if task_id not in (None, MOCAP_TASK):
+      raise ValueError("Position-v3 mocap checkpoint cannot be exported as another task")
+    export_onnx(
+      checkpoint_path, Path(output_dir) if output_dir else checkpoint_path.parent,
+      native_inputs=Path(native_inputs) if native_inputs else None,
+    )
+    return
+  if task_id == "G1-Gloria-MotionTracking":
+    raise ValueError("The official mocap task no longer accepts PPO/RGMT checkpoints")
+  if native_inputs:
+    raise ValueError("--native-inputs is only supported for the official MLP mocap exporter")
   if not checkpoint_path.is_file():
     raise FileNotFoundError(f"检查点不存在: {checkpoint_path}")
   resolved_task_id = _resolve_task_id(checkpoint_path, task_id)
@@ -94,7 +92,6 @@ def main(
   cfg = load_env_cfg(resolved_task_id, play=True)
   agent_cfg = load_rl_cfg(resolved_task_id)
   cfg.scene.num_envs = 1
-  _restore_actor_group(cfg)
 
   env = ManagerBasedRlEnv(cfg=cfg, device=device)
   wrapped = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
@@ -110,8 +107,6 @@ def main(
   contract_path = out / contract_name
   runner.export_policy_to_onnx(str(out), onnx_name)
 
-  robot = env.scene["robot"]
-
   metadata = get_base_metadata(env.unwrapped, "local")
   metadata.update(deployment_metadata(env.unwrapped))
   metadata.update(
@@ -120,44 +115,6 @@ def main(
       "task_id": resolved_task_id,
     }
   )
-  if resolved_task_id == "G1-Gloria-MotionTracking":
-    from g1_lower_rl.tasks.motion_tracking.mdp.commands import GeneralMotionCommand
-
-    motion_cmd = env.command_manager.get_term("motion")
-    assert isinstance(motion_cmd, GeneralMotionCommand)
-    # 窗口由 _window_offsets() 实算（含历史帧，非均匀），cfg.lookahead_steps 是遗留字段，对不上。
-    offsets = [int(x) for x in motion_cmd._window_offsets().tolist()]
-    ref_dim = int(motion_cmd.reference_tokens.shape[-1])
-    feature_dim, rem = divmod(ref_dim, len(offsets))
-    assert rem == 0, f"参考窗口契约与实际不符: {ref_dim} 不能被 {len(offsets)} 整除"
-    key_bodies = list(motion_cmd.cfg.reference_key_bodies)
-    layout = "lin_vel_local3,ang_vel_local3,proj_gravity3,joint_pos29"
-    per_body = 0
-    if key_bodies:
-      # 这几维都在**机器人当前 anchor 的 yaw 局部系**下，部署端必须用机器人自身位姿去算。
-      # 位置项还需要里程计（要减 robot_anchor_pos_w），速度项只需 yaw 姿态。
-      if motion_cmd.cfg.reference_key_body_pos:
-        layout += f",key_body_pos_in_robot_anchor_yaw{len(key_bodies) * 3}"
-        per_body += 3
-      if motion_cmd.cfg.reference_key_body_vel:
-        layout += f",key_body_vel_in_robot_anchor_yaw{len(key_bodies) * 3}"
-        per_body += 3
-    expect = 38 + len(key_bodies) * per_body
-    assert feature_dim == expect, (
-      f"契约 layout 与实际维度不符: layout 描述 {expect}，实际 {feature_dim}。"
-      "部署端会按 layout 排布输入，对不上就是静默错位。"
-    )
-    metadata.update(
-      {
-        "lookahead_steps": offsets,
-        "lookahead_feature_dim": feature_dim,
-        "lookahead_layout": layout,
-        "reference_key_bodies": key_bodies,
-        "anchor_body_name": motion_cmd.cfg.anchor_body_name,
-        "tracked_body_names": list(motion_cmd.cfg.body_names),
-        "all_body_names": list(robot.body_names),
-      }
-    )
   attach_metadata_to_onnx(str(onnx_path), metadata)
 
   # 同时落一份可读的契约，便于人工核对与写部署测试。
@@ -168,6 +125,7 @@ def main(
   print(f"[导出] {onnx_path}")
   print(f"[导出] {contract_path}")
   print(f"  观测 {env.observation_manager.group_obs_dim['actor']} -> 动作 {env.action_manager.total_action_dim}")
+  env.close()
 
 
 if __name__ == "__main__":

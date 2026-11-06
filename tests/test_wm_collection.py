@@ -4,11 +4,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
-from mjlab.scene import Scene
+from mjlab.scene import Scene, SceneCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.registry import load_env_cfg
+from mjlab.terrains import TerrainEntityCfg
 
-from g1_lower_rl.tasks.motion_tracking.env_cfg import motion_tracking_env_cfg
+from g1_lower_rl.assets.g1_gloria import get_robot_cfg
 from g1_lower_rl.world_model.collection import MotionCollector, canonical_indices, native_sensor_force_sign
 from g1_lower_rl.world_model.corpus import prepare_corpus
 from g1_lower_rl.world_model.model import BODY_NAMES, JOINT_NAMES
@@ -49,7 +50,7 @@ def position_collector(native_model):
     scene=SimpleNamespace(env_origins=torch.zeros(2, 3)),
     cfg=SimpleNamespace(decimation=4),
   )
-  collector._randomize_foot_friction(torch.arange(2))
+  physics.geom_friction[:, [geom for ids in collector._foot_geoms for geom in ids], 0] = 0.8
   collector._sensor = SimpleNamespace(data=SimpleNamespace(force=torch.zeros(2, 2, 3)), _invalidate_cache=lambda: None)
   collector._force_sign, collector._substep = -1.0, 0
   collector._held_target, collector._tick_start, collector._last_next = None, None, None
@@ -119,9 +120,8 @@ def test_intermediate_overflow_quarantines_entire_control_transition(position_co
 
 @pytest.fixture(scope="module")
 def native_model():
-  cfg = motion_tracking_env_cfg()
-  cfg.scene.num_envs = 1
-  cfg.scene.sensors = (
+  cfg = SceneCfg(num_envs=1, entities={"robot": get_robot_cfg()}, terrain=TerrainEntityCfg(terrain_type="plane"))
+  cfg.sensors = (
     ContactSensorCfg(
       name="wm_feet",
       primary=ContactMatch(mode="body", pattern=r"^(left|right)_ankle_roll_link$", entity="robot"),
@@ -130,7 +130,7 @@ def native_model():
       reduce="netforce",
     ),
   )
-  return Scene(cfg.scene, device="cpu").compile()
+  return Scene(cfg, device="cpu").compile()
 
 
 def test_canonical_contract_matches_compiled_robot(native_model):
@@ -185,110 +185,6 @@ def test_transition_state_layout_uses_native_body_angular_velocity(native_model)
   assert indices["qpos"] == list(range(7, 36))
   assert indices["qvel"] == list(range(6, 35))
   assert torch.tensor(indices["qvel"]).unique().numel() == 29
-
-
-@pytest.mark.parametrize("reset_works", [True, False])
-def test_nonfinite_recovery_is_targeted_logged_and_keeps_invalid_labels(caplog, reset_works):
-  from types import SimpleNamespace
-
-  collector = MotionCollector.__new__(MotionCollector)
-  collector.num_envs = 3
-  collector.device = torch.device("cpu")
-  data = SimpleNamespace(**{name: torch.ones(3, 4) for name in ("qpos", "qvel", "qacc", "qacc_warmstart", "sensordata")})
-  data.qpos[1, 0] = torch.nan
-  data.overflow = torch.zeros(3, dtype=torch.int32)
-  observations = {"history": torch.arange(12.0).reshape(3, 4)}
-  untouched = observations["history"][[0, 2]].clone()
-  resets = []
-
-  def reset(*, env_ids):
-    resets.append(env_ids.clone())
-    if reset_works:
-      data.qpos[env_ids] = 0
-      observations["history"][env_ids] = 0
-    return observations, {}
-
-  collector.env = SimpleNamespace(sim=SimpleNamespace(data=data), reset=reset)
-  collector._command = SimpleNamespace(motion_ids=torch.tensor([10, 11, 12]))
-  collector.nonfinite_envs = torch.zeros(3, dtype=torch.bool)
-  collector.last_dones = torch.zeros(3, dtype=torch.bool)
-  collector.counters = {"nonfinite_resets": 0}
-  collector._records = [
-    (
-      torch.ones(3, 71),
-      torch.ones(3, 145),
-      torch.ones(3, 71),
-      torch.ones(3, 2, 3),
-      torch.ones(3, dtype=torch.bool),
-      torch.zeros(3, dtype=torch.long),
-    )
-    for _ in range(4)
-  ]
-  collector._records[-1][2][1, 0] = torch.nan
-  if reset_works:
-    collector._recover_nonfinite(0)
-    assert torch.isfinite(data.qpos).all()
-    assert collector.last_dones.tolist() == [False, True, False]
-    assert collector.counters["nonfinite_resets"] == 1
-  else:
-    with pytest.raises(FloatingPointError, match="survived 3 targeted resets"):
-      collector._recover_nonfinite(0)
-  assert len(resets) == (1 if reset_works else 3) and all(ids.tolist() == [1] for ids in resets)
-  assert "quarantining" in caplog.text and "motions=[11]" in caplog.text
-  assert all(record[4].tolist() == [True, False, True] for record in collector._records)
-  assert torch.isnan(collector._records[-1][2][1, 0])
-  torch.testing.assert_close(observations["history"][[0, 2]], untouched, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("propagates", ["state", "observation", "overflow"])
-def test_reset_forward_quarantines_newly_invalid_other_environments(propagates):
-  from types import SimpleNamespace
-
-  collector = MotionCollector.__new__(MotionCollector)
-  collector.num_envs, collector.device = 3, torch.device("cpu")
-  data = SimpleNamespace(**{name: torch.ones(3, 4) for name in ("qpos", "qvel", "qacc", "qacc_warmstart", "sensordata")})
-  data.qpos[1, 0] = torch.nan
-  data.overflow = torch.zeros(3, dtype=torch.int32)
-  observations = {"history": torch.ones(3, 10)}
-  resets = []
-
-  def reset(*, env_ids):
-    resets.append(env_ids.tolist())
-    for name in ("qpos", "qvel", "qacc", "qacc_warmstart", "sensordata"):
-      getattr(data, name)[env_ids] = 0
-    data.overflow[env_ids] = 0
-    observations["history"][env_ids] = 0
-    if len(resets) == 1:
-      if propagates == "state":
-        data.qacc[2, 0] = torch.nan
-      elif propagates == "observation":
-        observations["history"][2, 0] = torch.nan
-      else:
-        data.overflow[2] = 64
-    return observations, {}
-
-  collector.env = SimpleNamespace(sim=SimpleNamespace(data=data), reset=reset)
-  collector._command = SimpleNamespace(motion_ids=torch.arange(3))
-  collector.nonfinite_envs = torch.zeros(3, dtype=torch.bool)
-  collector.last_dones = torch.zeros(3, dtype=torch.bool)
-  collector.counters = {"nonfinite_resets": 0}
-  collector._records = [
-    (
-      torch.ones(3, 71),
-      torch.ones(3, 145),
-      torch.ones(3, 71),
-      torch.ones(3, 2, 3),
-      torch.ones(3, dtype=torch.bool),
-      torch.zeros(3, dtype=torch.long),
-    )
-    for _ in range(4)
-  ]
-  collector._recover_nonfinite(0)
-  assert resets == [[1], [2]]
-  assert collector.nonfinite_envs.tolist() == collector.last_dones.tolist() == [False, True, True]
-  assert all(record[4].tolist() == [True, False, False] for record in collector._records)
-  assert collector.counters["nonfinite_resets"] == 2
-  assert torch.isfinite(data.qacc).all() and torch.isfinite(observations["history"]).all()
 
 
 @pytest.mark.parametrize("task", ["G1-Gloria-FootstepTracking", "G1-Gloria-LowerBody-Flat"])

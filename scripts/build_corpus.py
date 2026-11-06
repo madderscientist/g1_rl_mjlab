@@ -139,10 +139,10 @@ def main(
   device: str = "cuda:0",
 ) -> None:
   """把 CSV 动作转成 NPZ 语料。"""
-  from mjlab.scene import Scene
+  from mjlab.scene import Scene, SceneCfg
   from mjlab.sim.sim import Simulation, SimulationCfg
 
-  from g1_lower_rl.tasks.motion_tracking import motion_tracking_env_cfg
+  from g1_lower_rl.assets.g1_gloria import get_robot_cfg
 
   out = Path(output_dir)
   out.mkdir(parents=True, exist_ok=True)
@@ -160,7 +160,7 @@ def main(
   print(f"[语料] 待转换 {len(clips)} 段")
 
   # 用与训练完全相同的场景做正运动学，保证刚体顺序一致。
-  cfg = motion_tracking_env_cfg()
+  cfg = SceneCfg(num_envs=1, entities={"robot": get_robot_cfg()})
   sim_cfg = SimulationCfg()
   sim_cfg.mujoco.timestep = 1.0 / fps
   # fallAndGetUp 这类动作有整段躺在地上的帧，接触点数远超训练配置里按站立姿态定的
@@ -168,7 +168,7 @@ def main(
   # access，且是异步报出来的，栈指向的往往是无辜的下一行。只做正运动学，放宽不费什么。
   sim_cfg.nconmax = 2000
   sim_cfg.njmax = 4000
-  scene = Scene(cfg.scene, device=device)
+  scene = Scene(cfg, device=device)
   model = scene.compile()
   sim = Simulation(num_envs=1, cfg=sim_cfg, model=model, device=device)
   scene.initialize(sim.mj_model, sim.model, sim.data)

@@ -16,14 +16,14 @@ import mjlab
 import tyro
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.rl import MjlabOnPolicyRunner, RslRlBaseRunnerCfg, RslRlVecEnvWrapper
-from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
+from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.utils.gpu import select_gpus
 from mjlab.utils.os import dump_yaml, get_checkpoint_path
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
 
 from g1_lower_rl.scene_graph import enable_scene_cuda_graphs
-from g1_lower_rl.tasks import FOOTSTEP_TASK, STEP_EPISODE_TASK
+from g1_lower_rl.tasks import FOOTSTEP_TASK, MOCAP_TASK, STEP_EPISODE_TASK, list_tasks
 from g1_lower_rl.tasks.lower_body.cfg.constants import MIRROR_STAGES
 
 
@@ -199,15 +199,17 @@ def launch_training(task_id: str, args: TrainConfig | None = None) -> None:
 
 
 def main() -> None:
-  import g1_lower_rl.tasks  # noqa: F401  注册任务
-
-  _ = g1_lower_rl.tasks
   chosen_task, remaining_args = tyro.cli(
     tyro.extras.literal_type_from_choices(list_tasks()),
     add_help=False,
     return_unknown_args=True,
     config=mjlab.TYRO_FLAGS,
   )
+  if chosen_task == MOCAP_TASK:
+    from g1_lower_rl.tasks.motion_tracking.training import TrainingConfig, run_training
+
+    run_training(tyro.cli(TrainingConfig, args=remaining_args, prog=f"{sys.argv[0]} {chosen_task}"))
+    return
   args = tyro.cli(
     TrainConfig,
     args=remaining_args,

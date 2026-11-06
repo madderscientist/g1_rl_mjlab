@@ -56,7 +56,7 @@ def utc_now() -> str:
 class TrainingConfig:
   checkpoint: str = ""
   """Frozen teacher checkpoint. Required unless --synthetic is explicitly selected."""
-  teacher_kind: Literal["rgmt", "supermimic22650"] = "rgmt"
+  teacher_kind: Literal["supermimic22650"] = "supermimic22650"
   replica_source: str | None = None
   """Audited third-party source tree required by the frozen native22650 teacher."""
   output_dir: str = "logs/world_model/pretrain"
@@ -182,8 +182,8 @@ class TrainingConfig:
       raise ValueError("max_updates must be positive")
     if not self.synthetic and not self.checkpoint:
       raise ValueError("A frozen teacher checkpoint is required (or explicitly use --synthetic)")
-    if self.teacher_kind == "supermimic22650" and (not self.replica_source or self.synthetic):
-      raise ValueError("Native22650 requires --replica-source and real MuJoCo collection")
+    if self.teacher_kind != "supermimic22650" or (not self.synthetic and not self.replica_source):
+      raise ValueError("WM pretraining requires the native22650 teacher and --replica-source, or --synthetic")
 
 
 @dataclass
@@ -247,7 +247,8 @@ def _collector(cfg: TrainingConfig, context: DistributedContext, seed: int):
 
     return SyntheticCollector(num_envs=cfg.num_envs, device=context.device, seed=seed, physics_dt=cfg.physics_dt)
   # Keep simulator/task/teacher imports out of inference and replay-only use.
-  from g1_lower_rl.world_model.collection import CollectorConfig, MotionCollector
+  from g1_lower_rl.world_model.baseline_collection import BaselineMotionCollector
+  from g1_lower_rl.world_model.collection import CollectorConfig
 
   config = CollectorConfig(
     checkpoint=cfg.checkpoint,
@@ -259,12 +260,8 @@ def _collector(cfg: TrainingConfig, context: DistributedContext, seed: int):
     physics_dt=cfg.physics_dt,
     action_noise=cfg.action_noise,
   )
-  if cfg.teacher_kind == "supermimic22650":
-    from g1_lower_rl.world_model.baseline_collection import BaselineMotionCollector
-
-    assert cfg.replica_source is not None
-    return BaselineMotionCollector(config, replica_source=cfg.replica_source, validation_envs=cfg.validation_envs)
-  return MotionCollector(config)
+  assert cfg.replica_source is not None
+  return BaselineMotionCollector(config, replica_source=cfg.replica_source, validation_envs=cfg.validation_envs)
 
 
 def _autocast(cfg: TrainingConfig):

@@ -1,5 +1,6 @@
 """导入本模块即注册所有任务。"""
 
+from mjlab.tasks.registry import list_tasks as list_mjlab_tasks
 from mjlab.tasks.registry import register_mjlab_task
 
 from g1_lower_rl.rl import GloriaOnPolicyRunner
@@ -13,10 +14,7 @@ from g1_lower_rl.tasks.lower_body import (
   ppo_runner_cfg_gru,
 )
 from g1_lower_rl.tasks.lower_body.cfg.constants import ITER
-from g1_lower_rl.tasks.motion_tracking import (
-  motion_tracking_env_cfg,
-  motion_tracking_ppo_runner_cfg,
-)
+from g1_lower_rl.tasks.motion_tracking import MOCAP_TASK as MOCAP_TASK
 from g1_lower_rl.tasks.standing import standing_env_cfg, standing_ppo_runner_cfg
 
 # 脚本的默认任务。别再各自硬编码字符串——改过任务名之后漏改一处就会静默跑错环境。
@@ -68,12 +66,6 @@ register_mjlab_task(
   runner_cls=GloriaOnPolicyRunner,
 )
 
-# 全身 29 轴跟随一段参考动作（GMT）。镜像增强是按下肢 15 轴写的，对 29 轴会镜错，
-# 但它由 train.py 的 --mirror-schedule 控制，与 runner 无关，跑本任务时传空即可。
-register_mjlab_task(
-  task_id="G1-Gloria-MotionTracking",
-  env_cfg=motion_tracking_env_cfg(),
-  play_env_cfg=motion_tracking_env_cfg(play=True),
-  rl_cfg=motion_tracking_ppo_runner_cfg(),
-  runner_cls=GloriaOnPolicyRunner,
-)
+def list_tasks() -> list[str]:
+  """Project tasks include SuperMimic, which deliberately has no PPO registry entry."""
+  return sorted([*list_mjlab_tasks(), MOCAP_TASK])

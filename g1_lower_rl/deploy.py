@@ -107,6 +107,11 @@ class Policy(NamedTuple):
 def load_policy(path: str) -> Policy:
   session = onnxruntime.InferenceSession(path, providers=["CPUExecutionProvider"])
   meta = dict(session.get_modelmeta().custom_metadata_map)
+  if "mocap_contract" in meta:
+    raise ValueError(
+      "This is a full-body mocap MLP, not a velocity-command policy. "
+      "Use its history/reference ONNX contract and scripts/play.py G1-Gloria-MotionTracking."
+    )
   names = meta["joint_names"].split(",")
   defaults = np.array([float(v) for v in meta["default_joint_pos"].split(",")])
   scale = np.array([float(v) for v in meta["action_scale"].split(",")])

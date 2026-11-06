@@ -13,12 +13,13 @@ import torch
 import tyro
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
-from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg
+from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 
 from g1_lower_rl.rl import latest_checkpoint, load_trained_runner
+from g1_lower_rl.tasks import MOCAP_TASK, list_tasks
 
 
 @dataclass(frozen=True)
@@ -123,15 +124,18 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
 
 
 def main() -> None:
-  import g1_lower_rl.tasks  # noqa: F401  注册任务
-
-  _ = g1_lower_rl.tasks
   chosen_task, remaining_args = tyro.cli(
     tyro.extras.literal_type_from_choices(list_tasks()),
     add_help=False,
     return_unknown_args=True,
     config=mjlab.TYRO_FLAGS,
   )
+  if chosen_task == MOCAP_TASK:
+    from g1_lower_rl.tasks.motion_tracking.training.playback import PlayConfig as MocapPlayConfig
+    from g1_lower_rl.tasks.motion_tracking.training.playback import run_play as run_mocap_play
+
+    run_mocap_play(tyro.cli(MocapPlayConfig, args=remaining_args, prog=f"{sys.argv[0]} {chosen_task}"))
+    return
   args = tyro.cli(
     PlayConfig,
     args=remaining_args,

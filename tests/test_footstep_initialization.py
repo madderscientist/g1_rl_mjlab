@@ -30,7 +30,7 @@ def test_mixture_is_shared_by_training_profiles_only(profile, play):
 
 
 @pytest.mark.parametrize("task", [
-  "G1-Gloria-LowerBody-Flat", "G1-Gloria-LowerBody-Flat-GRU", "G1-Gloria-Stand", "G1-Gloria-MotionTracking",
+  "G1-Gloria-LowerBody-Flat", "G1-Gloria-LowerBody-Flat-GRU", "G1-Gloria-Stand",
 ])
 def test_other_tasks_keep_original_initialization(task):
   assert "reset_initialization" not in load_env_cfg(task).events

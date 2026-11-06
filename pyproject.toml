@@ -11,6 +11,7 @@ dependencies = [
   "mjlab>=1.6.0",
   # Direct third-party imports used by scripts/.
   "imageio[ffmpeg]",
+  "onnx",
   "onnxruntime",
   "Pillow",
   "tyro",
