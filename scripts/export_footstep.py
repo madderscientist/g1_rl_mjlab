@@ -22,6 +22,7 @@ def main():
   parser.add_argument("checkpoint", type=Path)
   parser.add_argument("--output-dir", type=Path, required=True)
   parser.add_argument("--simulation-steps", type=int, default=0)
+  parser.add_argument("--twin-mirror", action="store_true", help="Export with Twin-Mirror sagittal symmetrization")
   args = parser.parse_args()
   if args.simulation_steps < 0:
     parser.error("Simulation steps must be nonnegative")
@@ -30,7 +31,8 @@ def main():
   digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
   saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
   assert saved["infos"]["actor_raw_obs_dim"] == 79
-  config = {name: value for name, value in asdict(FootstepModelCfg()).items()
+  twin_mirror = bool(args.twin_mirror or (saved.get("infos") or {}).get("twin_mirror", False))
+  config = {name: value for name, value in asdict(FootstepModelCfg(twin_mirror=twin_mirror)).items()
     if name in inspect.signature(FootstepActor).parameters}
   observations = TensorDict({"actor": torch.zeros(1, 79)}, batch_size=[1])
   actor = FootstepActor(observations, {"actor": ["actor"]}, "actor", 15, **config).eval()
@@ -60,7 +62,8 @@ def main():
     return next_hidden
 
   generator = np.random.default_rng(42)
-  hidden = torch.zeros(1, 1, 64)
+  hidden_shape = tuple(contract["inputs"]["h_in"])
+  hidden = torch.zeros(*hidden_shape)
   with torch.inference_mode():
     for step in range(1024):
       if step % 128 == 0:
@@ -98,7 +101,7 @@ def main():
         with torch.inference_mode():
           env.reset()
           policy.reset()
-          hidden = torch.zeros(1, 1, 64)
+          hidden = torch.zeros(*hidden_shape)
           resets = 0
           for step in range(args.simulation_steps):
             reset = env.episode_length_buf == 0

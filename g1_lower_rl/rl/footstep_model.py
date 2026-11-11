@@ -22,6 +22,8 @@ from torch import nn
 from g1_lower_rl.assets import LOWER_BODY_JOINTS, WHOLE_BODY_JOINTS, get_robot_cfg
 from g1_lower_rl.footstep_contract import ACTION_DIM, CONTRACT_VERSION, ENCODED_OBS_DIM, FOOTSTEP_SLOTS, RAW_OBS_DIM
 from g1_lower_rl.footstep_phase import FootstepPhaseCfg, resolve_phase_cfg
+from g1_lower_rl.rl.mirror import _pair_joints
+from rsl_rl.utils import unpad_trajectories
 
 OBSERVATION_LAYOUT = (
   ("joint_pos", 0, 29, "rad"),
@@ -109,11 +111,154 @@ class FootstepObservationEncoder(nn.Module):
     return torch.cat((features, obs[..., 78:79]), dim=-1) if self.include_theta else features
 
 
+def build_footstep_mirror_buffers(*, include_theta: bool = True) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+  """构建编码观测空间（82/81维）与动作空间（15维）的矢状面左右镜像置换与符号"""
+  q_perm, q_sign = _pair_joints(list(WHOLE_BODY_JOINTS))
+  act_perm, act_sign = _pair_joints(list(LOWER_BODY_JOINTS))
+  enc_perm = (
+    q_perm
+    + [29 + i for i in q_perm]
+    + list(range(58, 73))
+    + [77, 78, 79, 80, 73, 74, 75, 76]
+    + ([81] if include_theta else [])
+  )
+  enc_sign = (
+    q_sign
+    + q_sign
+    + [-1.0, 1.0, -1.0]  # pelvis_ang_vel
+    + [1.0, -1.0, 1.0]   # pelvis_projected_gravity
+    + [-1.0, 1.0, -1.0]  # torso_ang_vel
+    + [1.0, -1.0, 1.0]   # torso_projected_gravity
+    + [-1.0, -1.0]       # sin(phase), cos(phase): phase + pi -> (-sin, -cos)
+    + [1.0]              # frequency
+    + [1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0]  # L_next <-> R_next: (dx, -dy, -sin, +cos)
+    + ([-1.0] if include_theta else [])  # theta -> -theta
+  )
+  return (
+    torch.tensor(enc_perm, dtype=torch.long),
+    torch.tensor(enc_sign, dtype=torch.float32),
+    torch.tensor(act_perm, dtype=torch.long),
+    torch.tensor(act_sign, dtype=torch.float32),
+  )
+
+
+class _TwinMirrorTorchGRUModel(nn.Module):
+  """TorchScript-friendly Twin-Mirror GRU wrapper."""
+
+  hidden_state: torch.Tensor
+  enc_mirror_perm: torch.Tensor
+  enc_mirror_sign: torch.Tensor
+  act_mirror_perm: torch.Tensor
+  act_mirror_sign: torch.Tensor
+
+  def __init__(self, model: FootstepActor) -> None:
+    super().__init__()
+    self.encoder = copy.deepcopy(model.encoder)
+    self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+    self.rnn = copy.deepcopy(model.rnn.rnn)
+    self.mlp = copy.deepcopy(model.mlp)
+    if model.distribution is not None:
+      self.deterministic_output = model.distribution.as_deterministic_output_module()
+    else:
+      self.deterministic_output = nn.Identity()
+    self.rnn.cpu()
+    self.register_buffer("enc_mirror_perm", model._enc_mirror_perm.detach().cpu().clone())
+    self.register_buffer("enc_mirror_sign", model._enc_mirror_sign.detach().cpu().clone())
+    self.register_buffer("act_mirror_perm", model._act_mirror_perm.detach().cpu().clone())
+    self.register_buffer("act_mirror_sign", model._act_mirror_sign.detach().cpu().clone())
+    self.register_buffer("hidden_state", torch.zeros(self.rnn.num_layers, 1, 2 * self.rnn.hidden_size))
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    enc_orig = self.encoder(x)
+    enc_mirr = enc_orig.index_select(-1, self.enc_mirror_perm) * self.enc_mirror_sign
+    norm_pair = self.obs_normalizer(torch.cat((enc_orig, enc_mirr), dim=0))
+    h_orig, h_mirr = self.hidden_state.chunk(2, dim=-1)
+    h_pair = torch.cat((h_orig, h_mirr), dim=1)
+    out_pair, next_h_pair = self.rnn(norm_pair.unsqueeze(0), h_pair)
+    next_h_orig, next_h_mirr = next_h_pair.chunk(2, dim=1)
+    self.hidden_state[:] = torch.cat((next_h_orig, next_h_mirr), dim=-1)
+    mlp_pair = self.mlp(out_pair.squeeze(0))
+    out_orig, out_mirr = mlp_pair.chunk(2, dim=0)
+    out_mirr_back = out_mirr.index_select(-1, self.act_mirror_perm) * self.act_mirror_sign
+    return self.deterministic_output(0.5 * (out_orig + out_mirr_back))
+
+  @torch.jit.export
+  def reset(self) -> None:
+    self.hidden_state[:] = 0.0
+
+
+class _TwinMirrorOnnxRNNModel(nn.Module):
+  """ONNX-exportable Twin-Mirror GRU wrapper."""
+
+  is_recurrent: bool = True
+  enc_mirror_perm: torch.Tensor
+  enc_mirror_sign: torch.Tensor
+  act_mirror_perm: torch.Tensor
+  act_mirror_sign: torch.Tensor
+
+  def __init__(self, model: FootstepActor, verbose: bool = False) -> None:
+    super().__init__()
+    self.verbose = verbose
+    self.encoder = copy.deepcopy(model.encoder)
+    self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+    self.rnn = copy.deepcopy(model.rnn.rnn)
+    self.mlp = copy.deepcopy(model.mlp)
+    if model.distribution is not None:
+      self.deterministic_output = model.distribution.as_deterministic_output_module()
+    else:
+      self.deterministic_output = nn.Identity()
+    self.register_buffer("enc_mirror_perm", model._enc_mirror_perm.detach().cpu().clone())
+    self.register_buffer("enc_mirror_sign", model._enc_mirror_sign.detach().cpu().clone())
+    self.register_buffer("act_mirror_perm", model._act_mirror_perm.detach().cpu().clone())
+    self.register_buffer("act_mirror_sign", model._act_mirror_sign.detach().cpu().clone())
+    self.input_size = model.raw_obs_dim
+    self.hidden_size = 2 * int(self.rnn.hidden_size)
+    self.num_layers = int(self.rnn.num_layers)
+
+  def forward(
+    self, obs: torch.Tensor, h_in: torch.Tensor, c_in: torch.Tensor | None = None
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    del c_in
+    enc_orig = self.encoder(obs)
+    enc_mirr = enc_orig.index_select(-1, self.enc_mirror_perm) * self.enc_mirror_sign
+    norm_orig = self.obs_normalizer(enc_orig)
+    norm_mirr = self.obs_normalizer(enc_mirr)
+    half = self.hidden_size // 2
+    h_orig = h_in[:, :, :half]
+    h_mirr = h_in[:, :, half:]
+    out_orig_seq, next_h_orig = self.rnn(norm_orig.unsqueeze(0), h_orig)
+    out_mirr_seq, next_h_mirr = self.rnn(norm_mirr.unsqueeze(0), h_mirr)
+    h_out = torch.cat((next_h_orig, next_h_mirr), dim=-1)
+    out_orig = self.mlp(out_orig_seq.squeeze(0))
+    out_mirr = self.mlp(out_mirr_seq.squeeze(0))
+    out_mirr_back = out_mirr.index_select(-1, self.act_mirror_perm) * self.act_mirror_sign
+    out = self.deterministic_output(0.5 * (out_orig + out_mirr_back))
+    return out, h_out, None
+
+  def get_dummy_inputs(self) -> tuple[torch.Tensor, ...]:
+    obs = torch.zeros(1, self.input_size)
+    h_in = torch.zeros(self.num_layers, 1, self.hidden_size)
+    return (obs, h_in)
+
+  @property
+  def input_names(self) -> list[str]:
+    return ["obs", "h_in"]
+
+  @property
+  def output_names(self) -> list[str]:
+    return ["actions", "h_out"]
+
+
 class FootstepActor(RNNModel):
   """以原始观测作为明确部署输入边界的 rsl_rl 循环策略网络"""
 
   raw_obs_dim = RAW_OBS_DIM
   encoded_obs_dim = ENCODED_OBS_DIM
+  default_twin_mirror = False
+  _enc_mirror_perm: torch.Tensor
+  _enc_mirror_sign: torch.Tensor
+  _act_mirror_perm: torch.Tensor
+  _act_mirror_sign: torch.Tensor
 
   def __init__(
     self,
@@ -130,11 +275,13 @@ class FootstepActor(RNNModel):
     rnn_num_layers: int = 1,
     default_joint_pos: Sequence[float] | None = None,
     phase_cfg: FootstepPhaseCfg | dict | None = None,
+    twin_mirror: bool | None = None,
   ) -> None:
     if output_dim != ACTION_DIM:
       raise ValueError("FootstepActor controls exactly 15 leg and waist joints")
     if rnn_type != "gru":
       raise ValueError("FootstepActor requires a GRU")
+    self.twin_mirror = self.default_twin_mirror if twin_mirror is None else bool(twin_mirror)
     super().__init__(
       obs=obs,
       obs_groups=obs_groups,
@@ -148,10 +295,21 @@ class FootstepActor(RNNModel):
       rnn_hidden_dim=rnn_hidden_dim,
       rnn_num_layers=rnn_num_layers,
     )
-    self.encoder = FootstepObservationEncoder(default_joint_pos, include_theta=self.raw_obs_dim == 79)
+    include_theta = self.raw_obs_dim == 79
+    self.encoder = FootstepObservationEncoder(default_joint_pos, include_theta=include_theta)
+    enc_perm, enc_sign, act_perm, act_sign = build_footstep_mirror_buffers(include_theta=include_theta)
+    self.register_buffer("_enc_mirror_perm", enc_perm, persistent=False)
+    self.register_buffer("_enc_mirror_sign", enc_sign, persistent=False)
+    self.register_buffer("_act_mirror_perm", act_perm, persistent=False)
+    self.register_buffer("_act_mirror_sign", act_sign, persistent=False)
     self.phase_cfg = resolve_phase_cfg(phase_cfg=FootstepPhaseCfg(**phase_cfg) if isinstance(phase_cfg, dict) else phase_cfg)
     for name, values in nominal_action_parameters().items():
       self.register_buffer(f"action_{name}", torch.tensor(values, dtype=torch.float32))
+
+  @property
+  def hidden_state_dim(self) -> int:
+    rnn_module: Any = self.rnn.rnn
+    return int(rnn_module.hidden_size) * (2 if self.twin_mirror else 1)
 
   def _get_obs_dim(self, obs: TensorDict, obs_groups: dict[str, list[str]], obs_set: str) -> tuple[list[str], int]:
     groups, raw_dim = super()._get_obs_dim(obs, obs_groups, obs_set)
@@ -160,21 +318,80 @@ class FootstepActor(RNNModel):
     return groups, self.encoded_obs_dim
 
   def get_latent(self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None) -> torch.Tensor:
-    features = self.obs_normalizer(self.encoder(obs[self.obs_groups[0]]))
-    return self.rnn(features, masks, hidden_state).squeeze(0)
+    raw = obs[self.obs_groups[0]]
+    if not self.twin_mirror:
+      features = self.obs_normalizer(self.encoder(raw))
+      return self.rnn(features, masks, hidden_state).squeeze(0)
+    enc_orig = self.encoder(raw)
+    enc_mirr = enc_orig.index_select(-1, self._enc_mirror_perm) * self._enc_mirror_sign
+    if masks is not None:
+      if hidden_state is None or not isinstance(hidden_state, torch.Tensor):
+        raise ValueError("Hidden states not passed to RNN module during policy update")
+      h_orig, h_mirr = hidden_state.chunk(2, dim=-1)
+      h_pair = torch.cat((h_orig, h_mirr), dim=1).contiguous()
+      norm_pair = self.obs_normalizer(torch.cat((enc_orig, enc_mirr), dim=1))
+      out_pair, _ = self.rnn.rnn(norm_pair, h_pair)
+      out_orig, out_mirr = out_pair.chunk(2, dim=1)
+      lat_orig = unpad_trajectories(out_orig, masks)
+      lat_mirr = unpad_trajectories(out_mirr, masks)
+      return torch.cat((lat_orig, lat_mirr), dim=-1)
+    h_in = self.rnn.hidden_state if hidden_state is None else hidden_state
+    if h_in is None:
+      h_pair = None
+    else:
+      if not isinstance(h_in, torch.Tensor):
+        raise TypeError("Expected GRU hidden state tensor")
+      h_orig, h_mirr = h_in.chunk(2, dim=-1)
+      h_pair = torch.cat((h_orig, h_mirr), dim=1).contiguous()
+    norm_pair = self.obs_normalizer(torch.cat((enc_orig, enc_mirr), dim=0))
+    out_pair, next_h_pair = self.rnn.rnn(norm_pair.unsqueeze(0), h_pair)
+    next_h_orig, next_h_mirr = next_h_pair.chunk(2, dim=1)
+    self.rnn.hidden_state = torch.cat((next_h_orig, next_h_mirr), dim=-1)
+    lat_orig, lat_mirr = out_pair.squeeze(0).chunk(2, dim=0)
+    return torch.cat((lat_orig, lat_mirr), dim=-1)
+
+  def forward(
+    self,
+    obs: TensorDict,
+    masks: torch.Tensor | None = None,
+    hidden_state: HiddenState = None,
+    stochastic_output: bool = False,
+  ) -> torch.Tensor:
+    if not self.twin_mirror:
+      return super().forward(obs, masks=masks, hidden_state=hidden_state, stochastic_output=stochastic_output)
+    latent = self.get_latent(obs, masks, hidden_state)
+    lat_orig, lat_mirr = latent.chunk(2, dim=-1)
+    mlp_pair = self.mlp(torch.stack((lat_orig, lat_mirr), dim=0))
+    out_orig, out_mirr = mlp_pair[0], mlp_pair[1]
+    out_mirr_back = out_mirr.index_select(-1, self._act_mirror_perm) * self._act_mirror_sign
+    mlp_output = 0.5 * (out_orig + out_mirr_back)
+    if self.distribution is not None:
+      if stochastic_output:
+        self.distribution.update(mlp_output)
+        return self.distribution.sample()
+      return self.distribution.deterministic_output(mlp_output)
+    return mlp_output
 
   def update_normalization(self, obs: TensorDict) -> None:
     if self.obs_normalization:
       features = self.encoder(obs[self.obs_groups[0]]).reshape(-1, self.encoded_obs_dim)
       normalizer: Any = self.obs_normalizer
-      normalizer.update(features)
+      if self.twin_mirror:
+        mirrored = features.index_select(-1, self._enc_mirror_perm) * self._enc_mirror_sign
+        normalizer.update(torch.cat((features, mirrored), dim=0))
+      else:
+        normalizer.update(features)
 
   def as_jit(self) -> nn.Module:
+    if self.twin_mirror:
+      return _TwinMirrorTorchGRUModel(self)
     exported: Any = super().as_jit()
     exported.obs_normalizer = nn.Sequential(copy.deepcopy(self.encoder), exported.obs_normalizer)
     return exported
 
   def as_onnx(self, verbose: bool = False) -> nn.Module:
+    if self.twin_mirror:
+      return _TwinMirrorOnnxRNNModel(self, verbose=verbose)
     exported: Any = super().as_onnx(verbose)
     exported.obs_normalizer = nn.Sequential(copy.deepcopy(self.encoder), exported.obs_normalizer)
     exported.input_size = self.raw_obs_dim
@@ -182,7 +399,8 @@ class FootstepActor(RNNModel):
 
   def deployment_contract(self) -> dict:
     rnn_module: Any = self.rnn.rnn
-    hidden_shape = [int(rnn_module.num_layers), 1, int(rnn_module.hidden_size)]
+    hidden_mult = 2 if self.twin_mirror else 1
+    hidden_shape = [int(rnn_module.num_layers), 1, int(rnn_module.hidden_size) * hidden_mult]
     defaults = self.encoder.default_joint_pos.detach().cpu().tolist()
     return {
       "version": CONTRACT_VERSION,
@@ -278,6 +496,7 @@ class FootstepActor(RNNModel):
 class LegacyFootstepActor(FootstepActor):
   raw_obs_dim = 78
   encoded_obs_dim = 81
+  default_twin_mirror = False
 
   def deployment_contract(self) -> dict:
     contract = super().deployment_contract()
@@ -327,6 +546,7 @@ class FootstepModelCfg(RslRlModelCfg):
   rnn_num_layers: int = 1
   default_joint_pos: tuple[float, ...] | None = None
   phase_cfg: FootstepPhaseCfg = field(default_factory=FootstepPhaseCfg)
+  twin_mirror: bool = False
   distribution_cfg: dict | None = field(
     default_factory=lambda: {
       "class_name": "GaussianDistribution",

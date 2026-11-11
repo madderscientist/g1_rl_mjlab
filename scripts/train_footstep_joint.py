@@ -145,17 +145,20 @@ class SharedActorPPO(PPO):
     iteration = self.joint_first_iteration + self.joint_updates - 1
     if self.gpu_global_rank == 0:
       saved = cpu_checkpoint_state(self.save())
-      saved.update(iter=iteration, task_critic_state_dicts={
-        task: record["critic"] for task, record in zip(("walking", "single_step"), records)
-      }, task_optimizer_state_dicts={
-        task: record["optimizer"] for task, record in zip(("walking", "single_step"), records)
-      }, infos={"shared_actor": True, "task_weights": self.task_weights,
+      joint_infos = {"shared_actor": True, "task_weights": self.task_weights,
         "fixed_exploration_std": .25, "actor_normalizer_frozen": True,
         "actor_raw_obs_dim": self.actor.raw_obs_dim,
         "theta_stage": getattr(self, "joint_theta_stage", None),
         "precision_stage": self.joint_stage,
         "env_state": {"common_step_counter": records[0]["counter"]},
-        "task_environment_counters": [record["counter"] for record in records]})
+        "task_environment_counters": [record["counter"] for record in records]}
+      if getattr(self.actor, "twin_mirror", False):
+        joint_infos["twin_mirror"] = True
+      saved.update(iter=iteration, task_critic_state_dicts={
+        task: record["critic"] for task, record in zip(("walking", "single_step"), records)
+      }, task_optimizer_state_dicts={
+        task: record["optimizer"] for task, record in zip(("walking", "single_step"), records)
+      }, infos=joint_infos)
       destination = self.joint_log_dir / f"model_{iteration}.pt"
       temporary = destination.with_suffix(".pt.tmp")
       torch.save(saved, temporary)
@@ -256,7 +259,8 @@ class JointRunner(FootstepResumeRunner):
       "foot_slip": {"weight": slip.weight, "linear": slip.params.get("slip_linear", False)},
       "command_config": {"manager": asdict(footsteps.cfg.manager), "source": asdict(footsteps.cfg.source)},
       "reward_weights": {name: reward_manager.get_term_cfg(name).weight for name in reward_manager.active_terms},
-      "theta_stage": self.alg.joint_theta_stage, "actor_raw_obs_dim": actor.raw_obs_dim}
+      "theta_stage": self.alg.joint_theta_stage, "actor_raw_obs_dim": actor.raw_obs_dim,
+      "twin_mirror": bool(getattr(actor, "twin_mirror", False))}
     write_json(self.task_log_dir / "initialization.json", receipt)
     print("JOINT_INITIALIZATION " + json.dumps(receipt), flush=True)
     return local.get("infos")
@@ -293,16 +297,20 @@ def worker(args, run_dir):
   from g1_lower_rl.tasks.footstep_tracking import make_footstep_env_cfg
 
   saved = torch.load(args.walking_checkpoint, map_location="cpu", weights_only=False)
-  stage_config = (saved.get("infos") or {}).get("precision_stage", {}) if rank == 0 else None
-  theta_stage = (saved.get("infos") or {}).get("theta_stage")
+  saved_infos = saved.get("infos") or {}
+  stage_config = saved_infos.get("precision_stage", {}) if rank == 0 else None
+  theta_stage = saved_infos.get("theta_stage")
+  twin_mirror = bool(getattr(args, "twin_mirror", False) or saved_infos.get("twin_mirror", False))
   if theta_stage is not None:
     from g1_lower_rl.rl.footstep_model import FootstepModelCfg
     from g1_lower_rl.tasks.footstep_tracking.theta_stage import make_theta_stage_env_cfg
 
     env_cfg = make_theta_stage_env_cfg(profile, theta_stage, rank, precision_stage=stage_config)
-    agent.actor = FootstepModelCfg()
+    agent.actor = FootstepModelCfg(twin_mirror=twin_mirror)
   else:
     env_cfg = make_footstep_env_cfg(profile, precision_stage=stage_config)
+    if isinstance(agent.actor, RslRlModelCfg):
+      setattr(agent.actor, "twin_mirror", twin_mirror)
   cfg = replace(cfg, env=env_cfg, resume_checkpoint=args.walking_checkpoint, enable_nan_guard=True,
     scene_cuda_graphs=not getattr(args, "no_scene_cuda_graphs", False))
   cfg.env.scene.num_envs = args.envs_per_rank
@@ -448,6 +456,7 @@ def main():
   parser.add_argument("--learning-rate", type=float, default=1e-5)
   parser.add_argument("--task-weights", type=float, nargs=2, default=[.7, .3], metavar=("WALKING", "SINGLE_STEP"))
   parser.add_argument("--evaluate-at-updates", type=int)
+  parser.add_argument("--twin-mirror", action="store_true", help="Enable Twin-Mirror sagittal symmetrization stage")
   parser.add_argument("--distributed-backend", choices=("nccl", "gloo"), default="nccl")
   parser.add_argument("--no-scene-cuda-graphs", action="store_true")
   parser.add_argument("--evaluate-after", action="store_true")

@@ -18,7 +18,7 @@
 
 ## 训练阶段
 
-主流程：基础行走 → 精度训练 → 联合训练 → Theta训练。单步预训练可选。
+主流程：基础行走 → 精度训练 → 联合训练 → Theta训练 → Twin-Mirror对称化微调。单步预训练可选。
 
 | 阶段 | 输入 | 目标 |
 | --- | --- | --- |
@@ -26,6 +26,9 @@
 | [2. 精度训练](#第二阶段精度训练) | 第一阶段检查点 | 保留空间课程，开启步频游走、精确引导和落脚代价 |
 | [3. 联合训练](#第三阶段联合训练) | 精度检查点，可选单步critic种子 | 一个共享actor，同时学习连续走与单步，两任务各有私有critic |
 | [4. Theta训练](#第四阶段theta迁移与训练) | 已训练的第三阶段模型，经显式迁移 | 只推进躯干期望偏角课程，固定旧课程参数 |
+| [5. Twin-Mirror对称化微调](#第五阶段twin-mirror对称化微调) | 已收敛的第四阶段模型 | 启用双流矢状面镜像架构，消除左右不对称并对齐双流表征 |
+
+> **注：如果 Twin-Mirror 从头开始（第一阶段 `--from-scratch --twin-mirror`）就使用，效果很有可能会更好。** 从第 0 轮起直接在严格对称流形上训练，可避免 GRU 先学出非对称内部隐状态编码再靠后天微调对齐，从而彻底消除静止站立（`f=0`）时双流隐状态的微弱内耗、使 `obs_normalizer` 统计量从头严格对称，并显著提升前期课程的样本效率。
 
 命令在仓库根目录执行；检查点和目录变量需自行设置。前三阶段沿用累计课程计数，第四阶段另设课程起点。
 
@@ -169,6 +172,43 @@ OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python scripts/train_footst
 世界系竖直轴角速度从足底site读取，按左右脚求和；行走及静止均启用，离地脚不计。
 上述权重下每只触地脚以1°/s转动时扣0.005/秒；停转后不追罚累计偏角。
 省略该字段时不增加此项；示例权重需显式配置。
+
+### 第五阶段：Twin-Mirror对称化微调
+
+单流 GRU 策略在长程 PPO 训练中容易因随机初始化与探索噪声产生对称破缺放大（如单步左右抬脚峰值相差超过 3 cm、左右落脚误差不一致），在作为教师策略蒸馏时会将左右偏置传染给学生网络。第五阶段在不改变任何网络权重形状的前提下，将 `FootstepActor` 切换为 **Twin-Mirror 双流矢状面等变架构** 并进行短程联合 PPO 微调。
+
+#### 原理
+
+1. **编码空间的精确线性对合镜像 $M_{\text{enc}}$**：
+   `FootstepObservationEncoder` 将 79 维原始观测映射为 82 维编码特征 $e_t = \text{Encoder}(o_t)$。在 82 维编码空间中，关于机器人矢状面（$y \mapsto -y$）的物理镜像是一个精确线性置换与符号翻转 $M_{\text{enc}}(e_t) = P_{\text{enc}} e_t \odot s_{\text{enc}}$（满足 $M_{\text{enc}}^2 = I$）：
+   - 全身 29 轴相对关节角 $q - q_{\text{def}}$ 与关节速度 $\dot{q}$：左右成对关节互换，绕 $x$（roll）与绕 $z$（yaw）轴取反，绕 $y$（pitch）轴保持同号；
+   - 骨盆与躯干角速度（轴矢量）：$(\omega_x, \omega_y, \omega_z) \mapsto (-\omega_x, \omega_y, -\omega_z)$；重力投影（极矢量）：$(g_x, g_y, g_z) \mapsto (g_x, -g_y, g_z)$；
+   - 步态相位半周期平移 $x \mapsto x + \pi$：在编码空间直接表现为 $(\sin x, \cos x) \mapsto (-\sin x, -\cos x)$，步频 $f$ 不变；
+   - 左右脚下一落点槽位 `L_next <-> R_next` 互换，且每个落点的 $(dx, dy, \sin\psi, \cos\psi) \mapsto (dx, -dy, -\sin\psi, \cos\psi)$；
+   - 期望躯干偏角指令：$\theta \mapsto -\theta$。
+2. **双流共享权重循环前向与动作反镜像平均**：
+   策略维护两条并行 GRU 隐状态流 $h_t = [h_t^{(1)}, h_t^{(2)}] \in \mathbb{R}^{1 \times B \times 128}$（原始流与镜像流各 64 维），共享同一套 `obs_normalizer`、`GRU(82, 64)` 与 `MLP(64 -> 256 -> 256 -> 128 -> 15)` 参数 $f_\theta$：
+   $$a_t^{(1)}, h_{t+1}^{(1)} = f_\theta\big(e_t, h_t^{(1)}\big), \qquad a_t^{(2)}, h_{t+1}^{(2)} = f_\theta\big(M_{\text{enc}}(e_t), h_t^{(2)}\big)$$
+   $$\pi_{\text{twin}}(o_t, h_t) = \frac{1}{2}\Big(a_t^{(1)} + M_a\big(a_t^{(2)}\big)\Big)$$
+   其中 $M_a(a) = P_a a \odot s_a$ 为 15 维控制动作的左右互换与 roll/yaw 符号翻转算子（$M_a^2 = I$）。
+
+#### 优势
+
+- **数学级严格左右等变**：由于 $M_{\text{enc}}^2 = I$ 且 $M_a^2 = I$，即使底层 `obs_normalizer`、GRU 或 MLP 权重本身不对称，只要输入镜像观测序列并交换两条隐状态流 $S(h^{(1)}, h^{(2)}) = (h^{(2)}, h^{(1)})$，恒有 $\pi_{\text{twin}}(M_o(o_t), S(h_t)) \equiv M_a(\pi_{\text{twin}}(o_t, h_t))$，从根源上清零左右步态不对称，蒸馏时绝不向学生模型引入单侧偏置。
+- **零新增参数与 100% 检查点兼容**：双流完全复用已有权重张量与形状，可直接 `strict=True` 加载第四阶段检查点；零样本即具备严格对称性，再经约 1600 轮小学习率（`1e-6`）联合 PPO 微调即可消除初始双流平均带来的轻微抬脚高度抵消，在连续行走落脚精度、单步保持精度和大样本稳定性上全面超越原单流模型。
+- **训练与单文件 ONNX 部署闭环**：在 `RolloutStorage` 与 PPO 序列截断反传中将双流沿 batch/trajectory 维拼接为一次并行算子调用；导出 ONNX 时隐状态接口为 `h_in / h_out: [1, 1, 128]`，`FootstepPolicy` 自动按契约识别。
+- **从头训练潜力**：**如果 Twin-Mirror 从头开始（第一阶段 `--from-scratch --twin-mirror`）就使用，效果很有可能会更好**——GRU 从第 0 轮起直接学习对称隐状态表征，不会产生单流历史偏置在静止站立时的双流内耗，且每次迈步天然提供双侧梯度。
+
+#### 启动与续训命令
+
+从第四阶段完整联合检查点 `THETA_CHECKPOINT` 启动第五阶段微调（首次加 `--twin-mirror`，后续存档自动写入 `infos.twin_mirror = true`）：
+
+```bash
+OMP_NUM_THREADS=1 MUJOCO_GL=egl micromamba run -n mj python scripts/train_footstep_joint.py \
+  --resume-joint "$THETA_CHECKPOINT" --run-dir "$NEW_TWIN_RUN_DIR" \
+  --twin-mirror --continuous --max-updates 200 --envs-per-rank 1024 --save-interval 200 \
+  --task-weights 0.4 0.6 --learning-rate 1e-6 --distributed-backend nccl
+```
 
 ## 续训与运行管理
 

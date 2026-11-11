@@ -72,6 +72,8 @@ def restore_fixed_exploration(actor, actor_cfg):
 
 class FootstepResumeRunner(MjlabOnPolicyRunner):
   def save(self, path, infos=None):
+    if getattr(self.alg.actor, "twin_mirror", False):
+      infos = {**(infos or {}), "twin_mirror": True}
     if os.environ.get("FOOTSTEP_PROFILE") in {"precision", "step-episode"}:
       params = self.env.unwrapped.reward_manager.get_term_cfg("footstep_landing").params
       infos = {**(infos or {}), "precision_stage": {
@@ -278,6 +280,7 @@ def main():
   budget.add_argument("--hours", type=float, help="Wall-clock training hours; stop and save after a complete update")
   parser.add_argument("--save-interval", type=int, default=100, help="Save every N cumulative PPO iterations")
   parser.add_argument("--tag", default="swing_linear_continuous")
+  parser.add_argument("--twin-mirror", action="store_true", help="Enable Twin-Mirror sagittal symmetrization")
   args = parser.parse_args()
   if any(index < 0 for index in args.gpu_ids) or len(set(args.gpu_ids)) != len(args.gpu_ids):
     parser.error("GPU IDs must be distinct nonnegative indices")
@@ -314,17 +317,20 @@ def main():
   first_iteration = 0
   checkpoint_counter = 0
   stage_config = {}
+  twin_mirror = bool(args.twin_mirror)
   if checkpoint is not None:
     saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
     first_iteration = int(saved["iter"]) + 1
     checkpoint_infos = saved.get("infos") or {}
     checkpoint_counter = checkpoint_infos.get("env_state", {}).get("common_step_counter", 0)
+    twin_mirror = bool(twin_mirror or checkpoint_infos.get("twin_mirror", False))
     if args.profile == "precision":
       stage_config = dict(checkpoint_infos.get("precision_stage", {}))
     del saved
   task_id = train.STEP_EPISODE_TASK if args.profile == "step-episode" else train.FOOTSTEP_TASK
   os.environ["FOOTSTEP_TASK_ID"] = task_id
   cfg = replace(train.TrainConfig.from_task(task_id), gpu_ids=args.gpu_ids, enable_nan_guard=True)
+  setattr(cfg.agent.actor, "twin_mirror", twin_mirror)
   if args.profile == "precision":
     stage_config.setdefault("landing_start_step", checkpoint_counter)
     stage_config.setdefault("landing_ramp_steps", 2000 * cfg.agent.num_steps_per_env)
