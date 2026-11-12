@@ -583,3 +583,87 @@ EMA 系数为 0.01。未过闸时即使达到迭代数也停在当前档。
 - `joint_pos_limits`：已删除；硬限位由 MuJoCo 处理。
 
 主任务实例化后有 23 个奖励项。当前值以 `cfg.rewards` 为准，历史数据用于解释取舍。
+
+## 10. 从 PPO 迁移到可微位置 WM + 历史 MLP（`G1-Gloria-LowerBody-WM`）
+
+除上述无模型 PPO 流程外，[wm/](./wm/) 提供了基于 [位置控制世界模型 v3](../../world_model/README.md) 的一阶可微训练体系 `G1-Gloria-LowerBody-WM`，支持在保留原下肢部署接口的前提下从零初始化训练历史滑窗 MLP 策略。
+
+### 10.1 模块组成
+
+[wm/](./wm/) 与全身动作跟踪分支完全解耦，仅依赖 `world_model` 与 `rl/supermimic.py` 基础算子：
+
+| 文件 | 职责 |
+|---|---|
+| [wm/policy.py](./wm/policy.py) | 10 帧历史 MLP Actor、输入去直流/物理缩放与旧权重无损迁移、57 维观测与 29 维执行器目标构造、固定高斯 KL 信赖域回溯 |
+| [wm/task.py](./wm/task.py) | WM v3 物理契约环境配置 `flat_env_cfg_wm`、表驱动环形回放池 `VelocityReplay`（带直立起点过滤）、单次 FK 融合的可微奖励/软终止/167 维 Critic 特征 `VelocityWmTask` |
+| [wm/collection.py](./wm/collection.py) | 原生 50 Hz 交互采集器 `VelocityPolicyCollector`、末子步积分后 `sim.forward()` 同步、18 项连续奖励对齐校验、课程状态序列化与恢复即重采样 |
+| [wm/graphs.py](./wm/graphs.py) | 共享显存池的固定形状 CUDA Graph 封装：`CapturedWmMicrobatch`（WM 8 步自回归反传）与 `CapturedVelocityRolloutStep`（H=32 想象单步前向 + VJP 反传） |
+| [wm/runner.py](./wm/runner.py) | 在线 WM 自适应 + H=32 可微 BPTT + GAE 训评主循环、内置两阶段探索/KL 退火日程、Preflight 审计与断点续训 |
+| [wm/playback.py](./wm/playback.py) | 原生 MuJoCo 回放（无头 smoke / Native / Viser）及双格式 ONNX 导出（无状态 `policy.onnx` 与兼容 [deploy.py](../../deploy.py) 的滑窗 `policy_deploy.onnx`） |
+
+### 10.2 从 PPO 迁移的核心改动与根因总结
+
+将无模型零阶强化学习（PPO + LSTM）改为基于世界模型的一阶路径梯度优化（BPTT + 历史 MLP）时，梯度传播机制、物理可观测性与探索动力学的差异决定了以下 6 项关键改造：
+
+#### 1. 网络结构与 `command_height` 去直流归一化（LSTM → 10×57 MLP）
+
+- **滑窗 MLP 替代隐状态**：Actor 改为无递归状态的 10 帧历史 MLP（`10 × 57 = 570 -> 1024 -> 512 -> 256 -> 15`，`SiLU`），`unflatten_native_history` 将 `mjlab` 按项拼接的历史展平向量精确还原为时间帧主序 `[B, 10, 57]`。
+- **高度指令去直流与尺度放大**：PPO 借助在线 `EmpiricalNormalization` 自动消去观测均值；若在固定物理尺度下直接输入原始 `command_height ∈ [0.50, 0.80]`，其直流能量（`0.68² ≈ 0.46`）是有效指令方差（`0.08² ≈ 0.0064`）的 **72 倍**，首层对应权重列梯度的 98.5% 被共模行走梯度淹没并推高 Adam 二阶矩 `exp_avg_sq`，导致深蹲指令响应饱和（实测给定 `0.50 m` 仍停在 `0.73 m`）。在 [wm/policy.py](./wm/policy.py) 内置 `(h_cmd - 0.68) / 0.10 ∈ [-1.8, +1.2]` 中心化缩放后，全量程蹲高稳态误差降至 `1~9 mm`。
+- **执行器偏置与末子步运动学同步**：严格复刻原生动作映射——下肢 15 维为 `default_lower + action * scale - encoder_bias_lower`，上肢 14 维直接取 `hold_arm_pose` 的 PD 目标（不重复扣 `encoder_bias`）；同时在第 4 个物理子步积分后执行 `sim.forward()` 再结算奖励，使 18 项连续原生奖励与解析可微实现的逐项总和最大绝对误差降至 `5.25e-8`。
+
+#### 2. 物理环境与位置 WM v3 契约对齐
+
+- **保留的可入模随机化与课程**：负载/连杆质量、躯干质心偏移、编码器零偏、IMU 零偏、开局姿态随机化，以及手臂目标姿态渐变/漂移课程（均在 WM 48 维物理上下文或马尔可夫起点状态中显式可见）。
+- **关闭的未入模隐变量**：左右脚独立摩擦合并为 `shared_random=True` 的共享摩擦（匹配 WM v3 单维摩擦输入）；移除未入模瞬时外力/冲量（`arm_torque`、`body_impulse`、`push_robot`）以防在线微调把随机外推吸收进接触动力学；关闭随机跳帧观测延时以保证 BPTT 想象滑窗时间步严格连续。
+
+#### 3. 接触可微化：消除单边互补死区与 FP32 下溢
+
+- **问题**：PPO 通过动作采样噪声零阶探索布尔接触跳变；而一阶 BPTT 需要连续非零的 $\partial r / \partial F_z$ 与 $\partial r / \partial z_{\text{foot}}$。双足站立时单脚法向力 `Fz ≈ 175 N`，窄门控 `sigmoid((15 - Fz) / 4) ≈ 4.2e-18` 在 FP32 下直接下溢为 `0.0`；同时地面单边约束（$z \cdot F_z = 0$）使未卸荷脚的 $\partial z_{\text{foot}} / \partial a \approx 0$，而仅对卸荷给奖又会诱发“踝关节前后翘脚卸力却不抬脚”的作弊解。
+- **方案**：在 [wm/task.py](./wm/task.py) 中拆分为两阶段梯度通路——支撑相奖励法向载荷占比 `Fz / (Fz_total + 10)`（站立时即有平滑重心转移梯度），腾空概率采用非下溢乘积 `(1 - Fz / (Fz_total + 10))² · exp(-Fz / 45) · sigmoid((rel_z - 0.020) / 0.012)`（必须真实卸荷且离地抬高才得分），地面滑移惩罚则独立使用陡峭接触门控 `sigmoid((Fz - 20) / 5)` 以免误罚空中摆动腿。
+
+#### 4. 全量程线性斜率牵引：打破高斯核尾部死区与 640 ms 静止局部最优
+
+- **问题**：纯高斯核 `exp(-e² / std²)` 在高速（`1.0 m/s`）或深蹲（`0.50 m`）初期的大误差区导数趋近于零；且在 H=32（640 ms）短视窗内，原地站立可稳定获取 `r_ang_avg + r_height + r_pose`，而迈出第一步伴随的躯干摆动与触地冲击反而使短窗累计回报低于“雕像站立”。
+- **方案**：在保留全部原生高斯核精确收敛顶点的基础上，补充全量程 `smooth_l1` 线性斜率牵引：水平线速度与航向角速度牵引 `r_vel_pull`、按目标高度自适应缩放峰值的摆动脚抛物线净空牵引 `r_swing_arch`、抬脚门控的世界系摆动腿水平速度引导 `r_swing_vel`，以及动静双态骨盆高度牵引 `r_height_pull`，确保任意初始误差下迈步与下蹲均严格优于原地不动。
+
+#### 5. 15 自由度下肢控制的概率终止窗口与直立起点过滤
+
+- **原因**：29 自由度全身控制可用 `p_term=0.005`（4 s 窗口）学出双臂撑地起身；但本任务双臂不受策略控制，倒地后无法靠手撑地恢复，过长的继续窗口会把 `<1%` 的失稳率放大为超过 `50%` 的地面死尸样本淹没回放池。
+- **方案**：默认采用 `termination_probability=0.05`（期望继续 20 步 / 0.4 s 供大倾角踉跄救回，`fell_over` 与 `collapsed` 共享同一次伯努利硬币；想象侧对应 `p_term * sigmoid(...)` 软终止），并在 `VelocityReplay.sample_starts` 中优先筛选直立存活态（`z > 0.40 m` 且 `upright_cos > 0.35`）作为 BPTT 起点。
+
+#### 6. 内置两阶段探索/KL 退火日程与 CUDA Graph 吞吐体系
+
+- **两阶段自动退火**：[wm/runner.py](./wm/runner.py) 内置 `DEFAULT_EXPLORATION_STAGES = ((0, 0.25, 0.08), (6500, 0.08, 0.015))`——前 6500 轮用宽探索与宽 KL 信赖域快速突破静止局部最优、跑通全课程速度与高度；6500 轮后自动收窄至高精度档，消除采样噪声对软臂（`--arms limp`）静止站立与深蹲稳定性的边际侵蚀。行为策略一致性校验采用噪声无关判据 `initial_kl * action_noise² <= 1e-5`。
+- **计算优化**：关节子集索引张量常驻 GPU、单步正向运动学与坐标变换在 `_kinematic_frame` 中单次融合复用，配合共享显存池的 WM H8 与 Actor H32 CUDA Graphs（默认 `num_envs=4096, actor_batch_size=8192, wm_batch_size=16384`），双卡 RTX 4090 利用率稳定在 `98%~100%`，单轮总耗时约 `3.3 s`（其中 8192 条 32 步 BPTT 仅约 `0.94 s`）。
+
+### 10.3 闭环部署验证基准
+
+使用从头训练收敛的策略（10234 轮），在纯 CPU MuJoCo + ONNX Runtime 下通过 [check_deploy_policy.py](../../../scripts/check_deploy_policy.py) 全部 9 个标准工况（`hold` 固定垂臂与 `limp` 零刚度软臂均为 **9/9 站住，0.0% 越 `ctrlrange`**）：
+
+- **速度与转向跟踪**：前进 `0.50 / 1.00 m/s` 稳态达 `0.48~0.51 / 0.96~0.98 m/s`，后退 `-0.40 m/s` 达 `-0.41 m/s`，横移 `±0.35 m/s` 达 `±0.35~0.36 m/s`，原地转向 `±0.80 rad/s` 达 `±0.78~0.79 rad/s`，静止与指令急停稳态漂移 `< 0.01 m/s`。
+- **全量程蹲高遵循**（站立与 `0.6 m/s` 行走双工况扫描）：指令高度 `0.68 / 0.62 / 0.56 / 0.50 m` 实测稳态高度分别为 `0.671 / 0.617 / 0.559 / 0.502 m`（稳态误差 **`1~9 mm`**）。
+
+### 10.4 常用命令
+
+```bash
+# 1. 零优化步 Preflight 自检（验证导数余弦、连续奖励对齐、WM 展开与 H32 BPTT 梯度）
+CUDA_VISIBLE_DEVICES=0,1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+torchrun --standalone --nproc-per-node=2 scripts/train.py G1-Gloria-LowerBody-WM \
+  --output logs/velocity_wm/preflight_check --preflight
+
+# 2. 双卡从头完整训练（自动执行两阶段探索/KL 退火；向输出目录写入 STOP 文件可安全保存退出）
+CUDA_VISIBLE_DEVICES=0,1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+torchrun --standalone --nproc-per-node=2 scripts/train.py G1-Gloria-LowerBody-WM \
+  --output logs/velocity_wm/mlp_hist10_scratch --iterations 0
+
+# 3. 原生 MuJoCo 回放（无头定量 smoke 或交互式 Viser）
+python scripts/play.py G1-Gloria-LowerBody-WM \
+  --checkpoint-file logs/velocity_wm/mlp_hist10_scratch --steps 200
+python scripts/play.py G1-Gloria-LowerBody-WM \
+  --checkpoint-file logs/velocity_wm/mlp_hist10_scratch --viewer viser --viser-port 8082
+
+# 4. 导出 ONNX 并执行上机前多工况闭环检验与对比渲染
+python scripts/export_onnx.py --checkpoint logs/velocity_wm/mlp_hist10_scratch
+python scripts/check_deploy_policy.py logs/velocity_wm/mlp_hist10_scratch/best_native/policy_deploy.onnx
+python scripts/check_deploy_policy.py logs/velocity_wm/mlp_hist10_scratch/best_native/policy_deploy.onnx --arms limp
+```

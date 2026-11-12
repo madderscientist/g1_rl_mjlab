@@ -76,6 +76,11 @@ python scripts/list_envs.py
 # 训练（默认开左右镜像数据增强 DUP，档位见 cfg/constants.py 的 MIRROR_STAGES）
 python scripts/train.py G1-Gloria-LowerBody-Flat --env.scene.num-envs 4096
 
+# 基于位置控制 WM v3 + 10 帧历史 MLP 的可微下肢速度跟踪训练（详见 g1_lower_rl/tasks/lower_body/README.md 第 10 节）
+CUDA_VISIBLE_DEVICES=0,1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+torchrun --standalone --nproc-per-node=2 scripts/train.py G1-Gloria-LowerBody-WM \
+    --output logs/velocity_wm/mlp_hist10_scratch --iterations 0
+
 # 续训（课程档位与闸门分数会一起恢复）
 python scripts/train.py G1-Gloria-LowerBody-Flat --agent.resume True \
     --agent.load-run 2026-08-07_14-00-32 --agent.load-checkpoint model_2000.pt

@@ -61,13 +61,17 @@ def main(
   checkpoint_path = Path(checkpoint)
   import torch
 
-  probe = torch.load(
-    checkpoint_path / "rank_0.pt" if checkpoint_path.is_dir() else checkpoint_path,
-    weights_only=True, map_location="cpu",
-  )
-  position_checkpoint = probe.get("format") == "full_mocap_position_v3_continuous_rgmt_v1"
+  probe_target = checkpoint_path
+  if checkpoint_path.is_dir():
+    if (checkpoint_path / "latest.json").is_file():
+      meta = json.loads((checkpoint_path / "latest.json").read_text(encoding="utf-8"))
+      probe_target = checkpoint_path / meta["directory"] / "rank_0.pt"
+    else:
+      probe_target = checkpoint_path / "rank_0.pt"
+  probe = torch.load(probe_target, weights_only=True, map_location="cpu")
+  ckpt_format = probe.get("format") if isinstance(probe, dict) else None
   del probe
-  if position_checkpoint:
+  if ckpt_format == "full_mocap_position_v3_continuous_rgmt_v1":
     from g1_lower_rl.tasks import MOCAP_TASK
     from g1_lower_rl.tasks.motion_tracking.training.export import export_onnx
 
@@ -77,6 +81,22 @@ def main(
       checkpoint_path, Path(output_dir) if output_dir else checkpoint_path.parent,
       native_inputs=Path(native_inputs) if native_inputs else None,
     )
+    return
+  if ckpt_format == "g1_lower_body_velocity_wm_v1":
+    from g1_lower_rl.tasks import LOWER_BODY_WM_TASK
+    from g1_lower_rl.tasks.lower_body.wm import export_onnx as export_velocity_wm_onnx
+
+    if task_id not in (None, LOWER_BODY_WM_TASK):
+      raise ValueError("Velocity WM checkpoint cannot be exported as another task")
+    if native_inputs:
+      raise ValueError("--native-inputs is only supported for the official MLP mocap exporter")
+    exported = export_velocity_wm_onnx(
+      checkpoint_path,
+      Path(output_dir) if output_dir else checkpoint_path.parent / "onnx",
+      overwrite=True,
+    )
+    for label, path in exported.items():
+      print(f"[导出] {label}: {path}")
     return
   if task_id == "G1-Gloria-MotionTracking":
     raise ValueError("The official mocap task no longer accepts PPO/RGMT checkpoints")

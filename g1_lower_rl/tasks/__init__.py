@@ -8,6 +8,9 @@ from g1_lower_rl.tasks.footstep_tracking.env_cfg import footstep_env_cfg
 from g1_lower_rl.tasks.footstep_tracking.rl_cfg import footstep_ppo_runner_cfg, step_episode_ppo_runner_cfg
 from g1_lower_rl.tasks.footstep_tracking.step_episode import step_episode_env_cfg
 from g1_lower_rl.tasks.lower_body import (
+  LOWER_BODY_WM_TASK as LOWER_BODY_WM_TASK,
+)
+from g1_lower_rl.tasks.lower_body import (
   flat_env_cfg,
   flat_env_cfg_gru,
   ppo_runner_cfg,
@@ -67,5 +70,5 @@ register_mjlab_task(
 )
 
 def list_tasks() -> list[str]:
-  """Project tasks include SuperMimic, which deliberately has no PPO registry entry."""
-  return sorted([*list_mjlab_tasks(), MOCAP_TASK])
+  """Project tasks include SuperMimic and Velocity WM, which deliberately have no PPO registry entry."""
+  return sorted([*list_mjlab_tasks(), MOCAP_TASK, LOWER_BODY_WM_TASK])

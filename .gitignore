@@ -24,6 +24,7 @@ tests/*
 !tests/test_mocap_official.py
 !tests/test_position_mocap.py
 !tests/test_policy_kl.py
+!tests/test_velocity_wm.py
 
 # Published WM weights belong in release assets, not Git.
 g1_lower_rl/world_model/checkpoints/*.pt

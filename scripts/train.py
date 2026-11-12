@@ -23,7 +23,7 @@ from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
 
 from g1_lower_rl.scene_graph import enable_scene_cuda_graphs
-from g1_lower_rl.tasks import FOOTSTEP_TASK, MOCAP_TASK, STEP_EPISODE_TASK, list_tasks
+from g1_lower_rl.tasks import FOOTSTEP_TASK, LOWER_BODY_WM_TASK, MOCAP_TASK, STEP_EPISODE_TASK, list_tasks
 from g1_lower_rl.tasks.lower_body.cfg.constants import MIRROR_STAGES
 
 
@@ -209,6 +209,11 @@ def main() -> None:
     from g1_lower_rl.tasks.motion_tracking.training import TrainingConfig, run_training
 
     run_training(tyro.cli(TrainingConfig, args=remaining_args, prog=f"{sys.argv[0]} {chosen_task}"))
+    return
+  if chosen_task == LOWER_BODY_WM_TASK:
+    from g1_lower_rl.tasks.lower_body.wm import VelocityWmConfig, run_velocity_wm_training
+
+    run_velocity_wm_training(tyro.cli(VelocityWmConfig, args=remaining_args, prog=f"{sys.argv[0]} {chosen_task}"))
     return
   args = tyro.cli(
     TrainConfig,

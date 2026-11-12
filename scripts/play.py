@@ -19,7 +19,7 @@ from mjlab.utils.wrappers import VideoRecorder
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 
 from g1_lower_rl.rl import latest_checkpoint, load_trained_runner
-from g1_lower_rl.tasks import MOCAP_TASK, list_tasks
+from g1_lower_rl.tasks import LOWER_BODY_WM_TASK, MOCAP_TASK, list_tasks
 
 
 @dataclass(frozen=True)
@@ -135,6 +135,12 @@ def main() -> None:
     from g1_lower_rl.tasks.motion_tracking.training.playback import run_play as run_mocap_play
 
     run_mocap_play(tyro.cli(MocapPlayConfig, args=remaining_args, prog=f"{sys.argv[0]} {chosen_task}"))
+    return
+  if chosen_task == LOWER_BODY_WM_TASK:
+    from g1_lower_rl.tasks.lower_body.wm import PlayConfig as VelocityWmPlayConfig
+    from g1_lower_rl.tasks.lower_body.wm import run_play as run_velocity_wm_play
+
+    run_velocity_wm_play(tyro.cli(VelocityWmPlayConfig, args=remaining_args, prog=f"{sys.argv[0]} {chosen_task}"))
     return
   args = tyro.cli(
     PlayConfig,
