@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -129,3 +132,88 @@ def optimizer_step(parameters: Iterable[nn.Parameter], optimizer: torch.optim.Op
       gradient.clamp_(-0.1, 0.1)
   optimizer.step()
   return float(norm)
+
+
+@torch.no_grad()
+def constrain_policy_kl(
+  actor: nn.Module,
+  optimizer: torch.optim.Optimizer,
+  before: list[torch.Tensor],
+  optimizer_before: dict[str, Any],
+  measure: Callable[[], torch.Tensor],
+  limit: float,
+) -> dict[str, float]:
+  """Backtrack actor update along linear parameter interpolation until fixed-Gaussian KL <= limit."""
+  parameters = list(actor.parameters())
+  if len(parameters) != len(before) or not math.isfinite(limit) or limit <= 0:
+    raise ValueError("Policy KL trust region requires matching weights and a positive finite limit")
+  proposed = [parameter.detach().clone() for parameter in parameters]
+  for attempt in range(13):
+    fraction = 0.5**attempt
+    for parameter, old, new in zip(parameters, before, proposed, strict=True):
+      parameter.copy_(torch.lerp(old, new, fraction))
+    kl = measure()
+    if not torch.isfinite(kl):
+      for parameter, old in zip(parameters, before, strict=True):
+        parameter.copy_(old)
+      optimizer.load_state_dict(optimizer_before)
+      raise FloatingPointError("Nonfinite policy KL; actor and Adam restored")
+    if kl <= limit:
+      return {"kl": float(kl), "step_fraction": fraction, "rejected": 0.0}
+  for parameter, old in zip(parameters, before, strict=True):
+    parameter.copy_(old)
+  optimizer.load_state_dict(optimizer_before)
+  logging.getLogger(__name__).warning("Policy update rejected: KL exceeded %g", limit)
+  return {"kl": 0.0, "step_fraction": 0.0, "rejected": 1.0}
+
+
+def lower_body_actuator_target(
+  action_lower: torch.Tensor,
+  arm_target: torch.Tensor,
+  default_lower: torch.Tensor,
+  scale_lower: torch.Tensor,
+  encoder_bias_lower: torch.Tensor,
+  limits: torch.Tensor,
+  limited: torch.Tensor,
+) -> torch.Tensor:
+  """Map 15D lower-body policy actions + 14D arm PD targets to canonical 29D actuator targets."""
+  lower = default_lower + action_lower * scale_lower - encoder_bias_lower
+  target = torch.cat((lower, arm_target), dim=-1)
+  return torch.where(limited, target.clamp(limits[:, 0], limits[:, 1]), target)
+
+
+def broadcast_module(module: nn.Module) -> None:
+  """Broadcast all module parameters and tensor buffers from rank 0 across distributed workers."""
+  if dist.is_initialized():
+    for value in (*module.parameters(), *module.buffers()):
+      if value.is_floating_point() or value.dtype in (torch.int64, torch.int32, torch.bool, torch.uint8):
+        dist.broadcast(value.detach(), 0)
+
+
+def file_sha256(path: Path) -> str:
+  digest = hashlib.sha256()
+  with path.open("rb") as stream:
+    while chunk := stream.read(1 << 20):
+      digest.update(chunk)
+  return digest.hexdigest()
+
+
+def prune_update_checkpoints(
+  checkpoints_dir: Path,
+  *,
+  save_interval: int,
+  max_retained: int,
+  world_size: int,
+) -> None:
+  """Retain latest 2 transient saves and up to `max_retained` periodic `update_*` saves (`milestone_*` untouched)."""
+  generations = sorted(checkpoints_dir.glob("update_*"))
+  non_periodic = [g for g in generations[:-2] if int(g.name.split("_")[1]) % save_interval != 0]
+  periodic = [g for g in generations if int(g.name.split("_")[1]) % save_interval == 0]
+  stale_periodic = periodic[:-max_retained] if max_retained > 0 else []
+  for previous in (*non_periodic, *stale_periodic):
+    if not previous.exists():
+      continue
+    for rank in range(world_size):
+      (previous / f"rank_{rank}.pt").unlink(missing_ok=True)
+    if not any(previous.iterdir()):
+      previous.rmdir()

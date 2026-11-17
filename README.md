@@ -22,7 +22,7 @@ Unitree G1 + 双 Gloria-M 夹爪的强化学习项目，包含下肢行走、分
 
 文档按用途分工：
 
-- [训练与回放](g1_lower_rl/tasks/footstep_tracking/README.md)：[单步/连续步Viser启动命令](g1_lower_rl/tasks/footstep_tracking/README.md#viser-回放)、阶段配方、初始化与完整续训、自动化验证。
+- [训练与回放](g1_lower_rl/tasks/footstep_tracking/README.md)：[单步/连续步Viser启动命令](g1_lower_rl/tasks/footstep_tracking/README.md#viser-回放)、阶段配方、初始化与完整续训、[从PPO迁移到SuperMimic世界模型训练](g1_lower_rl/tasks/footstep_tracking/README.md#从-ppo-迁移到-supermimicg1-gloria-footsteptracking-wm)（交付存档 `export/footstep_wm_71000/`）。
 - [单步场景规则](g1_lower_rl/tasks/footstep_tracking/step_episode/README.md)：回合时序、脚印目标、单步专属奖励与预览差异。
 - [模型与部署契约](g1_lower_rl/tasks/footstep_tracking/MODEL_CONTRACT.md)：输入布局、网络、ONNX、执行器与奖励公式。
 

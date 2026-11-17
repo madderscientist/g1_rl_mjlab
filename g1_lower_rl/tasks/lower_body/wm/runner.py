@@ -21,7 +21,19 @@ import torch.distributed as dist
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from g1_lower_rl.rl.supermimic import bptt_return, cosine_learning_rate, frozen, gae_targets, optimizer_step
+from g1_lower_rl.rl.supermimic import (
+  bptt_return,
+  cosine_learning_rate,
+  frozen,
+  gae_targets,
+  optimizer_step,
+)
+from g1_lower_rl.rl.supermimic import (
+  broadcast_module as _broadcast,
+)
+from g1_lower_rl.rl.supermimic import (
+  file_sha256 as _file_sha256,
+)
 from g1_lower_rl.world_model.adapters.kinematics import TorchKinematics
 from g1_lower_rl.world_model.checkpoint import atomic_checkpoint, atomic_json, load_world_model, read_checkpoint
 from g1_lower_rl.world_model.collection import CollectorConfig
@@ -87,14 +99,6 @@ _ROLLOUT_INPUT_NAMES: tuple[str, ...] = (
   "obs_noise",
   "act_noise",
 )
-
-
-def _file_sha256(path: Path) -> str:
-  digest = hashlib.sha256()
-  with path.open("rb") as stream:
-    while chunk := stream.read(1 << 20):
-      digest.update(chunk)
-  return digest.hexdigest()
 
 
 def _snapshot_velocity_sources(output_dir: Path, *, write: bool) -> dict[str, Any]:
@@ -246,13 +250,6 @@ class VelocityWmConfig:
       raise ValueError("actor_batch_size / utd must require at least one fresh native control per policy update")
     if not self.scratch_wm and not self.world_model:
       raise ValueError("Provide --world-model path or pass --scratch-wm True")
-
-
-def _broadcast(module: nn.Module) -> None:
-  if dist.is_initialized():
-    for value in (*module.parameters(), *module.buffers()):
-      if value.is_floating_point() or value.dtype in (torch.int64, torch.int32, torch.bool, torch.uint8):
-        dist.broadcast(value.detach(), 0)
 
 
 class VelocityWmTrainer:

@@ -1,5 +1,7 @@
 """脚步跟踪训练组件，任务由 g1_lower_rl.tasks 统一注册"""
 
+from g1_lower_rl.tasks.footstep_tracking.wm import FOOTSTEP_WM_TASK as FOOTSTEP_WM_TASK
+
 FOOTSTEP_PROFILES = ("tracking", "walk-first", "precision", "step-episode")
 
 

@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import logging
-import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
+from g1_lower_rl.rl.supermimic import constrain_policy_kl, lower_body_actuator_target
 from g1_lower_rl.world_model.adapters.math import conjugate, rotate, unit
 
 DEFAULT_HISTORY = 10
@@ -205,19 +203,7 @@ def velocity_observation(
   )
 
 
-def velocity_target(
-  action_lower: torch.Tensor,
-  arm_target: torch.Tensor,
-  default_lower: torch.Tensor,
-  scale_lower: torch.Tensor,
-  encoder_bias_lower: torch.Tensor,
-  limits: torch.Tensor,
-  limited: torch.Tensor,
-) -> torch.Tensor:
-  """Map 15D lower-body policy actions + 14D arm PD targets to canonical 29D actuator targets."""
-  lower = default_lower + action_lower * scale_lower - encoder_bias_lower
-  target = torch.cat((lower, arm_target), dim=-1)
-  return torch.where(limited, target.clamp(limits[:, 0], limits[:, 1]), target)
+velocity_target = lower_body_actuator_target
 
 
 @dataclass(frozen=True)
@@ -276,35 +262,27 @@ def velocity_policy_kl(
   return sums[0] / sums[1]
 
 
-@torch.no_grad()
-def constrain_policy_kl(
-  actor: nn.Module,
-  optimizer: torch.optim.Optimizer,
-  before: list[torch.Tensor],
-  optimizer_before: dict[str, Any],
-  measure: Callable[[], torch.Tensor],
-  limit: float,
-) -> dict[str, float]:
-  """Backtrack actor update along linear parameter interpolation until fixed-Gaussian KL <= limit."""
-  parameters = list(actor.parameters())
-  if len(parameters) != len(before) or not math.isfinite(limit) or limit <= 0:
-    raise ValueError("Policy KL trust region requires matching weights and a positive finite limit")
-  proposed = [parameter.detach().clone() for parameter in parameters]
-  for attempt in range(13):
-    fraction = 0.5**attempt
-    for parameter, old, new in zip(parameters, before, proposed, strict=True):
-      parameter.copy_(torch.lerp(old, new, fraction))
-    kl = measure()
-    if not torch.isfinite(kl):
-      for parameter, old in zip(parameters, before, strict=True):
-        parameter.copy_(old)
-      optimizer.load_state_dict(optimizer_before)
-      raise FloatingPointError("Nonfinite policy KL; actor and Adam restored")
-    if kl <= limit:
-      return {"kl": float(kl), "step_fraction": fraction, "rejected": 0.0}
-  for parameter, old in zip(parameters, before, strict=True):
-    parameter.copy_(old)
-  optimizer.load_state_dict(optimizer_before)
-  logging.getLogger(__name__).warning("Velocity policy update rejected: KL exceeded %g", limit)
-  return {"kl": 0.0, "step_fraction": 0.0, "rejected": 1.0}
+__all__ = [
+  "ACTION_DIM",
+  "ARM_DIM",
+  "CONTROL_DT",
+  "DEFAULT_HISTORY",
+  "GAIT_PERIOD",
+  "OBS_DIM",
+  "OBS_TERMS",
+  "TERM_DIVISORS",
+  "TERM_OFFSETS",
+  "VelocityMlpActor",
+  "VelocityPolicyBatch",
+  "VelocityPolicyRollout",
+  "actor_architecture_metadata",
+  "constrain_policy_kl",
+  "make_actor",
+  "migrate_actor_state_dict",
+  "observation_noise_std",
+  "unflatten_native_history",
+  "velocity_observation",
+  "velocity_policy_kl",
+  "velocity_target",
+]
 

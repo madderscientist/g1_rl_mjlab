@@ -82,15 +82,22 @@ def main(
       native_inputs=Path(native_inputs) if native_inputs else None,
     )
     return
-  if ckpt_format == "g1_lower_body_velocity_wm_v1":
-    from g1_lower_rl.tasks import LOWER_BODY_WM_TASK
-    from g1_lower_rl.tasks.lower_body.wm import export_onnx as export_velocity_wm_onnx
+  if ckpt_format in ("g1_lower_body_velocity_wm_v1", "g1_footstep_tracking_wm_v1"):
+    from g1_lower_rl.tasks import FOOTSTEP_WM_TASK, LOWER_BODY_WM_TASK
 
-    if task_id not in (None, LOWER_BODY_WM_TASK):
-      raise ValueError("Velocity WM checkpoint cannot be exported as another task")
+    if ckpt_format == "g1_lower_body_velocity_wm_v1":
+      from g1_lower_rl.tasks.lower_body.wm import export_onnx as wm_export_fn
+
+      expected_task, label_name = LOWER_BODY_WM_TASK, "Velocity WM"
+    else:
+      from g1_lower_rl.tasks.footstep_tracking.wm import export_onnx as wm_export_fn
+
+      expected_task, label_name = FOOTSTEP_WM_TASK, "Footstep WM"
+    if task_id not in (None, expected_task):
+      raise ValueError(f"{label_name} checkpoint cannot be exported as another task")
     if native_inputs:
       raise ValueError("--native-inputs is only supported for the official MLP mocap exporter")
-    exported = export_velocity_wm_onnx(
+    exported = wm_export_fn(
       checkpoint_path,
       Path(output_dir) if output_dir else checkpoint_path.parent / "onnx",
       overwrite=True,

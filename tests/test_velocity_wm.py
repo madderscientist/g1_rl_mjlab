@@ -254,6 +254,7 @@ def test_velocity_replay_filters_upright_starts():
   }
   for _ in range(12):
     replay.append_control(batch, record)
+  torch.manual_seed(0)
   starts = replay.sample_starts(batch_size=12, history_length=10)
   assert (starts.state[:, 2] > 0.40).all()
 

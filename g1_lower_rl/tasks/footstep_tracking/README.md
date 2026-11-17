@@ -6,7 +6,7 @@
 
 | 目的 | 入口 |
 | --- | --- |
-| 选择训练阶段、初始化或迁移 | [训练阶段](#训练阶段) |
+| 选择训练阶段、初始化或迁移 | [训练阶段](#训练阶段)、[从PPO迁移到SuperMimic](#从-ppo-迁移到-supermimicg1-gloria-footsteptracking-wm) |
 | 恢复、保存或停止训练 | [续训与运行管理](#续训与运行管理) |
 | 查观测与网络接口 | [策略接口](#策略接口)、[模型与部署契约](MODEL_CONTRACT.md) |
 | 查采样、奖励与安全规则 | [环境与训练规则](#环境与训练规则)、[单步场景规则](step_episode/README.md) |
@@ -428,5 +428,76 @@ PYTHONPATH="$SOURCE_ROOT:$SOURCE_ROOT/scripts" \
 | [rl_cfg.py](rl_cfg.py)、[策略模型](../../rl/footstep_model.py) | PPO基础配置、模型接口与导出 |
 | [单任务入口](../../../scripts/train_footstep_resume.py)、[联合入口](../../../scripts/train_footstep_joint.py) | 初始化、完整恢复、持续训练和原子存档 |
 | [回放入口](../../../run_logs/play_footstep_checkpoint.py) | 连续、单步和手动Viser回放 |
+| [wm/](./wm/)、[train_footstep_wm.py](../../../scripts/train_footstep_wm.py) | SuperMimic 可微位置 WM v3 + Twin-Mirror 10帧历史 MLP 联合训练、热重载回放与双格式 ONNX 导出 |
 
 [监督工具](../../../scripts/train_footstep_supervised.py)与[实验调度工具](../../../scripts/footstep_campaign.py)保留固定预算/独立任务实验兼容，不属于四阶段主流程。
+
+---
+
+## 从 PPO 迁移到 SuperMimic（`G1-Gloria-FootstepTracking-WM`）
+
+[wm/](./wm/) 提供基于 50 Hz [位置控制世界模型 v3](../../world_model/README.md) + Twin-Mirror 10 帧零均值历史 MLP + `H = 36`（`0.72 s`）可微 BPTT + 任务私有 GAE Critic（公共算子见 [supermimic.py](../../rl/supermimic.py)）的训练实现，支持从零自动课程进阶（Stage 0 直行至 Stage 7 全向变步频 + `±90°` 躯干偏角 + 满幅摆臂）及连续走（Rank 0 `precision`）与单步（Rank 1 `step-episode`）双卡联合训练。
+
+### 模块职责
+
+| 文件 | 职责 |
+| --- | --- |
+| [wm/policy.py](./wm/policy.py) | 10×85 维去直流本体帧与 13 维指令编码（含 `f=0` 冻结锚点门控）、Twin-Mirror MLP Actor、固定高斯 KL 计算 |
+| [wm/task.py](./wm/task.py) | WM v3 环境工厂、8 档自动课程表、带直立过滤与单步分层过采样的 `FootstepReplay`、可微队列推进与对齐 PPO 的 `FootstepWmTask` |
+| [wm/collection.py](./wm/collection.py) | 50 Hz 原生交互采集、末子步 `sim.forward()` 同步、确定性验证存活统计、课程与 `event_manager` 原地热更新 |
+| [wm/runner.py](./wm/runner.py) | 在线 WM 自适应 + CUDA Graph `H=36` BPTT + KL 回溯 + 双私有 GAE Critic 主循环、Preflight 审计与续训 |
+| [wm/playback.py](./wm/playback.py) | 无状态 `policy.onnx` 与兼容 [FootstepPolicy](../../footstep_deploy.py) 的 `policy_deploy.onnx` 导出校验、支持自动热重载的 Viser 回放 |
+
+### 迁移改动与关键注意事项
+
+PPO 靠动作采样积分平滑数十秒回合，而 SuperMimic 沿动力学一阶反传 `0.72 s` 路径导数并衔接 Critic 自举，迁移时须严格满足以下约束：
+
+| 迁移环节 | 直接照搬的典型故障 | 当前实现与约束 |
+| --- | --- | --- |
+| **物理契约与马尔可夫边界** | 未入模外力污染在线 WM；想象内指令脱节 | 统一 `5 ms × 4 = 20 ms` 与 `wm_feet` 合力传感；合并共享摩擦，关闭 `arm_torque / body_impulse / push_robot` 与跳帧延时；相位/步频斜坡、4 步队列、摆臂插值与 `theta` 斜坡完整入池并在想象中确定性推进；下肢目标扣 `encoder_bias_lower`，手臂 PD 目标不重复扣偏置 |
+| **零直流编码与 `f=0` 门控** | 无在线归一化时大均值输入淹没首层梯度；`f=0` 冻结 `anchor` 下恒定局部脚印向 MLP 注入静态偏置诱发盲目迈步 | 关节扣默认角、重力扣 `(0,0,-1)` 使静止帧为零；指令乘 `move_gate = clamp(f/0.005, 0, 1)`，在 `f=0` 清零相位与冻结脚印偏置，`f>0`（含启停斜坡）完整保留 |
+| **终端 $V(s_H)$ 与软终止 $d_t$** | 截断 $V(s_H)$ 或 $d_t$ 状态梯度后策略只贪 `0.72 s` 眼前分，“一步就死” | `with frozen(model, critic)` 仅冻结参数权重，由 [bptt_return](../../rl/supermimic.py) 对状态完整反传即时奖励、生存连乘 $S_t = \prod(1-d_k)$、到期自举与 $V(s_H)$ |
+| **双支撑重锚定可微化** | `anchor` 切换写在 `@torch.no_grad()` 内切断跨步梯度 | 用 `w_reanchor = reanchor_cond * p_contact` 平滑插值更新 `anchor`，使第 2 步相对落点误差能反传修正第 1 步落脚位姿 |
+| **接触梯度与静止支撑面** | `sigmoid((15-Fz)/4)` 在 `175 N` 下溢为 `0`；只奖卸荷学出翘脚不离地；`f=0` 强拉 `foot_site`（踝前 `+4 cm`）增加踝力矩 | 支撑相奖载荷占比 `Fz/(Fz_total+10)`，腾空用 `(1-share)²·exp(-Fz/45)·sigmoid((rel_z-0.02)/0.012)`，滑移独立用 `sigmoid((Fz-20)/5)`；行走期加质心/Capture-Point 弱引导，`f=0` 支撑面裕度放宽至 `9 cm` |
+| **落脚、单步到位与 `soft_landing`** | `onset_prob = p_c(1-prev_pc)` 乘正向奖诱发高频踮脚刷分；触地后 `next_state` 竖直足速已刹停为零使 `F·(-v_z)` 漏检重踩 | 正向/落脚项禁用 `onset_prob`：连续走用相位归一化晚摆动积分 $\int 4s^3(f/\text{SWING\_FRACTION})dt=1$ 对齐单次 `-0.5` 事件权重，单步仅在 `arrived` 按双脚状态漏斗发奖；`soft_landing` 用 `(-3e-3‖F‖ - 6e-3 relu(‖F‖-300))·onset_prob.detach()` 叠加近地 `<5.5 cm` 下砸限速 `relu(-v_z-0.55)²` |
+| **站姿高度、硬限位与铜损** | 对准 `0.735 m` 高斯打靶几何逼出 `50.5°` 半蹲使脚踝力矩翻倍；`soft_limits`（膝下界 `+3.5°`）锁死屈膝 | 对齐原 PPO：由 `torso_link` 刚体变换出 `head_collision` 高度算单调封顶 `head_height`（`+0.4`）与 `head_height_low`（`-1.0`），`f=0` 分支加入零死区直膝引导（`f>0` 保留 `45°` 支撑屈膝容许度）；铜损（`-0.25`，`f=0` 乘 `2`、顶限外推 `50×`）与腰边缘惩罚均读硬件 `joint_pos_limits` |
+| **概率终止、单步过采样与状态机** | 无手撑地下 `p_term=0.005` 致 `>50%` 死尸样本；单步 85% 时间为站立浪费算力；重启行走残留旧 `stop_ramp_start` 误触发停步 | 取 `p_term=0.05`（`0.4 s` 救回窗）+ 直立起点过滤；单步按 `55% 起步窗 + 25% 在途/收步 + 20% 站立` 过采样；双卡共享 Actor 加权合梯度、各保私有 Critic；停步触发须写边沿穿越 `(elapsed < t_stop) & (next_elapsed >= t_stop)` |
+| **存活门控课程与改奖励续训** | 只看单步分晋级导致开 Viser 几秒就倒；只改 `env.cfg.events` 未生效；改奖励续训旧 Critic 尺度失配 | 后半验证环境零噪声执行，以 `det_mtbf_s` 硬门控晋级，Stage 7 对齐 `play=True`，原地同步 `event_manager.get_term_cfg(...)`；`restore()` 显式重设新 `lr`，改奖励续训加 `--critic-warmup-iterations 25~35` 配合 `constrain_policy_kl` |
+| **CUDA Graph 零 CPU 拷贝** | 小 batch Eager 利用率 `<15%`；捕捉内 `q[:, [3,9]]` 或标量 `torch.where` 触发 CPU→GPU 拷贝报错 | `num_envs=4096, actor_batch=8192, wm_batch=16384` 静态图捕捉（双 4090 约 `3.3 s/轮`）；捕捉区内禁用列表花式索引（改用 `torch.stack`）与标量 `torch.where`，课程权重写入 GPU buffer `stage_params` 原地 `.copy_()` |
+
+### 导出基线与评测对照
+
+最优联合策略与双卡完整续训存档位于 `export/footstep_wm_71000/`（含 `training/update_00071000/rank_{0,1}.pt`、兼容 `FootstepPolicy` 的 `policy_deploy.onnx`、无状态 `policy.onnx`、`policy_contract.json` 与 `bundle.json`）：
+
+| 同随机种子闭环评测 (`64 envs`) | SuperMimic Twin-Mirror 10帧 MLP (`71k`) | PPO Twin-Mirror GRU (`189k`) |
+| --- | ---: | ---: |
+| Actor 部署参数量 / 单环境累计真实采样拍数 | `1.54M` / `3.22 × 10^5` | `0.15M` / `1.21 × 10^7` |
+| 连续全向走落脚 XY / Yaw 中位误差 (`8085`) | **`2.59 cm` / `1.31°`** | `5.39 cm` / `2.19°` |
+| 单步终点双脚最差 XY 中位数 / `<= 5cm` 达标率 (`8086`) | **`1.63 cm` / `98.4%`** | `3.60 cm` / `68.8%` |
+| `f = 0` 无扰站立双膝角 / 骨盆高度 / 膝力矩 | **`14.5°` / `0.785 m` / `2.10 N·m`** | `-1.8°` / `0.789 m` / `5.59 N·m` |
+| `f = 0` 站立额定归一化铜损 $\sum(\tau_i/\tau_{\max,i})^2$（无扰 / 强扰） | **`0.0883` / `0.1677`** | `0.1544` / `0.2104` |
+
+### 启动、续训、回放与导出
+
+```bash
+# 从零双卡自动课程 + 单步联合训练
+CUDA_VISIBLE_DEVICES=0,1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MUJOCO_GL=egl \
+torchrun --standalone --nproc-per-node=2 scripts/train.py G1-Gloria-FootstepTracking-WM \
+  --output logs/footstep_wm/from_scratch --iterations 0
+
+# 从导出基线继续联合训练（须指定新 --output 目录）
+CUDA_VISIBLE_DEVICES=0,1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MUJOCO_GL=egl \
+torchrun --standalone --nproc-per-node=2 scripts/train.py G1-Gloria-FootstepTracking-WM \
+  --resume export/footstep_wm_71000 --output logs/footstep_wm/continue_from_71000 --iterations 0
+
+# 双端口 Viser 回放（8085 连续走 / 8086 单步，支持权重更新自动热重载）
+CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 MUJOCO_GL=egl \
+python scripts/play.py G1-Gloria-FootstepTracking-WM \
+  --checkpoint-file export/footstep_wm_71000 --profile precision --viewer viser --viser-port 8085
+CUDA_VISIBLE_DEVICES=1 OMP_NUM_THREADS=1 MUJOCO_GL=egl \
+python scripts/play.py G1-Gloria-FootstepTracking-WM \
+  --checkpoint-file export/footstep_wm_71000 --profile step-episode --viewer viser --viser-port 8086
+
+# 导出无状态与部署版 ONNX
+python scripts/export_onnx.py --checkpoint export/footstep_wm_71000 --output-dir export/footstep_wm_71000
+```

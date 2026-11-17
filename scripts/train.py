@@ -23,7 +23,14 @@ from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
 
 from g1_lower_rl.scene_graph import enable_scene_cuda_graphs
-from g1_lower_rl.tasks import FOOTSTEP_TASK, LOWER_BODY_WM_TASK, MOCAP_TASK, STEP_EPISODE_TASK, list_tasks
+from g1_lower_rl.tasks import (
+  FOOTSTEP_TASK,
+  FOOTSTEP_WM_TASK,
+  LOWER_BODY_WM_TASK,
+  MOCAP_TASK,
+  STEP_EPISODE_TASK,
+  list_tasks,
+)
 from g1_lower_rl.tasks.lower_body.cfg.constants import MIRROR_STAGES
 
 
@@ -52,7 +59,7 @@ class TrainConfig:
   带来的微小不对称会被 PPO 逐步放大。详见 ``g1_lower_rl/rl/mirror.py``。"""
 
   @staticmethod
-  def from_task(task_id: str) -> "TrainConfig":
+  def from_task(task_id: str) -> TrainConfig:
     """从注册任务构建训练参数，脚步布局不使用旧速度任务的镜像增强"""
     return TrainConfig(
       env=load_env_cfg(task_id),
@@ -214,6 +221,11 @@ def main() -> None:
     from g1_lower_rl.tasks.lower_body.wm import VelocityWmConfig, run_velocity_wm_training
 
     run_velocity_wm_training(tyro.cli(VelocityWmConfig, args=remaining_args, prog=f"{sys.argv[0]} {chosen_task}"))
+    return
+  if chosen_task == FOOTSTEP_WM_TASK:
+    from g1_lower_rl.tasks.footstep_tracking.wm import FootstepWmConfig, run_footstep_wm_training
+
+    run_footstep_wm_training(tyro.cli(FootstepWmConfig, args=remaining_args, prog=f"{sys.argv[0]} {chosen_task}"))
     return
   args = tyro.cli(
     TrainConfig,
