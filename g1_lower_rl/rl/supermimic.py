@@ -98,7 +98,13 @@ def cosine_learning_rate(iteration: int, base: float, world_size: int, decay_ste
   return base * math.sqrt(world_size) * (0.03 + 0.97 * (1 + math.cos(math.pi * progress)) / 2)
 
 
-def optimizer_step(parameters: Iterable[nn.Parameter], optimizer: torch.optim.Optimizer, *, actor: bool = False) -> float:
+def optimizer_step(
+  parameters: Iterable[nn.Parameter],
+  optimizer: torch.optim.Optimizer,
+  *,
+  actor: bool = False,
+  max_raw_norm: float | None = None,
+) -> float:
   params = [p for p in parameters if p.requires_grad]
   gradients = [p.grad for p in params if p.grad is not None]
   if not gradients:
@@ -126,12 +132,15 @@ def optimizer_step(parameters: Iterable[nn.Parameter], optimizer: torch.optim.Op
       actor,
       float(norm),
     )
+  norm_val = float(norm)
+  if max_raw_norm is not None and norm_val > max_raw_norm:
+    return norm_val
   nn.utils.clip_grads_with_norm_(params, 1.0, norm)
   if actor:
     for gradient in gradients:
       gradient.clamp_(-0.1, 0.1)
   optimizer.step()
-  return float(norm)
+  return norm_val
 
 
 @torch.no_grad()

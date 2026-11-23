@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 
 from g1_lower_rl.world_model.model import (
   CONTROL_DT,
@@ -30,6 +31,7 @@ class LossConfig:
   zero_force_threshold: float = 1e-3
   nonnegative_fz_weight: float = 0.01
   contact_threshold: float = 10.0
+  outlier_huber_delta: float | None = None
 
   def __post_init__(self) -> None:
     if not all(
@@ -45,6 +47,8 @@ class LossConfig:
       )
     ):
       raise ValueError("Loss configuration must be finite")
+    if self.outlier_huber_delta is not None and (not math.isfinite(self.outlier_huber_delta) or self.outlier_huber_delta <= 0):
+      raise ValueError("outlier_huber_delta must be positive when set")
     if not 0 < self.gamma <= 1 or self.gamma_reference_dt <= 0:
       raise ValueError("gamma must be in (0, 1] and reference dt must be positive")
     if min(self.force_weight, self.zero_force_weight, self.zero_force_threshold, self.nonnegative_fz_weight) < 0:
@@ -62,6 +66,7 @@ def autoregressive_loss(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
   state = window.state[:, 0]
   elapsed = torch.zeros(state.shape[0], device=state.device)
+  valid = torch.ones_like(elapsed)
   state_sum = torch.zeros_like(elapsed)
   force_sum = torch.zeros_like(elapsed)
   zero_sum = torch.zeros_like(elapsed)
@@ -69,27 +74,60 @@ def autoregressive_loss(
   weight_sum = torch.zeros_like(elapsed)
   for step in range(window.inputs.shape[1]):
     logged = window.inputs[:, step]
-    prediction = forward(state, logged[:, INPUT_FIELDS["joint_target"]], logged[:, INPUT_FIELDS["context"]])
+    if cfg.outlier_huber_delta is not None:
+      d = cfg.outlier_huber_delta
+      true_jump = state_delta(window.state[:, step], window.next_state[:, step], validate=False).detach() / delta_scale
+      quat_step = window.next_state[:, step, 3:7].unsqueeze(-2).expand(*window.foot_force[:, step].shape[:-1], 4)
+      tf_step = world_to_root(quat_step, window.foot_force[:, step]).detach().flatten(-2) / force_scale
+      step_ok = (true_jump.abs().amax(dim=-1) <= (4.0 * d)) & (tf_step.abs().amax(dim=-1) <= (4.0 * d))
+      valid = valid * step_ok.to(dtype=valid.dtype)
+      safe_state = torch.where(valid.unsqueeze(-1) > 0, state, state.detach().clamp(-10.0, 10.0))
+    else:
+      safe_state = state
+    prediction = forward(safe_state, logged[:, INPUT_FIELDS["joint_target"]], logged[:, INPUT_FIELDS["context"]])
     error = state_delta(prediction.state, window.next_state[:, step], validate=False) / delta_scale
     quaternion = window.next_state[:, step, 3:7].unsqueeze(-2).expand(*window.foot_force[:, step].shape[:-1], 4)
     target_force = world_to_root(quaternion, window.foot_force[:, step])
     force_error = (prediction.foot_force_root - target_force).flatten(-2) / force_scale
     zero = window.foot_force[:, step].norm(dim=-1) <= cfg.zero_force_threshold
-    zero_error = (force_error.unflatten(-1, (2, 3)).square().mean(-1) * zero).sum(-1) / zero.sum(-1).clamp_min(1)
     normal_scale = force_scale.unflatten(-1, (2, 3)).square().mean(-1).sqrt().clamp_min(1e-6)
     negative_fz = prediction.foot_force[..., 2].clamp_max(0) / normal_scale
-    weight = cfg.gamma ** (elapsed / cfg.gamma_reference_dt)
-    state_sum = state_sum + weight * error.square().mean(-1)
-    force_sum = force_sum + weight * force_error.square().mean(-1)
+    weight = (cfg.gamma ** (elapsed / cfg.gamma_reference_dt)) * valid
+    if cfg.outlier_huber_delta is not None:
+      d = cfg.outlier_huber_delta
+      state_sq = 2.0 * F.huber_loss(error, torch.zeros_like(error), reduction="none", delta=d)
+      force_sq = 2.0 * F.huber_loss(force_error, torch.zeros_like(force_error), reduction="none", delta=d)
+      zero_sq = 2.0 * F.huber_loss(
+        force_error.unflatten(-1, (2, 3)),
+        torch.zeros_like(force_error.unflatten(-1, (2, 3))),
+        reduction="none",
+        delta=d,
+      )
+      zero_error = (zero_sq.mean(-1) * zero).sum(-1) / zero.sum(-1).clamp_min(1)
+      # Truncate autoregressive backpropagation once prediction diverges > 2*d sigma on an OOD fall pose so
+      # multi-step MLP Jacobians (L^8) cannot explode across remaining rollout steps.
+      pred_ok = error.detach().abs().amax(dim=-1) <= (2.0 * d)
+      valid = valid * pred_ok.to(dtype=valid.dtype)
+      next_state_carry = torch.where(valid.unsqueeze(-1) > 0, prediction.state, state.detach())
+    else:
+      zero_error = (force_error.unflatten(-1, (2, 3)).square().mean(-1) * zero).sum(-1) / zero.sum(-1).clamp_min(1)
+      state_sq = error.square()
+      force_sq = force_error.square()
+      next_state_carry = prediction.state
+    state_sum = state_sum + weight * state_sq.mean(-1)
+    force_sum = force_sum + weight * force_sq.mean(-1)
     zero_sum = zero_sum + weight * zero_error
     negative_fz_sum = negative_fz_sum + weight * negative_fz.square().mean(-1)
     weight_sum = weight_sum + weight
     elapsed = elapsed + CONTROL_DT
-    state = prediction.state
-  state_loss = (state_sum / weight_sum).mean()
-  force_loss = (force_sum / weight_sum).mean()
-  zero_loss = (zero_sum / weight_sum).mean()
-  negative_fz_loss = (negative_fz_sum / weight_sum).mean()
+    state = next_state_carry
+  denom = weight_sum.clamp_min(1e-6)
+  traj_active = (weight_sum > 0).to(dtype=state_sum.dtype)
+  active_count = traj_active.sum().clamp_min(1.0)
+  state_loss = ((state_sum / denom) * traj_active).sum() / active_count
+  force_loss = ((force_sum / denom) * traj_active).sum() / active_count
+  zero_loss = ((zero_sum / denom) * traj_active).sum() / active_count
+  negative_fz_loss = ((negative_fz_sum / denom) * traj_active).sum() / active_count
   total = (
     state_loss
     + cfg.force_weight * force_loss

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 from mjlab.envs import ManagerBasedRlEnv
@@ -28,10 +28,13 @@ from .policy import (
   ACTION_DIM,
   DEFAULT_HISTORY,
   FRAME_DIM,
-  FootstepTwinMirrorMlpActor,
+  FootstepTwinMirrorGruActor,
+  FootstepTwinMirrorSkipGruActor,
+  FootstepWmActor,
   command_from_world_queue,
   encode_command,
   encode_proprio_frame,
+  raw_obs_from_world_queue,
 )
 from .task import (
   AUTO_CURRICULUM_STAGES,
@@ -50,7 +53,7 @@ class FootstepPolicyCollector(MotionCollector):
     config: CollectorConfig,
     *,
     validation_envs: int,
-    actor: FootstepTwinMirrorMlpActor,
+    actor: FootstepWmActor,
     history_length: int = DEFAULT_HISTORY,
     termination_probability: float = DEFAULT_TERMINATION_PROB,
     policy_action_sampling: bool = True,
@@ -59,6 +62,9 @@ class FootstepPolicyCollector(MotionCollector):
     play: bool = False,
     enable_corruption: bool | None = None,
     render_mode: Literal["rgb_array"] | None = None,
+    vel_push_prob: float = 0.0,
+    vel_push_lin: float = 0.45,
+    vel_push_ang: float = 0.45,
   ):
     if not 0 <= validation_envs < config.num_envs or config.recover_nonfinite:
       raise ValueError("Footstep WM collection requires 0 <= validation_envs < num_envs and fail-fast physics")
@@ -71,10 +77,18 @@ class FootstepPolicyCollector(MotionCollector):
     self.num_envs = config.num_envs
     self.validation_envs = validation_envs
     self.actor = actor
+    self.is_gru_actor = isinstance(actor, (FootstepTwinMirrorGruActor, FootstepTwinMirrorSkipGruActor))
+    self.gru_hidden_state_dim = (
+      actor.hidden_state_dim if isinstance(actor, (FootstepTwinMirrorGruActor, FootstepTwinMirrorSkipGruActor)) else 0
+    )
     self.history_length = history_length
     self.termination_probability = termination_probability
     self.policy_action_sampling = policy_action_sampling
     self.is_step_episode = env_profile == "step-episode"
+    self.play = bool(play)
+    self.vel_push_prob = float(vel_push_prob)
+    self.vel_push_lin = float(vel_push_lin)
+    self.vel_push_ang = float(vel_push_ang)
     self.device = torch.device(config.device)
     self._action_noise = float(config.action_noise)
     self.action_failure: dict[str, torch.Tensor] | None = None
@@ -228,7 +242,11 @@ class FootstepPolicyCollector(MotionCollector):
       self.template = StaticKinematicTemplate.from_mujoco(self.env.sim.mj_model, "robot/")
       self.metadata = {
         "contract_version": 3,
-        "policy_collection": "current_trainable_footstep_TwinMirror_MLP",
+        "policy_collection": (
+          "current_trainable_footstep_TwinMirror_GRU"
+          if self.is_gru_actor
+          else "current_trainable_footstep_TwinMirror_MLP"
+        ),
         "history_length": history_length,
         "termination_probability": termination_probability,
         "static_template": self.template.to_dict(),
@@ -279,6 +297,10 @@ class FootstepPolicyCollector(MotionCollector):
         (0.12, 0.30),
         yaw_noise=(-stage.foot_yaw_half_range, stage.foot_yaw_half_range),
       )
+      if hasattr(batch, "initial_direction_range"):
+        batch.initial_direction_range.copy_(
+          batch.initial_direction_range.new_tensor((-stage.direction_half_range, stage.direction_half_range))
+        )
     else:
       mgr_init_freq = 1.2 if stage.initial_frequency is None else stage.initial_frequency
       batch.cfg = replace(
@@ -315,12 +337,32 @@ class FootstepPolicyCollector(MotionCollector):
         self.env.event_manager.get_term_cfg(event_name).params["target_scale"] = stage.arm_target_scale
       except (KeyError, ValueError):
         pass
+    if not self.play and "reset_initialization" in self.env.cfg.events:
+      init_probs = (0.5, 0.4, 0.1) if stage.index >= 4 else (0.75, 0.25, 0.0)
+      init_h_range = (0.50, 0.79) if stage.index >= 4 else (0.62, 0.78)
+      self.env.cfg.events["reset_initialization"].params.update(
+        probabilities=init_probs,
+        pelvis_height_range=init_h_range,
+      )
+      try:
+        self.env.event_manager.get_term_cfg("reset_initialization").params.update(
+          probabilities=init_probs,
+          pelvis_height_range=init_h_range,
+        )
+      except (KeyError, ValueError):
+        pass
     self._theta_cmd.angle_limit = float(stage.theta_limit_rad)
 
   def reset_all_envs(self) -> None:
     """Full environment reset applying current stage events (`reset_arm_pose` target_scale, etc.) across all worlds."""
     self._observations, _ = self.env.reset()
+    if not self.play and not self.is_step_episode and self.env.max_episode_length > 1:
+      # Stagger episode clocks uniformly so neither training nor validation envs hit synchronized timeouts.
+      self.env.episode_length_buf.copy_(
+        torch.randint(0, int(self.env.max_episode_length), (self.num_envs,), device=self.device)
+      )
     self._history = torch.zeros(self.num_envs, self.history_length, FRAME_DIM, device=self.device)
+    self._gru_h = torch.zeros(self.num_envs, self.gru_hidden_state_dim, device=self.device)
     self._prev_action = torch.zeros(self.num_envs, ACTION_DIM, device=self.device)
     self._episode_fresh = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
     self._was_failing = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -393,10 +435,15 @@ class FootstepPolicyCollector(MotionCollector):
     raw_freq = raw_obs[:, 71]
     raw_fp = raw_obs[:, 72:78].unflatten(-1, (2, 3))
     command = encode_command(raw_phase, raw_freq, raw_fp, theta)
+    raw_obs_79 = torch.cat((raw_obs[:, :78], theta.unsqueeze(-1)), dim=-1)
     if verify_packing:
       queue_cmd = command_from_world_queue(phase, frequency, queue, first_side, anchor, theta)
       # Wrap phase modulo 2*pi induces identical sin/cos
       torch.testing.assert_close(command, queue_cmd, rtol=1e-4, atol=1e-4)
+      queue_raw79 = raw_obs_from_world_queue(raw_obs[:, :70], phase, frequency, queue, first_side, anchor, theta)
+      torch.testing.assert_close(raw_obs_79[:, 71:], queue_raw79[:, 71:], rtol=1e-4, atol=1e-4)
+      torch.testing.assert_close(raw_obs_79[:, 70].sin(), queue_raw79[:, 70].sin(), rtol=1e-4, atol=1e-4)
+      torch.testing.assert_close(raw_obs_79[:, 70].cos(), queue_raw79[:, 70].cos(), rtol=1e-4, atol=1e-4)
 
     encoder_bias = robot.data.encoder_bias[:, self._all_joint_ids].clone()
     imu_bias = self._current_imu_bias()
@@ -411,10 +458,31 @@ class FootstepPolicyCollector(MotionCollector):
     air_time = self._feet_sensor.data.current_air_time
     contact_time = self._feet_sensor.data.current_contact_time
     assert found is not None and air_time is not None and contact_time is not None
-    aux = pack_footstep_aux((found > 0).float(), air_time, contact_time, anchor).clone()
+    try:
+      filt_fn: Any = self.env.reward_manager.get_term_cfg("pelvis_upright_filtered").func
+      filt_g_xy = filt_fn.filtered_gravity[:, :2].to(torch.float32).clone()
+    except (KeyError, ValueError, AttributeError):
+      filt_g_xy = raw_obs[:, 61:63].to(torch.float32).clone()
+    aux = pack_footstep_aux((found > 0).float(), air_time, contact_time, anchor, filt_g_xy).clone()
 
     history_snapshot = self._history.clone()
-    mean = self.actor(history_snapshot, command)
+    if isinstance(self.actor, FootstepTwinMirrorSkipGruActor):
+      gru_h_in = torch.where(self._episode_fresh.unsqueeze(-1), torch.zeros_like(self._gru_h), self._gru_h)
+      mean, next_gru_h = self.actor.step(frame, command, gru_h_in)
+      self._gru_h.copy_(next_gru_h)
+      policy_input_a = torch.cat((gru_h_in, frame), dim=-1)
+      policy_input_b = command.clone()
+    elif isinstance(self.actor, FootstepTwinMirrorGruActor):
+      gru_h_in = torch.where(self._episode_fresh.unsqueeze(-1), torch.zeros_like(self._gru_h), self._gru_h)
+      mean, next_gru_h = self.actor.step(raw_obs_79, gru_h_in, prev_act)
+      self._gru_h.copy_(next_gru_h)
+      policy_input_a = torch.cat((gru_h_in, prev_act), dim=-1)
+      policy_input_b = raw_obs_79.clone()
+    else:
+      gru_h_in = None
+      mean = self.actor(history_snapshot, command)
+      policy_input_a = history_snapshot
+      policy_input_b = command
     if self.policy_action_sampling:
       action = mean + (self._action_noise * self._noise_mask) * torch.randn_like(mean)
     else:
@@ -452,11 +520,33 @@ class FootstepPolicyCollector(MotionCollector):
     done = terminated | truncated
     step_ep_done = (done & self.is_step_episode) if self.is_step_episode else torch.zeros_like(done)
     step_ep_success = self._last_step_accurate.clone() if self.is_step_episode else torch.zeros_like(done)
-    self._unbroken_steps = torch.where(done, torch.zeros_like(self._unbroken_steps), self._unbroken_steps)
+    self._unbroken_steps = torch.where(
+      terminated,
+      torch.zeros_like(self._unbroken_steps),
+      self._unbroken_steps.clamp_max(self.env.max_episode_length),
+    )
     self._was_failing = failed & ~done
 
     self._prev_action.copy_(action)
     self._episode_fresh = done.clone()
+
+    # Boundary-masked training-env velocity push: MotionCollector._step increments _segment across
+    # this instantaneous qvel jump so online WM training remains strictly Markovian.
+    if not self.play and self.current_stage.index >= 7 and self.vel_push_prob > 0.0:
+      cand_push = (torch.rand(self.num_envs, device=self.device) < self.vel_push_prob) & (~done) & (~failed)
+      cand_push[: self.validation_envs] = False
+      if cand_push.any():
+        push_ids = torch.nonzero(cand_push, as_tuple=False).squeeze(-1)
+        m_push = len(push_ids)
+        ang = torch.rand(m_push, device=self.device) * (2.0 * math.pi)
+        mag = (0.35 + 0.65 * torch.rand(m_push, device=self.device)) * self.vel_push_lin
+        cur_vel = robot.data.root_link_vel_w[push_ids, :6].clone()
+        cur_vel[:, 0] += mag * torch.cos(ang)
+        cur_vel[:, 1] += mag * torch.sin(ang)
+        cur_vel[:, 3:6] += (torch.rand(m_push, 3, device=self.device) * 2.0 - 1.0) * self.vel_push_ang
+        robot.write_root_link_velocity_to_sim(cur_vel, env_ids=push_ids)
+        self.env.sim.forward()
+        self._observations = self.env.observation_manager.compute()
 
     self.counters["failed_control_steps"] += int(failed.sum())
     self.counters["failed_continued_control_steps"] += int((failed & ~terminated & ~truncated).sum())
@@ -466,9 +556,11 @@ class FootstepPolicyCollector(MotionCollector):
       expected = pack_inputs(batch.state[0], batch.inputs[0, :, 68:97], batch.inputs[0, :, 97:])
       torch.testing.assert_close(batch.inputs[0], expected)
 
-    return batch, {
+    record = {
       "history": history_snapshot,
       "command": command,
+      "policy_input_a": policy_input_a,
+      "policy_input_b": policy_input_b,
       "mean_action": mean,
       "latest": frame.clone(),
       "aux": aux,
@@ -516,6 +608,10 @@ class FootstepPolicyCollector(MotionCollector):
       "terminated": terminated,
       "truncated": truncated,
     }
+    if gru_h_in is not None:
+      record["gru_h"] = gru_h_in.clone()
+      record["raw_obs_79"] = raw_obs_79.clone()
+    return batch, record
 
   def save_action_failure(self, path) -> None:
     if self.action_failure is None:

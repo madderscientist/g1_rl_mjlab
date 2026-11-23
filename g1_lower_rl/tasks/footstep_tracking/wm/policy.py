@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -224,6 +225,33 @@ def command_from_world_queue(
   return encode_command(phase, frequency, local_fp, theta)
 
 
+def raw_obs_from_world_queue(
+  raw_proprio: torch.Tensor,
+  phase: torch.Tensor,
+  frequency: torch.Tensor,
+  queue: torch.Tensor,
+  first_side: torch.Tensor,
+  anchor: torch.Tensor,
+  theta: torch.Tensor,
+) -> torch.Tensor:
+  """Build 79D FootstepActor raw observation from 70D noisy proprio + world footstep queue."""
+  sides = torch.arange(2, device=first_side.device)
+  indices = (sides[None, :] != first_side[:, None]).long()
+  future_world = queue.gather(1, indices[:, :, None].expand(-1, -1, 3))
+  local_fp = to_local(future_world, anchor[:, None, :]).flatten(1)
+  wrapped_phase = phase.remainder(2.0 * math.pi)
+  return torch.cat(
+    (
+      raw_proprio,
+      wrapped_phase.unsqueeze(-1),
+      frequency.unsqueeze(-1),
+      local_fp,
+      theta.unsqueeze(-1),
+    ),
+    dim=-1,
+  )
+
+
 footstep_target = lower_body_actuator_target
 
 
@@ -285,7 +313,345 @@ class FootstepTwinMirrorMlpActor(nn.Module):
     return 0.5 * (y + ym_unmirrored)
 
 
-def actor_architecture_metadata(actor: FootstepTwinMirrorMlpActor) -> dict[str, object]:
+class FootstepTwinMirrorGruActor(nn.Module):
+  """Analytically sagittal-symmetric Twin-Mirror GRU wrapping FootstepActor for CUDA-graph BPTT."""
+
+  def __init__(
+    self,
+    gru_hidden_dim: int = 64,
+    mlp_hidden_dims: tuple[int, ...] = (256, 256, 128),
+    default_joint_pos: Sequence[float] | None = None,
+    *,
+    include_prev_action: bool = False,
+    skip_connection: bool = False,
+    skip_hidden_dims: tuple[int, ...] = (256, 128),
+  ):
+    super().__init__()
+    from tensordict import TensorDict
+
+    from g1_lower_rl.rl.footstep_model import FootstepActor
+
+    if gru_hidden_dim < 1 or not mlp_hidden_dims or min(mlp_hidden_dims) < 1:
+      raise ValueError("gru_hidden_dim and mlp_hidden_dims must be positive")
+    if skip_connection and (not skip_hidden_dims or min(skip_hidden_dims) < 1):
+      raise ValueError("skip_hidden_dims must be positive when skip_connection=True")
+    self.gru_hidden_dim = int(gru_hidden_dim)
+    self.mlp_hidden_dims = tuple(int(w) for w in mlp_hidden_dims)
+    self.include_prev_action = bool(include_prev_action)
+    self.skip_connection = bool(skip_connection)
+    self.skip_hidden_dims = tuple(int(w) for w in skip_hidden_dims)
+    self.hidden_state_dim = 2 * self.gru_hidden_dim
+    self.encoded_obs_dim = 82
+    self.gru_input_dim = self.encoded_obs_dim + (ACTION_DIM if self.include_prev_action else 0)
+    defaults = torch.tensor(
+      nominal_joint_positions() if default_joint_pos is None else default_joint_pos,
+      dtype=torch.float32,
+    )
+    if defaults.shape != (JOINT_DIM,) or not torch.isfinite(defaults).all():
+      raise ValueError("default_joint_pos must contain 29 finite joint angles")
+
+    dummy_obs = TensorDict({"actor": torch.zeros(1, RAW_OBS_DIM)}, batch_size=[1])
+    self.actor = FootstepActor(
+      dummy_obs,
+      {"actor": ["actor"]},
+      "actor",
+      ACTION_DIM,
+      hidden_dims=self.mlp_hidden_dims,
+      activation="elu",
+      obs_normalization=True,
+      distribution_cfg=None,
+      rnn_type="gru",
+      rnn_hidden_dim=self.gru_hidden_dim,
+      rnn_num_layers=1,
+      twin_mirror=True,
+    )
+    if self.gru_input_dim != self.encoded_obs_dim:
+      self.actor.rnn.rnn = nn.GRU(self.gru_input_dim, self.gru_hidden_dim, num_layers=1)
+    if self.skip_connection:
+      in_dim = self.gru_input_dim
+      skip_layers: list[nn.Module] = []
+      for width in self.skip_hidden_dims:
+        lin = nn.Linear(in_dim, width)
+        nn.init.orthogonal_(lin.weight, gain=math.sqrt(2.0))
+        nn.init.zeros_(lin.bias)
+        skip_layers.extend((lin, nn.SiLU()))
+        in_dim = width
+      skip_out = nn.Linear(in_dim, ACTION_DIM)
+      nn.init.zeros_(skip_out.weight)
+      nn.init.zeros_(skip_out.bias)
+      skip_layers.append(skip_out)
+      self.skip_net: nn.Sequential | None = nn.Sequential(*skip_layers)
+    else:
+      self.skip_net = None
+    self.actor.encoder.default_joint_pos.copy_(defaults)
+    # Sensible physical scales if initialized from scratch; overwritten when loading PPO/WM actor checkpoint.
+    init_std = torch.ones_like(self.actor.obs_normalizer._std)
+    init_std[:, 29:58] = 5.0
+    init_std[:, 58:61] = 2.0
+    init_std[:, 64:67] = 2.0
+    self.actor.obs_normalizer._std.copy_(init_std)
+    self.actor.obs_normalizer._var.copy_(init_std.square())
+    self.actor.obs_normalizer.eval()
+
+  @property
+  def default_joint_pos(self) -> torch.Tensor:
+    return self.actor.encoder.default_joint_pos
+
+  def train(self, mode: bool = True) -> FootstepTwinMirrorGruActor:
+    super().train(mode)
+    # cuDNN GRU backward requires self.actor.rnn in train mode, while EmpiricalNormalization must remain frozen!
+    self.actor.obs_normalizer.eval()
+    return self
+
+  def set_actuator_metadata(
+    self,
+    *,
+    default_joint_pos: torch.Tensor,
+    action_scale: torch.Tensor,
+    stiffness: torch.Tensor,
+    damping: torch.Tensor,
+    effort_limit: torch.Tensor,
+  ) -> None:
+    self.actor.encoder.default_joint_pos.copy_(default_joint_pos.to(dtype=torch.float32))
+    self.actor.action_scale.copy_(action_scale.to(dtype=torch.float32))
+    self.actor.action_stiffness.copy_(stiffness.to(dtype=torch.float32))
+    self.actor.action_damping.copy_(damping.to(dtype=torch.float32))
+    self.actor.action_effort_limit.copy_(effort_limit.to(dtype=torch.float32))
+
+  def load_ppo_actor_state_dict(self, actor_state_dict: dict[str, torch.Tensor]) -> None:
+    """Load PPO or narrow SuperMimic GRU weights, zero-padding GRU prev_action input columns if widened."""
+    stripped = {
+      k.removeprefix("actor."): v
+      for k, v in actor_state_dict.items()
+      if not k.startswith("skip_net.")
+    }
+    filtered = {k: v.clone() for k, v in stripped.items() if not k.startswith("distribution.")}
+    target_sd = self.actor.state_dict()
+    key = "rnn.rnn.weight_ih_l0"
+    if key in filtered and key in target_sd and filtered[key].shape != target_sd[key].shape:
+      src = filtered[key]
+      dst_shape = target_sd[key].shape
+      if src.ndim == 2 and src.shape[0] == dst_shape[0] and src.shape[1] < dst_shape[1]:
+        padded = src.new_zeros(dst_shape)
+        padded[:, : src.shape[1]] = src
+        filtered[key] = padded
+    self.actor.load_state_dict(filtered, strict=True)
+    if not all(torch.isfinite(v).all() for v in self.actor.state_dict().values() if v.is_floating_point()):
+      raise FloatingPointError("Loaded FootstepActor state_dict contains nonfinite weights/statistics")
+    self.actor.obs_normalizer.eval()
+
+  def optimizer_param_groups(self, base_lr: float, skip_lr_mult: float = 10.0) -> list[dict[str, object]]:
+    groups: list[dict[str, object]] = [
+      {"params": [p for p in self.actor.parameters() if p.requires_grad], "lr": base_lr, "lr_mult": 1.0}
+    ]
+    if self.skip_net is not None:
+      groups.append(
+        {
+          "params": [p for p in self.skip_net.parameters() if p.requires_grad],
+          "lr": base_lr * float(skip_lr_mult),
+          "lr_mult": float(skip_lr_mult),
+        }
+      )
+    return groups
+
+  def step(
+    self,
+    raw_obs_79: torch.Tensor,
+    hidden: torch.Tensor,
+    prev_action: torch.Tensor | None = None,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure-tensor single-step Twin-Mirror GRU forward: (raw_obs[B, 79], h[B, 2*H], prev_act[B, 15]) -> (act, next_h)."""
+    if not torch.jit.is_tracing():
+      if raw_obs_79.ndim != 2 or raw_obs_79.shape[-1] != RAW_OBS_DIM:
+        raise ValueError(f"Expected [batch, {RAW_OBS_DIM}] raw_obs_79, got {tuple(raw_obs_79.shape)}")
+      if hidden.ndim != 2 or hidden.shape[-1] != self.hidden_state_dim:
+        raise ValueError(f"Expected [batch, {self.hidden_state_dim}] hidden, got {tuple(hidden.shape)}")
+    fa = self.actor
+    enc_orig = fa.encoder(raw_obs_79)
+    enc_mirr = enc_orig.index_select(-1, fa._enc_mirror_perm) * fa._enc_mirror_sign
+    norm_pair = fa.obs_normalizer(torch.cat((enc_orig, enc_mirr), dim=0))
+    if self.include_prev_action:
+      pa = raw_obs_79.new_zeros((raw_obs_79.shape[0], ACTION_DIM)) if prev_action is None else prev_action
+      if not torch.jit.is_tracing() and (pa.ndim != 2 or pa.shape != (raw_obs_79.shape[0], ACTION_DIM)):
+        raise ValueError(f"Expected [batch, {ACTION_DIM}] prev_action, got {tuple(pa.shape)}")
+      pa_clamped = pa.clamp(-4.0, 4.0)
+      pa_mirr = pa_clamped.index_select(-1, fa._act_mirror_perm) * fa._act_mirror_sign
+      pa_pair = torch.cat((pa_clamped, pa_mirr), dim=0)
+      gru_in_pair = torch.cat((norm_pair, pa_pair), dim=-1)
+    else:
+      pa_pair = None
+      gru_in_pair = norm_pair
+    h_orig, h_mirr = hidden.chunk(2, dim=-1)
+    h_pair = torch.cat((h_orig, h_mirr), dim=0).unsqueeze(0).contiguous()
+    out_pair, next_h_pair = fa.rnn.rnn(gru_in_pair.unsqueeze(0), h_pair)
+    next_h_orig, next_h_mirr = next_h_pair.squeeze(0).chunk(2, dim=0)
+    next_hidden = torch.cat((next_h_orig, next_h_mirr), dim=-1)
+    mlp_pair = fa.mlp(out_pair.squeeze(0))
+    if self.skip_net is not None:
+      norm_clipped = norm_pair.clamp(-5.0, 5.0)
+      skip_in = torch.cat((norm_clipped, pa_pair), dim=-1) if pa_pair is not None else norm_clipped
+      mlp_pair = mlp_pair + self.skip_net(skip_in)
+    out_orig, out_mirr = mlp_pair.chunk(2, dim=0)
+    out_mirr_back = out_mirr.index_select(-1, fa._act_mirror_perm) * fa._act_mirror_sign
+    actions = 0.5 * (out_orig + out_mirr_back)
+    return actions, next_hidden
+
+  def forward(
+    self,
+    raw_obs_79: torch.Tensor,
+    hidden: torch.Tensor,
+    prev_action: torch.Tensor | None = None,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    return self.step(raw_obs_79, hidden, prev_action)
+
+
+class FootstepTwinMirrorSkipGruActor(nn.Module):
+  """Unified Twin-Mirror zero-DC GRU + direct observation skip + per-joint gated leaky action integrator."""
+
+  default_joint_pos: torch.Tensor
+  obs_mirror_perm: torch.Tensor
+  obs_mirror_sign: torch.Tensor
+  act_mirror_perm: torch.Tensor
+  act_mirror_sign: torch.Tensor
+
+  def __init__(
+    self,
+    gru_hidden_dim: int = 256,
+    hidden_dims: tuple[int, ...] = (512, 256, 128),
+    default_joint_pos: Sequence[float] | None = None,
+    *,
+    max_integrator_alpha: float = 0.85,
+    init_alpha_logit: float = -4.0,
+  ):
+    super().__init__()
+    if gru_hidden_dim < 1 or not hidden_dims or min(hidden_dims) < 1 or not 0.0 < max_integrator_alpha < 1.0:
+      raise ValueError("gru_hidden_dim, hidden_dims must be positive and max_integrator_alpha in (0, 1)")
+    self.gru_hidden_dim = int(gru_hidden_dim)
+    self.hidden_dims = tuple(int(w) for w in hidden_dims)
+    self.hidden_state_dim = 2 * self.gru_hidden_dim
+    self.max_integrator_alpha = float(max_integrator_alpha)
+    self.frame_cmd_dim = FRAME_DIM + CMD_ENC_DIM  # 85 + 13 = 98
+
+    defaults = torch.tensor(
+      nominal_joint_positions() if default_joint_pos is None else default_joint_pos,
+      dtype=torch.float32,
+    )
+    if defaults.shape != (JOINT_DIM,) or not torch.isfinite(defaults).all():
+      raise ValueError("default_joint_pos must contain 29 finite joint angles")
+    self.register_buffer("default_joint_pos", defaults)
+
+    obs_perm, obs_sign, act_perm, act_sign = build_twin_mirror_indices(1)
+    self.register_buffer("obs_mirror_perm", obs_perm, persistent=False)
+    self.register_buffer("obs_mirror_sign", obs_sign, persistent=False)
+    self.register_buffer("act_mirror_perm", act_perm, persistent=False)
+    self.register_buffer("act_mirror_sign", act_sign, persistent=False)
+
+    self.gru = nn.GRU(self.frame_cmd_dim, self.gru_hidden_dim, num_layers=1)
+    nn.init.orthogonal_(self.gru.weight_ih_l0)
+    nn.init.orthogonal_(self.gru.weight_hh_l0)
+    nn.init.zeros_(self.gru.bias_ih_l0)
+    nn.init.zeros_(self.gru.bias_hh_l0)
+
+    in_dim = self.gru_hidden_dim + self.frame_cmd_dim
+    layers: list[nn.Module] = []
+    for width in self.hidden_dims:
+      lin = nn.Linear(in_dim, width)
+      nn.init.orthogonal_(lin.weight, gain=math.sqrt(2.0))
+      nn.init.zeros_(lin.bias)
+      layers.extend((lin, nn.SiLU()))
+      in_dim = width
+    last = nn.Linear(in_dim, ACTION_DIM)
+    nn.init.orthogonal_(last.weight, gain=0.01)
+    nn.init.zeros_(last.bias)
+    layers.append(last)
+    self.net = nn.Sequential(*layers)
+
+    self.alpha_logit = nn.Parameter(torch.full((ACTION_DIM,), float(init_alpha_logit)))
+
+  def integrator_alpha(self) -> torch.Tensor:
+    sym_logit = 0.5 * (self.alpha_logit + self.alpha_logit.index_select(0, self.act_mirror_perm))
+    return self.max_integrator_alpha * torch.sigmoid(sym_logit)
+
+  def step(
+    self,
+    frame: torch.Tensor,
+    command: torch.Tensor,
+    hidden: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Single-step forward: (frame[B, 85], command[B, 13], hidden[B, 2*H]) -> (actions[B, 15], next_hidden[B, 2*H])."""
+    if not torch.jit.is_tracing():
+      if frame.ndim != 2 or frame.shape[-1] != FRAME_DIM:
+        raise ValueError(f"Expected [batch, {FRAME_DIM}] frame, got {tuple(frame.shape)}")
+      if command.ndim != 2 or command.shape[-1] != CMD_ENC_DIM:
+        raise ValueError(f"Expected [batch, {CMD_ENC_DIM}] command, got {tuple(command.shape)}")
+      if hidden.ndim != 2 or hidden.shape[-1] != self.hidden_state_dim:
+        raise ValueError(f"Expected [batch, {self.hidden_state_dim}] hidden, got {tuple(hidden.shape)}")
+    prev_act = frame[:, 70:85].clamp(-4.0, 4.0)
+    x = torch.cat((frame[:, :70], prev_act, command), dim=-1)
+    xm = x.index_select(-1, self.obs_mirror_perm) * self.obs_mirror_sign
+    x_pair = torch.cat((x, xm), dim=0)
+
+    h_orig, h_mirr = hidden.chunk(2, dim=-1)
+    h_pair = torch.cat((h_orig, h_mirr), dim=0).unsqueeze(0).contiguous()
+    out_pair, next_h_pair = self.gru(x_pair.unsqueeze(0), h_pair)
+    next_h_orig, next_h_mirr = next_h_pair.squeeze(0).chunk(2, dim=0)
+    next_hidden = torch.cat((next_h_orig, next_h_mirr), dim=-1)
+
+    trunk_in = torch.cat((out_pair.squeeze(0), x_pair.clamp(-6.0, 6.0)), dim=-1)
+    u_orig, u_mirr = self.net(trunk_in).chunk(2, dim=0)
+    u_mirr_back = u_mirr.index_select(-1, self.act_mirror_perm) * self.act_mirror_sign
+    u_sym = 0.5 * (u_orig + u_mirr_back)
+
+    alpha = self.integrator_alpha()
+    actions = alpha * prev_act + (1.0 - alpha) * u_sym
+    return actions, next_hidden
+
+  def forward(
+    self,
+    frame: torch.Tensor,
+    command: torch.Tensor,
+    hidden: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    return self.step(frame, command, hidden)
+
+
+FootstepWmActor = FootstepTwinMirrorMlpActor | FootstepTwinMirrorGruActor | FootstepTwinMirrorSkipGruActor
+
+
+def actor_architecture_metadata(actor: FootstepWmActor) -> dict[str, object]:
+  if isinstance(actor, FootstepTwinMirrorSkipGruActor):
+    return {
+      "type": "footstep_twin_mirror_skip_gru_integrator",
+      "frame_dim": FRAME_DIM,
+      "cmd_dim": CMD_ENC_DIM,
+      "gru_input_dim": actor.frame_cmd_dim,
+      "gru_hidden_dim": actor.gru_hidden_dim,
+      "hidden_state_dim": actor.hidden_state_dim,
+      "trunk_input_dim": actor.gru_hidden_dim + actor.frame_cmd_dim,
+      "hidden_dims": list(actor.hidden_dims),
+      "action_dim": ACTION_DIM,
+      "activation": "SiLU",
+      "max_integrator_alpha": actor.max_integrator_alpha,
+      "twin_mirror": True,
+      "zero_centered_standing": True,
+    }
+  if isinstance(actor, FootstepTwinMirrorGruActor):
+    return {
+      "type": "footstep_twin_mirror_gru",
+      "raw_obs_dim": RAW_OBS_DIM,
+      "encoded_obs_dim": actor.encoded_obs_dim,
+      "gru_input_dim": actor.gru_input_dim,
+      "gru_hidden_dim": actor.gru_hidden_dim,
+      "hidden_state_dim": actor.hidden_state_dim,
+      "mlp_hidden_dims": list(actor.mlp_hidden_dims),
+      "include_prev_action": actor.include_prev_action,
+      "skip_connection": actor.skip_connection,
+      "skip_hidden_dims": list(actor.skip_hidden_dims) if actor.skip_connection else [],
+      "action_dim": ACTION_DIM,
+      "activation": "ELU+SiLU" if actor.skip_connection else "ELU",
+      "obs_normalizer_frozen": True,
+      "twin_mirror": True,
+    }
   return {
     "type": "footstep_twin_mirror_history_mlp",
     "history_length": actor.history_length,
@@ -304,7 +670,29 @@ def make_actor(
   device: str | torch.device,
   history_length: int = DEFAULT_HISTORY,
   hidden_dims: tuple[int, ...] = (1024, 512, 256),
-) -> FootstepTwinMirrorMlpActor:
+  *,
+  actor_type: str = "mlp",
+  gru_hidden_dim: int = 64,
+  gru_mlp_hidden_dims: tuple[int, ...] = (256, 256, 128),
+  gru_include_prev_action: bool = False,
+  gru_skip_connection: bool = False,
+  gru_skip_hidden_dims: tuple[int, ...] = (256, 128),
+) -> FootstepWmActor:
+  if actor_type == "skip_gru":
+    return FootstepTwinMirrorSkipGruActor(
+      gru_hidden_dim=gru_hidden_dim,
+      hidden_dims=hidden_dims,
+    ).to(device).train()
+  if actor_type == "gru":
+    return FootstepTwinMirrorGruActor(
+      gru_hidden_dim=gru_hidden_dim,
+      mlp_hidden_dims=gru_mlp_hidden_dims,
+      include_prev_action=gru_include_prev_action,
+      skip_connection=gru_skip_connection,
+      skip_hidden_dims=gru_skip_hidden_dims,
+    ).to(device).train()
+  if actor_type != "mlp":
+    raise ValueError(f"Unsupported actor_type: {actor_type!r}")
   return FootstepTwinMirrorMlpActor(history_length=history_length, hidden_dims=hidden_dims).to(device)
 
 
@@ -378,7 +766,10 @@ __all__ = [
   "RAW_OBS_DIM",
   "FootstepPolicyBatch",
   "FootstepPolicyRollout",
+  "FootstepTwinMirrorGruActor",
   "FootstepTwinMirrorMlpActor",
+  "FootstepTwinMirrorSkipGruActor",
+  "FootstepWmActor",
   "actor_architecture_metadata",
   "build_twin_mirror_indices",
   "command_from_world_queue",
@@ -389,5 +780,6 @@ __all__ = [
   "footstep_target",
   "make_actor",
   "proprio_noise_std",
+  "raw_obs_from_world_queue",
   "raw_proprio_from_state",
 ]

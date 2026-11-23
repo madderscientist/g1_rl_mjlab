@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import pickle
 import shutil
 import signal
 import time
@@ -59,6 +60,8 @@ from .policy import (
   PROPRIO_RAW_DIM,
   FootstepPolicyBatch,
   FootstepPolicyRollout,
+  FootstepTwinMirrorGruActor,
+  FootstepTwinMirrorSkipGruActor,
   actor_architecture_metadata,
   command_from_world_queue,
   constrain_policy_kl,
@@ -67,6 +70,7 @@ from .policy import (
   footstep_target,
   make_actor,
   proprio_noise_std,
+  raw_obs_from_world_queue,
   raw_proprio_from_state,
 )
 from .task import (
@@ -159,11 +163,23 @@ class FootstepWmConfig:
   world_model: str = DEFAULT_PRETRAINED_WM
   scratch_wm: bool = False
   resume: str | None = None
+  init_ppo_actor: str | None = None
+  init_actor_from: str | None = None
+  init_wm_critic_from: str | None = None
   preflight: bool = False
+  actor_type: Literal["mlp", "gru", "skip_gru"] = "mlp"
+  gru_hidden_dim: int = 64
+  gru_mlp_hidden_dims: tuple[int, ...] = (256, 256, 128)
+  gru_burnin_steps: int = 24
+  gru_include_prev_action: bool = False
+  gru_skip_connection: bool = False
+  gru_skip_hidden_dims: tuple[int, ...] = (256, 128)
+  gru_skip_lr_mult: float = 10.0
   auto_curriculum: bool = True
   joint_step_episode: bool = True
   joint_task_weights: tuple[float, float] = (0.7, 0.3)
   initial_stage: int = 0
+  final_polish: bool = False
   qualify_streak_required: int = 3
   device: str = "cuda:0"
   seed: int = 20261112
@@ -191,6 +207,12 @@ class FootstepWmConfig:
   utd: float = 0.5
   action_noise: float | None = None
   policy_target_kl: float | None = None
+  imag_vel_push_prob: float = 0.0
+  imag_vel_push_lin: float = 0.30
+  imag_vel_push_ang: float = 0.45
+  collector_vel_push_prob: float = 0.0
+  collector_vel_push_lin: float = 0.45
+  collector_vel_push_ang: float = 0.45
   termination_probability: float = DEFAULT_TERMINATION_PROB
   policy_microbatch: int = 16384
   save_interval: int = 200
@@ -236,16 +258,35 @@ class FootstepWmConfig:
       self.validation_batch_size,
       self.qualify_streak_required,
     )
-    if min(counts) < 1 or self.iterations < 0 or self.critic_warmup_iterations < 0 or not self.actor_hidden_dims or min(self.actor_hidden_dims) < 1:
+    if (
+      min(counts) < 1
+      or self.iterations < 0
+      or self.critic_warmup_iterations < 0
+      or not self.actor_hidden_dims
+      or min(self.actor_hidden_dims) < 1
+      or self.gru_hidden_dim < 1
+      or self.gru_burnin_steps < 1
+      or not self.gru_mlp_hidden_dims
+      or min(self.gru_mlp_hidden_dims) < 1
+    ):
       raise ValueError("All batch/env/horizon/network counts must be positive and iterations >= 0")
+    if self.actor_type not in ("mlp", "gru", "skip_gru"):
+      raise ValueError(f"actor_type must be 'mlp', 'gru', or 'skip_gru', got {self.actor_type!r}")
+    if self.init_ppo_actor and self.actor_type != "gru":
+      raise ValueError("--init-ppo-actor requires --actor-type gru")
+    if self.init_ppo_actor and self.init_actor_from:
+      raise ValueError("Cannot pass both --init-ppo-actor and --init-actor-from")
+    if self.resume and (self.init_ppo_actor or self.init_actor_from or self.init_wm_critic_from):
+      raise ValueError("--resume cannot be combined with --init-ppo-actor, --init-actor-from, or --init-wm-critic-from")
     if not 0 <= self.initial_stage < len(AUTO_CURRICULUM_STAGES):
       raise ValueError(f"initial_stage must lie in [0, {len(AUTO_CURRICULUM_STAGES) - 1}]")
     if self.validation_envs >= self.num_envs:
       raise ValueError("validation_envs must be strictly smaller than num_envs")
-    min_window = max(32, self.history_length, self.wm_horizon, self.horizon)
+    gru_win = self.gru_burnin_steps if self.actor_type in ("gru", "skip_gru") else 1
+    min_window = max(32, self.history_length, gru_win, self.wm_horizon, self.horizon)
     if self.replay_steps < min_window or self.warmup_steps < min_window:
       raise ValueError(f"replay_steps and warmup_steps must be at least {min_window}")
-    positive = [self.learning_rate, self.wm_learning_rate, self.utd, self.save_seconds]
+    positive = [self.learning_rate, self.wm_learning_rate, self.utd, self.save_seconds, self.gru_skip_lr_mult]
     if self.action_noise is not None:
       positive.append(self.action_noise)
     if self.policy_target_kl is not None:
@@ -254,6 +295,15 @@ class FootstepWmConfig:
       raise ValueError("Invalid learning rate, discount, GAE lambda, exploration std, or KL limit")
     if not math.isfinite(self.termination_probability) or not 0.0 < self.termination_probability <= 1.0:
       raise ValueError("termination_probability must lie in (0, 1]")
+    if (
+      not 0.0 <= self.imag_vel_push_prob <= 1.0
+      or self.imag_vel_push_lin < 0.0
+      or self.imag_vel_push_ang < 0.0
+      or not 0.0 <= self.collector_vel_push_prob <= 1.0
+      or self.collector_vel_push_lin < 0.0
+      or self.collector_vel_push_ang < 0.0
+    ):
+      raise ValueError("Invalid velocity push probability or amplitude")
     if self.actor_batch_size / self.utd < self.num_envs - self.validation_envs:
       raise ValueError("actor_batch_size / utd must require at least one fresh native control per policy update")
     if len(self.joint_task_weights) != 2 or any(not math.isfinite(w) or w <= 0 for w in self.joint_task_weights):
@@ -287,9 +337,10 @@ class FootstepWmTrainer:
     self.stage_index = int(cfg.initial_stage)
     self.stage_entered_iteration = 0
     self.stage_qualified_streak = 0
-    self.final_polish_active = False
+    self.final_polish_active = bool(cfg.final_polish)
     self.stage_history: list[dict[str, Any]] = []
     self.best_validation_reward = -math.inf
+    self.best_validation_score = -math.inf
     self.continuation: dict[str, object] | None = None
     self.optimizer_updates = {"world_model": 0, "actor": 0, "critic": 0}
     self.started = time.monotonic()
@@ -301,7 +352,18 @@ class FootstepWmTrainer:
     self.sources = _snapshot_footstep_sources(self.output, write=rank == 0)
     torch.manual_seed(cfg.seed)
 
-    self.actor = make_actor(self.device, history_length=cfg.history_length, hidden_dims=cfg.actor_hidden_dims)
+    self.actor = make_actor(
+      self.device,
+      history_length=cfg.history_length,
+      hidden_dims=cfg.actor_hidden_dims,
+      actor_type=cfg.actor_type,
+      gru_hidden_dim=cfg.gru_hidden_dim,
+      gru_mlp_hidden_dims=cfg.gru_mlp_hidden_dims,
+      gru_include_prev_action=cfg.gru_include_prev_action,
+      gru_skip_connection=cfg.gru_skip_connection,
+      gru_skip_hidden_dims=cfg.gru_skip_hidden_dims,
+    )
+    self.is_gru_actor = isinstance(self.actor, (FootstepTwinMirrorGruActor, FootstepTwinMirrorSkipGruActor))
     self.critic = nn.Sequential(
       nn.Linear(CRITIC_DIM, 512),
       nn.ELU(),
@@ -312,31 +374,130 @@ class FootstepWmTrainer:
       nn.Linear(128, 1),
     ).to(self.device)
 
-    if cfg.scratch_wm:
-      self.model = PositionWorldModel(PositionWorldModelCfg()).to(self.device).train()
-      wm_origin: dict[str, object] = {"world_model_initialization": "scratch_fit_after_warmup"}
-    else:
-      wm_path = Path(cfg.world_model).resolve(strict=True)
-      self.model = load_world_model(wm_path, self.device).train()
-      parent = read_checkpoint(wm_path)
-      wm_origin = {
-        "world_model_initialization": "pretrained_v3_online",
-        "world_model_checkpoint": str(wm_path),
-        "world_model_sha256": _file_sha256(wm_path),
-        "world_model_update": parent.get("update"),
-        "world_model_best_score": parent.get("best_score"),
+    policy_init_origin: dict[str, object] = {"policy_initialization": "scratch"}
+    if cfg.init_ppo_actor:
+      assert isinstance(self.actor, FootstepTwinMirrorGruActor)
+      ppo_root = Path(cfg.init_ppo_actor).resolve(strict=True)
+      if ppo_root.is_dir():
+        if (ppo_root / "latest.json").is_file():
+          pmeta = json.loads((ppo_root / "latest.json").read_text(encoding="utf-8"))
+          ppo_path = (ppo_root / pmeta["directory"] / "rank_0.pt").resolve(strict=True)
+        else:
+          ppo_path = (ppo_root / "rank_0.pt").resolve(strict=True)
+      else:
+        ppo_path = ppo_root
+      try:
+        ppo_saved = torch.load(ppo_path, map_location="cpu", weights_only=True)
+      except (pickle.UnpicklingError, RuntimeError):
+        ppo_saved = torch.load(ppo_path, map_location="cpu", weights_only=False)
+      actor_sd = ppo_saved["actor_state_dict"] if isinstance(ppo_saved, dict) and "actor_state_dict" in ppo_saved else ppo_saved
+      self.actor.load_ppo_actor_state_dict(actor_sd)
+      self.actor.to(self.device).train()
+      policy_init_origin = {
+        "policy_initialization": "warmstart_twin_mirror_gru_checkpoint",
+        "ppo_actor_checkpoint": str(ppo_path),
+        "ppo_actor_sha256": _file_sha256(ppo_path),
+        "ppo_actor_iteration": (
+          ppo_saved.get("iter", ppo_saved.get("iteration")) if isinstance(ppo_saved, dict) else None
+        ),
       }
-      del parent
+      del ppo_saved
+    elif cfg.init_actor_from:
+      act_path = Path(cfg.init_actor_from).resolve(strict=True)
+      if act_path.is_dir():
+        act_path = (act_path / "rank_0.pt").resolve(strict=True)
+      act_saved = torch.load(act_path, map_location="cpu", weights_only=True)
+      act_sd = act_saved["actor_state_dict"] if isinstance(act_saved, dict) and "actor_state_dict" in act_saved else act_saved
+      self.actor.load_state_dict(act_sd, strict=True)
+      self.actor.to(self.device).train()
+      policy_init_origin = {
+        "policy_initialization": "warmstart_actor_state_dict",
+        "actor_init_checkpoint": str(act_path),
+        "actor_init_sha256": _file_sha256(act_path),
+      }
+      del act_saved
+
+    critic_init_origin: dict[str, object] = {"critic_initialization": "scratch"}
+    wm_adam_Warmstart: dict[str, Any] | None = None
+    if cfg.init_wm_critic_from:
+      warm_root = Path(cfg.init_wm_critic_from).resolve(strict=True)
+      if warm_root.is_dir():
+        if (warm_root / "latest.json").is_file():
+          wmeta = json.loads((warm_root / "latest.json").read_text(encoding="utf-8"))
+          wdir = warm_root / wmeta["directory"]
+        else:
+          wdir = warm_root
+        warm_file = wdir / f"rank_{self.rank}.pt"
+        if not warm_file.is_file():
+          warm_file = wdir / "rank_0.pt"
+      else:
+        warm_file = warm_root
+      warm_saved = torch.load(warm_file, map_location=self.device, weights_only=True)
+      if warm_saved.get("format") != FORMAT:
+        raise ValueError(f"Expected {FORMAT} checkpoint for --init-wm-critic-from, got {warm_saved.get('format')}")
+      self.model = PositionWorldModel(PositionWorldModelCfg(**warm_saved["world_model_config"])).to(self.device).train()
+      self.model.load_state_dict(warm_saved["world_model_state_dict"], strict=True)
+      self.critic.load_state_dict(warm_saved["critic_state_dict"], strict=True)
+      wm_adam_Warmstart = warm_saved.get("optimizers", {}).get("world_model")
+      wm_origin = {
+        "world_model_initialization": "supermimic_online_warmstart",
+        "world_model_checkpoint": str(warm_file),
+        "world_model_sha256": _file_sha256(warm_file),
+        "world_model_parent_iteration": warm_saved.get("iteration"),
+      }
+      critic_init_origin = {
+        "critic_initialization": "supermimic_critic_warmstart",
+        "critic_parent_checkpoint": str(warm_file),
+        "critic_parent_iteration": warm_saved.get("iteration"),
+      }
+      del warm_saved
+    elif cfg.scratch_wm:
+      self.model = PositionWorldModel(PositionWorldModelCfg()).to(self.device).train()
+      wm_origin = {"world_model_initialization": "scratch_fit_after_warmup"}
+    else:
+      wm_root = Path(cfg.world_model).resolve(strict=True)
+      if wm_root.is_dir():
+        if (wm_root / "latest.json").is_file():
+          wmeta = json.loads((wm_root / "latest.json").read_text(encoding="utf-8"))
+          wm_path = (wm_root / wmeta["directory"] / "rank_0.pt").resolve(strict=True)
+        else:
+          wm_path = (wm_root / "rank_0.pt").resolve(strict=True)
+      else:
+        wm_path = wm_root
+      probe_wm = torch.load(wm_path, map_location="cpu", weights_only=True)
+      if isinstance(probe_wm, dict) and probe_wm.get("format") == FORMAT:
+        self.model = PositionWorldModel(PositionWorldModelCfg(**probe_wm["world_model_config"])).to(self.device).train()
+        self.model.load_state_dict(probe_wm["world_model_state_dict"], strict=True)
+        wm_origin = {
+          "world_model_initialization": "supermimic_online_wm_only",
+          "world_model_checkpoint": str(wm_path),
+          "world_model_sha256": _file_sha256(wm_path),
+          "world_model_parent_iteration": probe_wm.get("iteration"),
+        }
+        del probe_wm
+      else:
+        del probe_wm
+        self.model = load_world_model(wm_path, self.device).train()
+        parent = read_checkpoint(wm_path)
+        wm_origin = {
+          "world_model_initialization": "pretrained_v3_online",
+          "world_model_checkpoint": str(wm_path),
+          "world_model_sha256": _file_sha256(wm_path),
+          "world_model_update": parent.get("update"),
+          "world_model_best_score": parent.get("best_score"),
+        }
+        del parent
 
     _broadcast(self.actor)
-    _broadcast(self.critic)
+    if not (cfg.init_wm_critic_from and cfg.joint_step_episode and world_size >= 2):
+      _broadcast(self.critic)
     _broadcast(self.model)
 
     self.origin: dict[str, object] = {
       **wm_origin,
-      "policy_initialization": "scratch",
-      "critic_initialization": "scratch",
-      "optimizers": "fresh_Adam",
+      **policy_init_origin,
+      **critic_init_origin,
+      "optimizers": "warmstarted_wm_Adam" if wm_adam_Warmstart is not None else "fresh_Adam",
       "architecture": actor_architecture_metadata(self.actor),
       "actor_parameters": sum(p.numel() for p in self.actor.parameters()),
       "critic_parameters": sum(p.numel() for p in self.critic.parameters()),
@@ -345,7 +506,7 @@ class FootstepWmTrainer:
     }
 
     init_stage = AUTO_CURRICULUM_STAGES[self.stage_index]
-    init_noise, _ = cfg.active_exploration(init_stage)
+    init_noise, _ = cfg.active_exploration(init_stage, final_polish=self.final_polish_active)
     env_seed = (cfg.seed + rank * 9973) % 2**32
     torch.manual_seed(env_seed)
     env_profile: Literal["walk-first", "step-episode"] = (
@@ -368,12 +529,23 @@ class FootstepWmTrainer:
       policy_action_sampling=True,
       scene_cuda_graphs=cfg.scene_cuda_graphs,
       env_profile=env_profile,
+      vel_push_prob=cfg.collector_vel_push_prob,
+      vel_push_lin=cfg.collector_vel_push_lin,
+      vel_push_ang=cfg.collector_vel_push_ang,
     )
 
     self.default_position = self.collector.default_joint_pos_canonical
     self.default_lower = self.default_position[:ACTION_DIM].clone()
     self.scale_lower = self.collector.action_scale.clone()
     lower_kp, lower_kd, lower_effort = self.collector.lower_pd_parameters()
+    if isinstance(self.actor, FootstepTwinMirrorGruActor):
+      self.actor.set_actuator_metadata(
+        default_joint_pos=self.default_position,
+        action_scale=self.scale_lower,
+        stiffness=lower_kp,
+        damping=lower_kd,
+        effort_limit=lower_effort,
+      )
 
     fk = TorchKinematics(self.collector.template).to(device=self.device, dtype=torch.float32)
     fk.level_batching = cfg.fast_kinematics
@@ -412,13 +584,33 @@ class FootstepWmTrainer:
       "inference_action_noise": False,
     }
 
-    self.replay = FootstepReplay(cfg.replay_steps, cfg.num_envs, cfg.validation_envs, self.device)
+    self.replay = FootstepReplay(
+      cfg.replay_steps,
+      cfg.num_envs,
+      cfg.validation_envs,
+      self.device,
+      include_gru_state=self.is_gru_actor,
+      gru_hidden_state_dim=(
+        self.actor.hidden_state_dim
+        if isinstance(self.actor, (FootstepTwinMirrorGruActor, FootstepTwinMirrorSkipGruActor))
+        else 128
+      ),
+    )
+    actor_params: Any = (
+      self.actor.optimizer_param_groups(cfg.learning_rate, cfg.gru_skip_lr_mult)
+      if isinstance(self.actor, FootstepTwinMirrorGruActor)
+      else self.actor.parameters()
+    )
     self.optimizers = {
       "world_model": torch.optim.Adam(self.model.parameters(), lr=cfg.wm_learning_rate),
-      "actor": torch.optim.Adam(self.actor.parameters(), lr=cfg.learning_rate, betas=(0.9, 0.95)),
+      "actor": torch.optim.Adam(actor_params, lr=cfg.learning_rate, betas=(0.9, 0.95)),
       "critic": torch.optim.Adam(self.critic.parameters(), lr=cfg.learning_rate),
     }
-    self.loss_cfg = LossConfig(gamma=cfg.gamma)
+    if wm_adam_Warmstart is not None:
+      self.optimizers["world_model"].load_state_dict(wm_adam_Warmstart)
+      for group in self.optimizers["world_model"].param_groups:
+        group["lr"] = cfg.wm_learning_rate
+    self.loss_cfg = LossConfig(gamma=cfg.gamma, outlier_huber_delta=8.0)
     self.forward_model = torch.compile(self._dynamics, dynamic=True) if cfg.compile_model else self._dynamics
     self._graph_pool = torch.cuda.graph_pool_handle() if cfg.cuda_graphs else None
     self._actor_graphs: dict[int, CapturedVelocityRolloutStep] = {}
@@ -523,7 +715,11 @@ class FootstepWmTrainer:
 
       self.replay.append_control(batch, record)
       if policy_rollout is not None:
-        policy_rollout.append(history=record["history"], command=record["command"], mean=record["mean_action"])
+        policy_rollout.append(
+          history=record["policy_input_a"],
+          command=record["policy_input_b"],
+          mean=record["mean_action"],
+        )
 
       if audit:
         executed = batch.inputs[0, :, 68:97]
@@ -540,7 +736,8 @@ class FootstepWmTrainer:
 
       train = slice(0, self.replay.train_envs)
       det = slice(self.collector.det_val_start, None)
-      for offset, sel in ((0, train), (10, det)):
+      splits = ((0, train),) if self.collector.is_step_episode else ((0, train), (10, det))
+      for offset, sel in splits:
         self.native_sums[offset + 0] += record["reward"][sel].double().sum()
         self.native_sums[offset + 1] += record["stance_xy_err"][sel].double().sum()
         self.native_sums[offset + 2] += record["stance_yaw_err"][sel].double().sum()
@@ -552,9 +749,9 @@ class FootstepWmTrainer:
         self.native_sums[offset + 8] += record["swing_lift"][sel].double().sum()
         self.native_sums[offset + 9] += record["ss_active"][sel].double().sum()
 
-      self.native_sums[20] += record["healthy"][det].double().sum()
-      self.native_sums[21] += record["first_fail"][det].double().sum()
       if not self.collector.is_step_episode:
+        self.native_sums[20] += record["healthy"][det].double().sum()
+        self.native_sums[21] += record["first_fail"][det].double().sum()
         self.native_sums[22] += record["unbroken_s"][det].double().sum()
         self.native_sums[23] += float(len(record["reward"][det]))
       else:
@@ -585,6 +782,13 @@ class FootstepWmTrainer:
         self.preflight["native_derivative_repeat_max_abs"] = float(probe["native_repeat_max_abs"])
 
   def policy_mean(self, history: torch.Tensor, command: torch.Tensor) -> torch.Tensor:
+    if isinstance(self.actor, FootstepTwinMirrorSkipGruActor):
+      h_dim = self.actor.hidden_state_dim
+      return self.actor.step(history[:, h_dim:], command, history[:, :h_dim])[0]
+    if isinstance(self.actor, FootstepTwinMirrorGruActor):
+      h_dim = self.actor.hidden_state_dim
+      pa = history[:, h_dim:] if history.shape[-1] > h_dim else None
+      return self.actor.step(command, history[:, :h_dim], pa)[0]
     return self.actor(history, command)
 
   def native_policy_kl(self, batch: FootstepPolicyBatch, action_noise: float) -> torch.Tensor:
@@ -624,8 +828,10 @@ class FootstepWmTrainer:
     norm = 0.0
     use_graph = cfg.cuda_graphs and not cfg.compile_model
     optimizer = self.optimizers["world_model"]
+    wm_skipped = 0
     for _ in range(cfg.wm_batches):
       optimizer.zero_grad(set_to_none=not use_graph)
+      batch_loss = 0.0
       for begin in range(0, cfg.wm_batch_size, cfg.wm_microbatch):
         size = min(cfg.wm_microbatch, cfg.wm_batch_size - begin)
         window = self.replay.sample(size, cfg.wm_horizon)
@@ -649,7 +855,7 @@ class FootstepWmTrainer:
             )
             optimizer.zero_grad(set_to_none=False)
           loss_det, state_det = self._wm_graphs[size](inputs)
-          total += float(loss_det)
+          batch_loss += float(loss_det)
           state_loss += float(state_det)
         else:
           loss, metrics = autoregressive_loss(
@@ -660,15 +866,31 @@ class FootstepWmTrainer:
             self.loss_cfg,
           )
           (loss * weight_val).backward()
-          total += float(loss.detach()) * weight_val
+          batch_loss += float(loss.detach()) * weight_val
           state_loss += float(metrics["state_loss"].detach()) * weight_val
-      norm = optimizer_step(self.model.parameters(), optimizer)
-      self.optimizer_updates["world_model"] += 1
+      total += batch_loss
+      skip_flag = torch.tensor(
+        int(not math.isfinite(batch_loss)),
+        device=self.device,
+        dtype=torch.int64,
+      )
+      if dist.is_initialized():
+        dist.all_reduce(skip_flag, op=dist.ReduceOp.MAX)
+      if int(skip_flag.item()) != 0:
+        wm_skipped += 1
+        continue
+      max_wm_norm = 30.0 if self.iteration > 50 else None
+      norm = optimizer_step(self.model.parameters(), optimizer, max_raw_norm=max_wm_norm)
+      if max_wm_norm is not None and norm > max_wm_norm:
+        wm_skipped += 1
+      else:
+        self.optimizer_updates["world_model"] += 1
     optimizer.zero_grad(set_to_none=not use_graph)
     return {
       "wm_loss": total / cfg.wm_batches,
       "wm_state_loss": state_loss / cfg.wm_batches,
       "wm_gradient_norm": norm,
+      "wm_outlier_skipped": float(wm_skipped),
     }
 
   def _rollout_tick(
@@ -697,8 +919,32 @@ class FootstepWmTrainer:
     proprio_noise: torch.Tensor,
     act_noise: torch.Tensor,
   ) -> tuple[torch.Tensor, ...]:
-    cmd = command_from_world_queue(phase, frequency, queue, first_side, aux[:, 6:9], theta)
-    sampled_act = self.actor(history, cmd) + act_noise
+    if isinstance(self.actor, FootstepTwinMirrorSkipGruActor):
+      h_dim = self.actor.hidden_state_dim
+      gru_h = history[:, :h_dim]
+      cur_frame = history[:, h_dim:]
+      prev_action = cur_frame[:, 70:85]
+      cmd = command_from_world_queue(phase, frequency, queue, first_side, aux[:, 6:9], theta)
+      mean_act, next_gru_h = self.actor.step(cur_frame, cmd, gru_h)
+      sampled_act = mean_act + act_noise
+      is_skip_gru = True
+    elif isinstance(self.actor, FootstepTwinMirrorGruActor):
+      h_dim = self.actor.hidden_state_dim
+      gru_h = history[:, :h_dim]
+      cur_raw_proprio = history[:, h_dim : h_dim + PROPRIO_RAW_DIM]
+      prev_action = history[:, h_dim + PROPRIO_RAW_DIM :]
+      raw_obs_79 = raw_obs_from_world_queue(
+        cur_raw_proprio, phase, frequency, queue, first_side, aux[:, 6:9], theta
+      )
+      mean_act, next_gru_h = self.actor.step(raw_obs_79, gru_h, prev_action)
+      sampled_act = mean_act + act_noise
+      is_skip_gru = False
+    else:
+      next_gru_h = None
+      prev_action = history[:, -1, 70:85]
+      cmd = command_from_world_queue(phase, frequency, queue, first_side, aux[:, 6:9], theta)
+      sampled_act = self.actor(history, cmd) + act_noise
+      is_skip_gru = False
     target29 = footstep_target(
       sampled_act,
       arm_target,
@@ -714,7 +960,7 @@ class FootstepWmTrainer:
       next_state=pred.state,
       foot_force=pred.foot_force,
       action=sampled_act,
-      prev_action=history[:, -1, 70:85],
+      prev_action=prev_action,
       aux=aux,
       end_phase=end_phase,
       frequency=frequency,
@@ -728,12 +974,20 @@ class FootstepWmTrainer:
       terminal_feet=terminal_feet,
       first_side=first_side,
       req_freq=req_freq,
+      encoder_bias_lower=encoder_bias[:, :ACTION_DIM],
     )
     torso_ang_w = frame.fk.body_angular_velocity[:, self.task.torso_id, :]
     next_raw_proprio = raw_proprio_from_state(pred.state, encoder_bias, frame.torso_q, torso_ang_w, imu_bias) + proprio_noise
-    next_frame = encode_proprio_frame(next_raw_proprio, sampled_act, self.actor.default_joint_pos)
-    next_history = torch.cat((history[:, 1:], next_frame.unsqueeze(1)), dim=1)
-    return pred.state, next_history, next_aux, reward, terminated, frame.foot_pos, frame.foot_yaw
+    if is_skip_gru and next_gru_h is not None:
+      next_frame = encode_proprio_frame(next_raw_proprio, sampled_act, self.actor.default_joint_pos)
+      next_history = torch.cat((next_gru_h, next_frame), dim=-1)
+    elif next_gru_h is not None:
+      next_history = torch.cat((next_gru_h, next_raw_proprio, sampled_act), dim=-1)
+    else:
+      next_frame = encode_proprio_frame(next_raw_proprio, sampled_act, self.actor.default_joint_pos)
+      next_history = torch.cat((history[:, 1:], next_frame.unsqueeze(1)), dim=1)
+    p_fz_anchor = torch.sigmoid((pred.foot_force[:, :, 2].clamp_min(0.0) - 12.0) / 4.0)
+    return pred.state, next_history, next_aux, reward, terminated, frame.foot_pos, frame.foot_yaw, p_fz_anchor
 
   def _captured_rollout_tick(self, args: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
     values = dict(zip(_ROLLOUT_INPUT_NAMES, args, strict=True))
@@ -754,11 +1008,27 @@ class FootstepWmTrainer:
     action_noise: float,
     checkpointed: bool,
     use_cuda_graphs: bool = False,
+    allow_vel_push: bool = False,
   ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], dict[str, float]]:
     cfg = self.cfg
     n = len(start.state)
     state = start.state
-    history = start.history
+    if isinstance(self.actor, FootstepTwinMirrorSkipGruActor):
+      if start.gru_h is None:
+        raise RuntimeError("Skip-GRU imagination start requires gru_h")
+      h_dim = self.actor.hidden_state_dim
+      history = torch.cat((start.gru_h, start.history[:, -1]), dim=-1)
+      prev_act0 = history[:, h_dim + PROPRIO_RAW_DIM :]
+    elif isinstance(self.actor, FootstepTwinMirrorGruActor):
+      if start.gru_h is None or start.raw_proprio_70 is None:
+        raise RuntimeError("GRU imagination start requires gru_h and raw_proprio_70")
+      h_dim = self.actor.hidden_state_dim
+      history = torch.cat((start.gru_h, start.raw_proprio_70, start.history[:, -1, 70:85]), dim=-1)
+      prev_act0 = history[:, h_dim + PROPRIO_RAW_DIM :]
+    else:
+      h_dim = 0
+      history = start.history
+      prev_act0 = history[:, -1, 70:85]
     context = start.context
     aux = start.aux
     arm_target = start.arm_target
@@ -786,7 +1056,7 @@ class FootstepWmTrainer:
       self.model,
       state,
       context,
-      history[:, -1, 70:85],
+      prev_act0,
       aux,
       arm_target,
       phase,
@@ -801,7 +1071,18 @@ class FootstepWmTrainer:
     values.append(self.critic(feat0).squeeze(-1))
 
     sides = self.task.sides
+    push_step = min(6, max(1, cfg.horizon // 5))
     for step_idx in range(cfg.horizon):
+      if allow_vel_push and cfg.imag_vel_push_prob > 0.0 and step_idx == push_step:
+        with torch.no_grad():
+          push_mask = (torch.rand(n, 1, device=self.device) < cfg.imag_vel_push_prob).to(state.dtype)
+          dv_xy = (torch.rand(n, 2, device=self.device) * 2.0 - 1.0) * cfg.imag_vel_push_lin
+          dv_z = (torch.rand(n, 1, device=self.device) * 2.0 - 1.0) * (0.20 * cfg.imag_vel_push_lin)
+          dw = (torch.rand(n, 3, device=self.device) * 2.0 - 1.0) * cfg.imag_vel_push_ang
+          delta_state = torch.zeros_like(state)
+          delta_state[:, 36:39] = torch.cat((dv_xy, dv_z), dim=-1) * push_mask
+          delta_state[:, 39:42] = dw * push_mask
+        state = state + delta_state
       proprio_noise = torch.randn(n, PROPRIO_RAW_DIM, device=self.device) * self.proprio_noise_std
       act_noise = torch.randn(n, ACTION_DIM, device=self.device) * action_noise
       with torch.no_grad():
@@ -864,20 +1145,21 @@ class FootstepWmTrainer:
         act_noise,
       )
       if use_cuda_graphs:
-        state, history, aux, reward, terminated, foot_pos, foot_yaw = self._captured_rollout_tick(step_args)
+        state, history, aux, reward, terminated, foot_pos, foot_yaw, p_fz_anchor = self._captured_rollout_tick(step_args)
       elif checkpointed:
-        state, history, aux, reward, terminated, foot_pos, foot_yaw = checkpoint(
+        state, history, aux, reward, terminated, foot_pos, foot_yaw, p_fz_anchor = checkpoint(
           self._rollout_tick, *step_args, use_reentrant=False
         )
       else:
-        state, history, aux, reward, terminated, foot_pos, foot_yaw = self._rollout_tick(*step_args)
+        state, history, aux, reward, terminated, foot_pos, foot_yaw, p_fz_anchor = self._rollout_tick(*step_args)
 
       with torch.no_grad():
-        p_contact = aux[:, 0:2]
         pending_clamped = cand_pending.clamp_min(0)
-        pending_p = p_contact.gather(1, pending_clamped[:, None]).squeeze(1)
-        reanchored = (cand_pending >= 0) & double_support & (pending_p > 0.35)
-        pending_anchor = torch.where(reanchored, torch.full_like(cand_pending, -1), cand_pending)
+        pending_p = p_fz_anchor.gather(1, pending_clamped[:, None]).squeeze(1)
+        clear_pending = ((cand_pending >= 0) & double_support & (pending_p > 0.90)) | (
+          (cand_pending >= 0) & (~double_support) & (pending_p > 0.35)
+        )
+        pending_anchor = torch.where(clear_pending, torch.full_like(cand_pending, -1), cand_pending)
 
         phase = end_phase
         frequency = next_freq
@@ -896,11 +1178,12 @@ class FootstepWmTrainer:
         )
         theta = advance_theta_command(theta, start.theta_target, start.theta_speed, theta_active)
 
+      cur_prev_act = history[:, h_dim + PROPRIO_RAW_DIM :] if self.is_gru_actor else history[:, -1, 70:85]
       feat = self.task.critic_features(
         self.model,
         state,
         context,
-        history[:, -1, 70:85],
+        cur_prev_act,
         aux,
         arm_target,
         phase,
@@ -940,6 +1223,20 @@ class FootstepWmTrainer:
       },
     )
 
+  def _sample_actor_starts(self, batch_size: int) -> FootstepPolicyStart:
+    is_rec = isinstance(self.actor, (FootstepTwinMirrorGruActor, FootstepTwinMirrorSkipGruActor))
+    win_len = self.cfg.gru_burnin_steps if is_rec else self.cfg.history_length
+    return self.replay.sample_starts(
+      batch_size,
+      win_len,
+      prefer_stepping=self.collector.is_step_episode,
+      burnin_gru_actor=(
+        self.actor
+        if isinstance(self.actor, (FootstepTwinMirrorGruActor, FootstepTwinMirrorSkipGruActor))
+        else None
+      ),
+    )
+
   def improve_policy(
     self,
     action_noise: float,
@@ -951,25 +1248,23 @@ class FootstepWmTrainer:
     optimizer.zero_grad(set_to_none=True)
     pieces: list[tuple[torch.Tensor, ...]] = []
     metrics: dict[str, float] = {}
-    rank_scale = (
-      float(self.world_size) * float(cfg.joint_task_weights[1 if self.collector.is_step_episode else 0])
-      if (cfg.joint_step_episode and self.world_size == 2)
-      else 1.0
-    )
+    if cfg.joint_step_episode and self.world_size == 2:
+      step_w = min(float(cfg.joint_task_weights[1]), 0.05) if self.stage_index < 3 else float(cfg.joint_task_weights[1])
+      task_w = step_w if self.collector.is_step_episode else (1.0 - step_w)
+      rank_scale = float(self.world_size) * task_w
+    else:
+      rank_scale = 1.0
     if not update_actor:
       with torch.no_grad():
         for begin in range(0, cfg.actor_batch_size, cfg.actor_microbatch):
           size = min(cfg.actor_microbatch, cfg.actor_batch_size - begin)
-          start = self.replay.sample_starts(
-            size,
-            cfg.history_length,
-            prefer_stepping=self.collector.is_step_episode,
-          )
+          start = self._sample_actor_starts(size)
           _, critic_batch, partial = self.imagine(
             start,
             action_noise=action_noise,
             checkpointed=False,
             use_cuda_graphs=False,
+            allow_vel_push=True,
           )
           pieces.append(critic_batch)
           for key, value in partial.items():
@@ -980,21 +1275,30 @@ class FootstepWmTrainer:
     with frozen(self.model, self.critic):
       for begin in range(0, cfg.actor_batch_size, cfg.actor_microbatch):
         size = min(cfg.actor_microbatch, cfg.actor_batch_size - begin)
-        start = self.replay.sample_starts(
-          size,
-          cfg.history_length,
-          prefer_stepping=self.collector.is_step_episode,
-        )
+        start = self._sample_actor_starts(size)
         loss, critic_batch, partial = self.imagine(
           start,
           action_noise=action_noise,
           checkpointed=cfg.checkpoint_imagination,
           use_cuda_graphs=cfg.cuda_graphs,
+          allow_vel_push=True,
         )
         (loss * rank_scale * (size / cfg.actor_batch_size)).backward()
         pieces.append(critic_batch)
         for key, value in partial.items():
           metrics[key] = metrics.get(key, 0.0) + value * (size / cfg.actor_batch_size)
+      bad_grad = int(
+        any(p.grad is not None and not torch.isfinite(p.grad).all() for p in self.actor.parameters() if p.requires_grad)
+      )
+      bad_flag = torch.tensor(bad_grad, device=self.device, dtype=torch.int64)
+      if dist.is_initialized():
+        dist.all_reduce(bad_flag, op=dist.ReduceOp.MAX)
+      if int(bad_flag.item()) > 0:
+        optimizer.zero_grad(set_to_none=True)
+        metrics["actor_gradient_norm"] = 0.0
+        metrics["actor_grad_overflow_skipped"] = 1.0
+        return metrics, tuple(torch.cat([part[i] for part in pieces]) for i in range(3))
+      metrics["actor_grad_overflow_skipped"] = 0.0
       metrics["actor_gradient_norm"] = optimizer_step(self.actor.parameters(), optimizer, actor=True)
     if any(p.grad is not None and p.grad.abs().max() > 0 for p in self.model.parameters()):
       raise RuntimeError("Footstep policy BPTT unexpectedly wrote nonzero WM parameter gradients")
@@ -1004,8 +1308,8 @@ class FootstepWmTrainer:
 
   def audit_imagination(self) -> None:
     audit_noise, _ = self.cfg.active_exploration(self.current_stage, final_polish=self.final_polish_active)
-    start_a = self.replay.sample_starts(4, self.cfg.history_length)
-    start_b = self.replay.sample_starts(4, self.cfg.history_length)
+    start_a = self._sample_actor_starts(4)
+    start_b = self._sample_actor_starts(4)
     gradients: list[torch.Tensor] = []
     with frozen(self.model, self.critic), torch.random.fork_rng(devices=[self.device]):
       if self.cfg.cuda_graphs:
@@ -1121,6 +1425,9 @@ class FootstepWmTrainer:
       "best_validation_reward": (
         self.best_validation_reward if math.isfinite(self.best_validation_reward) else None
       ),
+      "best_validation_score": (
+        self.best_validation_score if math.isfinite(self.best_validation_score) else None
+      ),
       "collector_counters": self.collector.counters,
       "continuation": self.continuation,
       "rng": {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state(self.device)},
@@ -1155,6 +1462,9 @@ class FootstepWmTrainer:
           "best_validation_reward": (
             self.best_validation_reward if math.isfinite(self.best_validation_reward) else None
           ),
+          "best_validation_score": (
+            self.best_validation_score if math.isfinite(self.best_validation_score) else None
+          ),
         },
       )
       if is_best:
@@ -1177,28 +1487,67 @@ class FootstepWmTrainer:
     saved = torch.load(path, map_location=self.device, weights_only=True)
     if saved.get("format") != FORMAT or saved["rank"] != self.rank or saved["world_size"] != self.world_size:
       raise ValueError("Footstep WM checkpoint format/rank/world_size mismatch")
-    ignored = {"resume", "output", "iterations", "preflight", "critic_warmup_iterations"}
+    ignored = {
+      "resume",
+      "output",
+      "iterations",
+      "preflight",
+      "critic_warmup_iterations",
+      "init_ppo_actor",
+      "init_actor_from",
+      "init_wm_critic_from",
+    }
     mutable = {
+      "horizon",
       "termination_probability",
       "learning_rate",
       "wm_learning_rate",
+      "wm_batches",
+      "gru_burnin_steps",
+      "gru_skip_lr_mult",
       "action_noise",
       "policy_target_kl",
+      "imag_vel_push_prob",
+      "imag_vel_push_lin",
+      "imag_vel_push_ang",
+      "collector_vel_push_prob",
+      "collector_vel_push_lin",
+      "collector_vel_push_ang",
       "auto_curriculum",
       "joint_step_episode",
       "joint_task_weights",
       "initial_stage",
+      "final_polish",
       "save_interval",
       "max_retained_checkpoints",
       "save_seconds",
     }
     expected_cfg = {k: v for k, v in asdict(self.cfg).items() if k not in ignored}
     previous_cfg = {k: v for k, v in saved["config"].items() if k not in ignored}
+    previous_cfg.setdefault("actor_type", "mlp")
+    previous_cfg.setdefault("gru_hidden_dim", 64)
+    previous_cfg.setdefault("gru_mlp_hidden_dims", [256, 256, 128])
+    previous_cfg.setdefault("gru_burnin_steps", 24)
+    previous_cfg.setdefault("gru_include_prev_action", False)
+    previous_cfg.setdefault("gru_skip_connection", False)
+    previous_cfg.setdefault("gru_skip_hidden_dims", [256, 128])
+    previous_cfg.setdefault("gru_skip_lr_mult", 10.0)
+    previous_cfg.setdefault("imag_vel_push_prob", 0.0)
+    previous_cfg.setdefault("imag_vel_push_lin", 0.30)
+    previous_cfg.setdefault("imag_vel_push_ang", 0.45)
+    previous_cfg.setdefault("collector_vel_push_prob", 0.0)
+    previous_cfg.setdefault("collector_vel_push_lin", 0.45)
+    previous_cfg.setdefault("collector_vel_push_ang", 0.45)
+    previous_cfg.setdefault("final_polish", False)
     previous_cfg.setdefault("joint_step_episode", False)
     previous_cfg.setdefault("joint_task_weights", [0.5, 0.5])
     previous_cfg.setdefault("max_retained_checkpoints", 12)
     expected_cfg["actor_hidden_dims"] = list(expected_cfg["actor_hidden_dims"])
     previous_cfg["actor_hidden_dims"] = list(previous_cfg["actor_hidden_dims"])
+    expected_cfg["gru_mlp_hidden_dims"] = list(expected_cfg["gru_mlp_hidden_dims"])
+    previous_cfg["gru_mlp_hidden_dims"] = list(previous_cfg["gru_mlp_hidden_dims"])
+    expected_cfg["gru_skip_hidden_dims"] = list(expected_cfg["gru_skip_hidden_dims"])
+    previous_cfg["gru_skip_hidden_dims"] = list(previous_cfg["gru_skip_hidden_dims"])
     expected_cfg["joint_task_weights"] = list(expected_cfg["joint_task_weights"])
     previous_cfg["joint_task_weights"] = list(previous_cfg["joint_task_weights"])
     changed_cfg = {
@@ -1216,12 +1565,15 @@ class FootstepWmTrainer:
     self.model.load_state_dict(saved["world_model_state_dict"], strict=True)
     for name, opt in self.optimizers.items():
       opt.load_state_dict(saved["optimizers"][name])
+    if isinstance(self.actor, FootstepTwinMirrorGruActor) and self.actor.skip_net is not None and len(self.optimizers["actor"].param_groups) > 1:
+      self.optimizers["actor"].param_groups[0]["lr_mult"] = 1.0
+      self.optimizers["actor"].param_groups[1]["lr_mult"] = float(self.cfg.gru_skip_lr_mult)
     for group in self.optimizers["world_model"].param_groups:
       group["lr"] = self.cfg.wm_learning_rate
     for name in ("actor", "critic"):
       for group in self.optimizers[name].param_groups:
-        group["lr"] = self.cfg.learning_rate
-    if any(k in changed_cfg for k in ("learning_rate", "action_noise", "policy_target_kl")):
+        group["lr"] = self.cfg.learning_rate * float(group.get("lr_mult", 1.0))
+    if any(k in changed_cfg for k in ("learning_rate", "action_noise", "policy_target_kl", "gru_skip_lr_mult")):
       self.optimizers["actor"].state.clear()
     if self.cfg.critic_warmup_iterations > 0:
       self.optimizers["critic"].state.clear()
@@ -1254,12 +1606,15 @@ class FootstepWmTrainer:
       self.stage_entered_iteration = self.iteration
       self.stage_qualified_streak = 0
       self.best_validation_reward = -math.inf
+      self.best_validation_score = -math.inf
     self._apply_stage(self.current_stage)
     # Full env reset so `reset_arm_pose(target_scale=...)` and commands take effect across all worlds immediately!
     self.collector.reset_all_envs()
 
     if saved.get("best_validation_reward") is not None and not changed_cfg:
       self.best_validation_reward = float(saved["best_validation_reward"])
+    if saved.get("best_validation_score") is not None and not changed_cfg:
+      self.best_validation_score = float(saved["best_validation_score"])
     self.collector.counters.update(saved["collector_counters"])
     cur_noise, _ = self.cfg.active_exploration(self.current_stage, final_polish=self.final_polish_active)
     self.collector.set_action_noise(cur_noise)
@@ -1299,6 +1654,7 @@ class FootstepWmTrainer:
       new_stage = self.current_stage
       self.stage_entered_iteration = self.iteration
       self.best_validation_reward = -math.inf
+      self.best_validation_score = -math.inf
       self._apply_stage(new_stage)
       record = {
         "iteration": self.iteration,
@@ -1321,6 +1677,7 @@ class FootstepWmTrainer:
       self.final_polish_active = True
       self.stage_entered_iteration = self.iteration
       self.best_validation_reward = -math.inf
+      self.best_validation_score = -math.inf
       record = {
         "iteration": self.iteration,
         "event": "activated_final_polish",
@@ -1386,7 +1743,7 @@ class FootstepWmTrainer:
         else:
           base = cfg.learning_rate
         for group in optimizer.param_groups:
-          group["lr"] = cosine_learning_rate(self.iteration, base, self.world_size)
+          group["lr"] = cosine_learning_rate(self.iteration, base, self.world_size) * float(group.get("lr_mult", 1.0))
 
       phase_started = time.monotonic()
       self.progress("world_model_start", compilation_enabled=cfg.compile_model)
@@ -1475,7 +1832,15 @@ class FootstepWmTrainer:
       is_best = False
       if is_val_iter:
         val_rew = metrics["native/validation_reward"]
-        if self.controls - post_warmup_controls >= 200 and val_rew > self.best_validation_reward:
+        val_score = (
+          -metrics["native/validation_stance_xy_err_m"]
+          - 0.15 * metrics["native/validation_stance_yaw_err_rad"]
+          + 0.04 * metrics["native/step_ep_success_rate"]
+          - 10.0 * metrics["native/validation_failure_rate"]
+        )
+        metrics["native/validation_score"] = val_score
+        if (not in_critic_warmup) and (self.controls - post_warmup_controls >= 800) and val_score > self.best_validation_score:
+          self.best_validation_score = val_score
           self.best_validation_reward = val_rew
           is_best = True
         milestone = self.maybe_advance_curriculum(metrics)
@@ -1492,13 +1857,18 @@ class FootstepWmTrainer:
         raise FloatingPointError("Nonfinite footstep WM training metric")
 
       checkpoint_started = time.monotonic()
-      if (
+      should_save = int(
         is_best
         or milestone is not None
         or self.iteration == 1
         or self.iteration % cfg.save_interval == 0
         or time.monotonic() - self.last_save >= cfg.save_seconds
-      ):
+      )
+      if dist.is_initialized():
+        save_flag = torch.tensor(should_save, device=self.device, dtype=torch.int64)
+        dist.all_reduce(save_flag, op=dist.ReduceOp.MAX)
+        should_save = int(save_flag.item())
+      if should_save:
         self.save(is_best=is_best, milestone=milestone)
       metrics["timing/checkpoint_seconds"] = time.monotonic() - checkpoint_started
       metrics["wall_seconds"] = time.monotonic() - tick

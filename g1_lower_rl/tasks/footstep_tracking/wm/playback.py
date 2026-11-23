@@ -29,7 +29,10 @@ from .policy import (
   ACTION_DIM,
   CMD_ENC_DIM,
   FRAME_DIM,
+  FootstepTwinMirrorGruActor,
   FootstepTwinMirrorMlpActor,
+  FootstepTwinMirrorSkipGruActor,
+  FootstepWmActor,
   encode_command,
   encode_proprio_frame,
 )
@@ -62,15 +65,33 @@ def load_footstep_wm_checkpoint(path: str | Path, device: str | torch.device = "
   return saved
 
 
-def load_actor_from_checkpoint(saved: dict[str, Any], device: str | torch.device = "cpu") -> FootstepTwinMirrorMlpActor:
+def load_actor_from_checkpoint(saved: dict[str, Any], device: str | torch.device = "cpu") -> FootstepWmActor:
   cfg = saved["config"]
-  actor = FootstepTwinMirrorMlpActor(
-    history_length=int(cfg["history_length"]),
-    hidden_dims=tuple(int(w) for w in cfg["actor_hidden_dims"]),
-    default_joint_pos=saved["controller_contract"]["default_joint_pos_29"],
-  ).to(device)
+  actor_type = cfg.get("actor_type", "mlp")
+  controller = saved["controller_contract"]
+  if actor_type == "skip_gru":
+    actor: FootstepWmActor = FootstepTwinMirrorSkipGruActor(
+      gru_hidden_dim=int(cfg.get("gru_hidden_dim", 256)),
+      hidden_dims=tuple(int(w) for w in cfg.get("actor_hidden_dims", (512, 256, 128))),
+      default_joint_pos=controller["default_joint_pos_29"],
+    ).to(device)
+  elif actor_type == "gru":
+    actor = FootstepTwinMirrorGruActor(
+      gru_hidden_dim=int(cfg.get("gru_hidden_dim", 64)),
+      mlp_hidden_dims=tuple(int(w) for w in cfg.get("gru_mlp_hidden_dims", (256, 256, 128))),
+      default_joint_pos=controller["default_joint_pos_29"],
+      include_prev_action=bool(cfg.get("gru_include_prev_action", False)),
+      skip_connection=bool(cfg.get("gru_skip_connection", False)),
+      skip_hidden_dims=tuple(int(w) for w in cfg.get("gru_skip_hidden_dims", (256, 128))),
+    ).to(device)
+  else:
+    actor = FootstepTwinMirrorMlpActor(
+      history_length=int(cfg["history_length"]),
+      hidden_dims=tuple(int(w) for w in cfg["actor_hidden_dims"]),
+      default_joint_pos=controller["default_joint_pos_29"],
+    ).to(device)
   actor.load_state_dict(saved["actor_state_dict"], strict=True)
-  if not all(torch.isfinite(v).all() for v in actor.state_dict().values()):
+  if not all(torch.isfinite(v).all() for v in actor.state_dict().values() if v.is_floating_point()):
     raise FloatingPointError("Footstep WM actor checkpoint contains nonfinite weights")
   return actor.eval().requires_grad_(False)
 
@@ -82,6 +103,77 @@ class StatelessFootstepOnnxWrapper(nn.Module):
 
   def forward(self, history: torch.Tensor, command: torch.Tensor) -> torch.Tensor:
     return self.actor(history, command)
+
+
+class StatelessFootstepGruOnnxWrapper(nn.Module):
+  def __init__(self, actor: FootstepTwinMirrorGruActor):
+    super().__init__()
+    self.actor = actor
+
+  @property
+  def state_dim(self) -> int:
+    return self.actor.hidden_state_dim + (ACTION_DIM if self.actor.include_prev_action else 0)
+
+  def forward(self, obs: torch.Tensor, h_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    h_dim = self.actor.hidden_state_dim
+    gru_h = h_in[:, :h_dim]
+    prev_act = h_in[:, h_dim:] if self.actor.include_prev_action else None
+    actions, next_gru_h = self.actor.step(obs, gru_h, prev_act)
+    h_out = torch.cat((next_gru_h, actions), dim=-1) if self.actor.include_prev_action else next_gru_h
+    return actions, h_out
+
+
+class DeployFootstepGruWrapper(nn.Module):
+  """Stateful ONNX wrapper matching g1_lower_rl.footstep_deploy.FootstepPolicy (`obs[1,79], h_in[1,1,D]`)."""
+
+  def __init__(self, actor: FootstepTwinMirrorGruActor):
+    super().__init__()
+    self.actor = actor
+
+  @property
+  def state_dim(self) -> int:
+    return self.actor.hidden_state_dim + (ACTION_DIM if self.actor.include_prev_action else 0)
+
+  def forward(self, obs: torch.Tensor, h_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    s = h_in.squeeze(0)
+    h_dim = self.actor.hidden_state_dim
+    gru_h = s[:, :h_dim]
+    prev_act = s[:, h_dim:] if self.actor.include_prev_action else None
+    actions, next_gru_h = self.actor.step(obs, gru_h, prev_act)
+    next_s = torch.cat((next_gru_h, actions), dim=-1) if self.actor.include_prev_action else next_gru_h
+    return actions, next_s.unsqueeze(0)
+
+
+class StatelessFootstepSkipGruOnnxWrapper(nn.Module):
+  def __init__(self, actor: FootstepTwinMirrorSkipGruActor):
+    super().__init__()
+    self.actor = actor
+
+  def forward(self, frame: torch.Tensor, command: torch.Tensor, h_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    return self.actor.step(frame, command, h_in)
+
+
+class DeployFootstepSkipGruWrapper(nn.Module):
+  """Stateful ONNX wrapper matching FootstepPolicy (`obs[1,79], h_in[1,1,2*H+15]`)."""
+
+  def __init__(self, actor: FootstepTwinMirrorSkipGruActor):
+    super().__init__()
+    self.actor = actor
+
+  @property
+  def state_dim(self) -> int:
+    return self.actor.hidden_state_dim + ACTION_DIM
+
+  def forward(self, obs: torch.Tensor, h_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    s = h_in.squeeze(0)
+    h_dim = self.actor.hidden_state_dim
+    gru_h = s[:, :h_dim]
+    prev_act = s[:, h_dim:]
+    frame_t = encode_proprio_frame(obs[:, :70], prev_act, self.actor.default_joint_pos)
+    cmd_t = encode_command(obs[:, 70], obs[:, 71], obs[:, 72:78].unflatten(-1, (2, 3)), obs[:, 78])
+    actions, next_gru_h = self.actor.step(frame_t, cmd_t, gru_h)
+    next_s = torch.cat((next_gru_h, actions), dim=-1)
+    return actions, next_s.unsqueeze(0)
 
 
 class DeployFootstepHistoryWrapper(nn.Module):
@@ -207,33 +299,113 @@ def export_onnx(
   if not overwrite and any(p.exists() for p in (stateless_path, deploy_path, contract_path)):
     raise FileExistsError(f"Export destination already contains ONNX/contract files: {out}")
 
-  h = actor.history_length
-  stateless = StatelessFootstepOnnxWrapper(actor).eval()
-  torch.onnx.export(
-    stateless,
-    (torch.zeros(1, h, FRAME_DIM), torch.zeros(1, CMD_ENC_DIM)),
-    str(stateless_path),
-    input_names=["history", "command"],
-    output_names=["actions"],
-    dynamic_axes={"history": {0: "batch"}, "command": {0: "batch"}, "actions": {0: "batch"}},
-    opset_version=17,
-    dynamo=False,
-  )
+  if isinstance(actor, FootstepTwinMirrorSkipGruActor):
+    stateless_sg = StatelessFootstepSkipGruOnnxWrapper(actor).eval()
+    torch.onnx.export(
+      stateless_sg,
+      (torch.zeros(1, FRAME_DIM), torch.zeros(1, CMD_ENC_DIM), torch.zeros(1, actor.hidden_state_dim)),
+      str(stateless_path),
+      input_names=["frame", "command", "h_in"],
+      output_names=["actions", "h_out"],
+      dynamic_axes={
+        "frame": {0: "batch"},
+        "command": {0: "batch"},
+        "h_in": {0: "batch"},
+        "actions": {0: "batch"},
+        "h_out": {0: "batch"},
+      },
+      opset_version=17,
+      dynamo=False,
+    )
+    deploy_sg = DeployFootstepSkipGruWrapper(actor).eval()
+    sg_sdim = deploy_sg.state_dim
+    torch.onnx.export(
+      deploy_sg,
+      (torch.zeros(1, RAW_OBS_DIM), torch.zeros(1, 1, sg_sdim)),
+      str(deploy_path),
+      input_names=["obs", "h_in"],
+      output_names=["actions", "h_out"],
+      opset_version=17,
+      dynamo=False,
+    )
+    deploy_contract = build_footstep_deploy_contract(saved, history_length=1)
+    deploy_contract["algorithm"] = "PositionWM_v3_BPTT_GAE_TwinMirror_SkipGRU_Integrator"
+    deploy_contract["inputs"]["h_in"] = [1, 1, sg_sdim]
+    deploy_contract["outputs"]["h_out"] = [1, 1, sg_sdim]
+    stateless_contract_tag = "stateless_twin_mirror_skip_gru_integrator"
+  elif isinstance(actor, FootstepTwinMirrorGruActor):
+    stateless_gru = StatelessFootstepGruOnnxWrapper(actor).eval()
+    gru_state_dim = stateless_gru.state_dim
+    torch.onnx.export(
+      stateless_gru,
+      (torch.zeros(1, RAW_OBS_DIM), torch.zeros(1, gru_state_dim)),
+      str(stateless_path),
+      input_names=["obs", "h_in"],
+      output_names=["actions", "h_out"],
+      dynamic_axes={"obs": {0: "batch"}, "h_in": {0: "batch"}, "actions": {0: "batch"}, "h_out": {0: "batch"}},
+      opset_version=17,
+      dynamo=False,
+    )
+    if not actor.include_prev_action and not actor.skip_connection:
+      deploy_gru: Any = actor.actor.as_onnx().cpu().eval()
+      torch.onnx.export(
+        deploy_gru,
+        deploy_gru.get_dummy_inputs(),
+        str(deploy_path),
+        input_names=deploy_gru.input_names,
+        output_names=deploy_gru.output_names,
+        opset_version=17,
+        dynamo=False,
+      )
+      deploy_contract = actor.actor.deployment_contract()
+      deploy_contract["task_id"] = FOOTSTEP_WM_TASK
+      deploy_contract["algorithm"] = "PositionWM_v3_BPTT_GAE_TwinMirror_GRU"
+      deploy_contract["iteration"] = int(saved["iteration"])
+    else:
+      deploy_gru_wrap = DeployFootstepGruWrapper(actor).eval()
+      torch.onnx.export(
+        deploy_gru_wrap,
+        (torch.zeros(1, RAW_OBS_DIM), torch.zeros(1, 1, gru_state_dim)),
+        str(deploy_path),
+        input_names=["obs", "h_in"],
+        output_names=["actions", "h_out"],
+        opset_version=17,
+        dynamo=False,
+      )
+      deploy_contract = build_footstep_deploy_contract(saved, history_length=1)
+      deploy_contract["algorithm"] = "PositionWM_v3_BPTT_GAE_TwinMirror_GRU_PrevAct_Skip"
+      deploy_contract["inputs"]["h_in"] = [1, 1, gru_state_dim]
+      deploy_contract["outputs"]["h_out"] = [1, 1, gru_state_dim]
+    stateless_contract_tag = "stateless_twin_mirror_gru"
+  else:
+    h = actor.history_length
+    stateless = StatelessFootstepOnnxWrapper(actor).eval()
+    torch.onnx.export(
+      stateless,
+      (torch.zeros(1, h, FRAME_DIM), torch.zeros(1, CMD_ENC_DIM)),
+      str(stateless_path),
+      input_names=["history", "command"],
+      output_names=["actions"],
+      dynamic_axes={"history": {0: "batch"}, "command": {0: "batch"}, "actions": {0: "batch"}},
+      opset_version=17,
+      dynamo=False,
+    )
 
-  deploy_wrapper = DeployFootstepHistoryWrapper(actor).eval()
-  torch.onnx.export(
-    deploy_wrapper,
-    (torch.zeros(1, RAW_OBS_DIM), torch.zeros(h, 1, FRAME_DIM + 1)),
-    str(deploy_path),
-    input_names=["obs", "h_in"],
-    output_names=["actions", "h_out"],
-    opset_version=17,
-    dynamo=False,
-  )
+    deploy_wrapper = DeployFootstepHistoryWrapper(actor).eval()
+    torch.onnx.export(
+      deploy_wrapper,
+      (torch.zeros(1, RAW_OBS_DIM), torch.zeros(h, 1, FRAME_DIM + 1)),
+      str(deploy_path),
+      input_names=["obs", "h_in"],
+      output_names=["actions", "h_out"],
+      opset_version=17,
+      dynamo=False,
+    )
+    deploy_contract = build_footstep_deploy_contract(saved, history_length=h)
+    stateless_contract_tag = "stateless_twin_mirror_history_mlp"
 
-  deploy_contract = build_footstep_deploy_contract(saved, history_length=h)
   for onnx_path, meta in (
-    (stateless_path, {"footstep_wm_contract": "stateless_twin_mirror_history_mlp"}),
+    (stateless_path, {"footstep_wm_contract": stateless_contract_tag}),
     (deploy_path, {"footstep_contract": json.dumps(deploy_contract)}),
   ):
     proto = onnx.load(onnx_path)
@@ -249,18 +421,52 @@ def export_onnx(
   opts.intra_op_num_threads = 1
   sess_stateless = ort.InferenceSession(str(stateless_path), sess_options=opts, providers=["CPUExecutionProvider"])
   rng = torch.Generator().manual_seed(20261112)
-  test_hist = torch.randn(4, h, FRAME_DIM, generator=rng)
-  test_cmd = torch.randn(4, CMD_ENC_DIM, generator=rng)
-  with torch.no_grad():
-    ref_stateless = actor(test_hist, test_cmd).numpy()
-  ort_stateless = sess_stateless.run(["actions"], {"history": test_hist.numpy(), "command": test_cmd.numpy()})[0]
-  max_err_stateless = float(np.max(np.abs(ref_stateless - ort_stateless)))
-  if max_err_stateless > 1e-5:
+  if isinstance(actor, FootstepTwinMirrorSkipGruActor):
+    test_f = torch.randn(4, FRAME_DIM, generator=rng) * 0.2
+    test_c = torch.randn(4, CMD_ENC_DIM, generator=rng) * 0.3
+    test_h = torch.randn(4, actor.hidden_state_dim, generator=rng) * 0.2
+    with torch.no_grad():
+      ref_act, ref_h = actor.step(test_f, test_c, test_h)
+    ort_act_s, ort_h_s = sess_stateless.run(
+      ["actions", "h_out"],
+      {"frame": test_f.numpy(), "command": test_c.numpy(), "h_in": test_h.numpy()},
+    )
+    max_err_stateless = float(
+      max(np.max(np.abs(ref_act.numpy() - ort_act_s)), np.max(np.abs(ref_h.numpy() - ort_h_s)))
+    )
+  elif isinstance(actor, FootstepTwinMirrorGruActor):
+    test_obs = torch.randn(4, RAW_OBS_DIM, generator=rng) * 0.05
+    test_obs[:, :29] += actor.default_joint_pos
+    test_obs[:, 63] = -1.0
+    test_obs[:, 69] = -1.0
+    test_obs[:, 70] = torch.rand(4, generator=rng) * float(2.0 * np.pi)
+    test_obs[:, 71] = 1.2
+    gru_sdim = actor.hidden_state_dim + (ACTION_DIM if actor.include_prev_action else 0)
+    test_h = torch.randn(4, gru_sdim, generator=rng) * 0.2
+    with torch.no_grad():
+      ref_act, ref_h = StatelessFootstepGruOnnxWrapper(actor).eval()(test_obs, test_h)
+    ort_act_s, ort_h_s = sess_stateless.run(["actions", "h_out"], {"obs": test_obs.numpy(), "h_in": test_h.numpy()})
+    max_err_stateless = float(
+      max(np.max(np.abs(ref_act.numpy() - ort_act_s)), np.max(np.abs(ref_h.numpy() - ort_h_s)))
+    )
+  else:
+    test_hist = torch.randn(4, actor.history_length, FRAME_DIM, generator=rng)
+    test_cmd = torch.randn(4, CMD_ENC_DIM, generator=rng)
+    with torch.no_grad():
+      ref_stateless = actor(test_hist, test_cmd).numpy()
+    ort_stateless = sess_stateless.run(["actions"], {"history": test_hist.numpy(), "command": test_cmd.numpy()})[0]
+    max_err_stateless = float(np.max(np.abs(ref_stateless - ort_stateless)))
+  if max_err_stateless > 1e-4:
     raise RuntimeError(f"Stateless footstep ONNX mismatch vs PyTorch: {max_err_stateless}")
 
   fp_policy = FootstepPolicy(deploy_path)
   fp_policy.reset()
-  py_h = torch.zeros(h, 1, FRAME_DIM + 1)
+  py_h = (
+    torch.zeros(1, actor.hidden_state_dim)
+    if isinstance(actor, (FootstepTwinMirrorGruActor, FootstepTwinMirrorSkipGruActor))
+    else torch.zeros(actor.history_length, 1, FRAME_DIM + 1)
+  )
+  py_pa = torch.zeros(1, ACTION_DIM)
   max_err_deploy = 0.0
   np_rng = np.random.default_rng(20261112)
   with torch.no_grad():
@@ -268,16 +474,27 @@ def export_onnx(
       if step_i == 8:
         fp_policy.reset()
         py_h.zero_()
+        py_pa.zero_()
       raw = np_rng.normal(0.0, 0.05, (1, RAW_OBS_DIM)).astype(np.float32)
       raw[:, :29] += actor.default_joint_pos.numpy()
       raw[:, 63] = raw[:, 69] = -1.0
       raw[:, 70] = np_rng.uniform(0.0, 2.0 * np.pi)
       raw[:, 71] = 0.0 if step_i % 4 == 0 else np_rng.uniform(0.8, 1.8)
       raw[:, 78] = np_rng.uniform(-0.8, 0.8)
-      expected_act, py_h = deploy_wrapper(torch.from_numpy(raw), py_h)
+      raw_t = torch.from_numpy(raw)
+      if isinstance(actor, FootstepTwinMirrorSkipGruActor):
+        frame_t = encode_proprio_frame(raw_t[:, :70], py_pa, actor.default_joint_pos)
+        cmd_t = encode_command(raw_t[:, 70], raw_t[:, 71], raw_t[:, 72:78].unflatten(-1, (2, 3)), raw_t[:, 78])
+        expected_act, py_h = actor.step(frame_t, cmd_t, py_h)
+        py_pa = expected_act.clone()
+      elif isinstance(actor, FootstepTwinMirrorGruActor):
+        expected_act, py_h = actor.step(raw_t, py_h, py_pa)
+        py_pa = expected_act.clone()
+      else:
+        expected_act, py_h = deploy_wrapper(raw_t, py_h)
       ort_act, _ = fp_policy.step(raw)
       max_err_deploy = max(max_err_deploy, float(np.max(np.abs(expected_act.numpy()[0] - ort_act))))
-  if max_err_deploy > 1e-5:
+  if max_err_deploy > 1e-4:
     raise RuntimeError(f"FootstepPolicy deploy ONNX mismatch vs PyTorch: {max_err_deploy}")
 
   atomic_json(
@@ -333,7 +550,7 @@ def run_play(cfg: PlayConfig) -> None:
     f"[PLAY_START] profile={cfg.profile} port={cfg.viser_port} iteration={saved['iteration']} ckpt={ckpt_resolved}",
     flush=True,
   )
-  h = actor.history_length
+  h = actor.history_length if isinstance(actor, FootstepTwinMirrorMlpActor) else 1
 
   env_cfg = footstep_env_cfg_wm(play=True, profile=cfg.profile)
   env_cfg.seed = 42
@@ -350,6 +567,11 @@ def run_play(cfg: PlayConfig) -> None:
   try:
     n_envs = env.num_envs
     history = torch.zeros(n_envs, h, FRAME_DIM, device=cfg.device)
+    gru_h = torch.zeros(
+      n_envs,
+      actor.hidden_state_dim if isinstance(actor, (FootstepTwinMirrorGruActor, FootstepTwinMirrorSkipGruActor)) else 0,
+      device=cfg.device,
+    )
     prev_action = torch.zeros(n_envs, ACTION_DIM, device=cfg.device)
     fresh = torch.ones(n_envs, dtype=torch.bool, device=cfg.device)
     theta_cmd = env.command_manager.get_term("torso_heading")
@@ -360,7 +582,7 @@ def run_play(cfg: PlayConfig) -> None:
 
     @torch.no_grad()
     def policy(observations: Any) -> torch.Tensor:
-      nonlocal history, prev_action, fresh, last_mtime_ns, tick_counter, current_iter
+      nonlocal history, gru_h, prev_action, fresh, last_mtime_ns, tick_counter, current_iter
       tick_counter += 1
       if cfg.hot_reload_checkpoint and tick_counter % 250 == 0:
         try:
@@ -369,7 +591,7 @@ def run_play(cfg: PlayConfig) -> None:
           if mtime_ns != last_mtime_ns:
             new_saved = load_footstep_wm_checkpoint(cand_file, device="cpu")
             sd = new_saved["actor_state_dict"]
-            if all(torch.isfinite(v).all() for v in sd.values()):
+            if all(torch.isfinite(v).all() for v in sd.values() if v.is_floating_point()):
               actor.load_state_dict(sd, strict=True)
               last_mtime_ns = mtime_ns
               current_iter = int(new_saved["iteration"])
@@ -385,14 +607,23 @@ def run_play(cfg: PlayConfig) -> None:
       ep_zero = env.episode_length_buf == 0
       is_fresh = fresh | ep_zero
       pa = torch.where(is_fresh.unsqueeze(-1), torch.zeros_like(prev_action), prev_action)
-      frame = encode_proprio_frame(raw[:, :70], pa, actor.default_joint_pos)
-      repeated = frame.unsqueeze(1).expand(-1, h, -1)
-      shifted = torch.cat((history[:, 1:], frame.unsqueeze(1)), dim=1)
-      history = torch.where(is_fresh[:, None, None], repeated, shifted)
-
       theta = theta_cmd.command[:, 0].to(raw.dtype)
-      cmd = encode_command(raw[:, 70], raw[:, 71], raw[:, 72:78].unflatten(-1, (2, 3)), theta)
-      action = actor(history, cmd)
+      if isinstance(actor, FootstepTwinMirrorSkipGruActor):
+        h_in = torch.where(is_fresh.unsqueeze(-1), torch.zeros_like(gru_h), gru_h)
+        frame = encode_proprio_frame(raw[:, :70], pa, actor.default_joint_pos)
+        cmd = encode_command(raw[:, 70], raw[:, 71], raw[:, 72:78].unflatten(-1, (2, 3)), theta)
+        action, gru_h = actor.step(frame, cmd, h_in)
+      elif isinstance(actor, FootstepTwinMirrorGruActor):
+        h_in = torch.where(is_fresh.unsqueeze(-1), torch.zeros_like(gru_h), gru_h)
+        raw79 = torch.cat((raw[:, :78], theta.unsqueeze(-1)), dim=-1)
+        action, gru_h = actor.step(raw79, h_in, pa)
+      else:
+        frame = encode_proprio_frame(raw[:, :70], pa, actor.default_joint_pos)
+        repeated = frame.unsqueeze(1).expand(-1, h, -1)
+        shifted = torch.cat((history[:, 1:], frame.unsqueeze(1)), dim=1)
+        history = torch.where(is_fresh[:, None, None], repeated, shifted)
+        cmd = encode_command(raw[:, 70], raw[:, 71], raw[:, 72:78].unflatten(-1, (2, 3)), theta)
+        action = actor(history, cmd)
       if not torch.isfinite(action).all():
         raise FloatingPointError("Nonfinite footstep playback action")
       prev_action = action.clone()

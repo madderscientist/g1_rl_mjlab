@@ -27,13 +27,24 @@ from g1_lower_rl.world_model.adapters.math import conjugate, rotate, unit
 from g1_lower_rl.world_model.model import BODY_NAMES, CONTROL_DT, JOINT_DIM, PositionWorldModel, state_features
 from g1_lower_rl.world_model.training.replay import RingReplay
 
-from .policy import ACTION_DIM, ARM_DIM, DEFAULT_HISTORY, FRAME_DIM, command_from_world_queue
+from .policy import (
+  ACTION_DIM,
+  ARM_DIM,
+  DEFAULT_HISTORY,
+  FRAME_DIM,
+  PROPRIO_RAW_DIM,
+  RAW_OBS_DIM,
+  FootstepTwinMirrorGruActor,
+  FootstepTwinMirrorSkipGruActor,
+  command_from_world_queue,
+  encode_command,
+)
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnvCfg
 
 CRITIC_DIM = 191
-AUX_DIM = 9  # [contact_prob(2), air_time(2), contact_time(2), anchor(3)]
+AUX_DIM = 11  # [contact_prob(2), air_time(2), contact_time(2), anchor(3), filt_g_pelvis_xy(2)]
 ARM_RAMP_DURATION_S = 5.0
 DEFAULT_TERMINATION_PROB = 0.05
 SWING_FRACTION = 0.40  # 1.0 - stance_fraction (0.60) for standard FootstepPhaseCfg
@@ -82,7 +93,7 @@ AUTO_CURRICULUM_STAGES: tuple[CurriculumStage, ...] = (
     direction_half_range=0.0, distance_range=(0.27, 0.27), width_range=(0.24, 0.24),
     direction_change_half_range=0.0, foot_yaw_half_range=0.0,
     frequency_range=(1.2, 1.2), initial_frequency=1.2, frequency_rate_half_range=0.0,
-    initial_standing_prob=0.18, stop_prob=0.12, arm_target_scale=0.2,
+    initial_standing_prob=0.05, stop_prob=0.05, arm_target_scale=0.2,
     swing_pos_w=2.0, swing_yaw_w=1.5, swing_pos_std=0.30, swing_yaw_std=0.25, swing_power=1.0, landing_w=-0.03,
     action_noise=0.24, policy_target_kl=0.07, max_failure_rate=0.008,
     min_det_mtbf_s=45.0, min_det_unbroken_s=18.0, min_ss_match=0.58, min_swing_lift_m=0.038,
@@ -305,9 +316,12 @@ def pack_footstep_aux(
   air_time: torch.Tensor,
   contact_time: torch.Tensor,
   anchor: torch.Tensor,
+  filt_g_pelvis_xy: torch.Tensor | None = None,
 ) -> torch.Tensor:
-  """Pack differentiable Markovian contact & anchor state into [B, 9]."""
-  return torch.cat((contact_prob, air_time, contact_time, anchor), dim=-1)
+  """Pack differentiable Markovian contact, anchor, and filtered pelvis gravity state into [B, 11]."""
+  if filt_g_pelvis_xy is None:
+    filt_g_pelvis_xy = contact_prob.new_zeros((*contact_prob.shape[:-1], 2))
+  return torch.cat((contact_prob, air_time, contact_time, anchor, filt_g_pelvis_xy), dim=-1)
 
 
 class FootstepPolicyStart(NamedTuple):
@@ -342,6 +356,8 @@ class FootstepPolicyStart(NamedTuple):
   theta_target: torch.Tensor
   theta_speed: torch.Tensor
   remaining: torch.Tensor
+  gru_h: torch.Tensor | None = None
+  raw_proprio_70: torch.Tensor | None = None
 
 
 _REPLAY_SPECS: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
@@ -381,11 +397,26 @@ _START_TAIL_FIELDS: tuple[str, ...] = tuple(k for k in _REPLAY_SPECS if k != "la
 class FootstepReplay(RingReplay):
   """Ring replay with upright start filtering and Markovian footstep queue/anchor snapshots."""
 
-  def __init__(self, capacity: int, num_envs: int, validation_envs: int, device: str | torch.device):
+  def __init__(
+    self,
+    capacity: int,
+    num_envs: int,
+    validation_envs: int,
+    device: str | torch.device,
+    *,
+    include_gru_state: bool = False,
+    gru_hidden_state_dim: int = 128,
+  ):
     super().__init__(capacity, num_envs, validation_envs, device)
+    self.include_gru_state = bool(include_gru_state)
+    self.gru_hidden_state_dim = int(gru_hidden_state_dim)
+    specs = dict(_REPLAY_SPECS)
+    if self.include_gru_state:
+      specs["gru_h"] = ((self.gru_hidden_state_dim,), torch.float32)
+      specs["raw_obs_79"] = ((RAW_OBS_DIM,), torch.float32)
     self._fields = {
       name: torch.empty(capacity, num_envs, *shape, dtype=dtype, device=self.device)
-      for name, (shape, dtype) in _REPLAY_SPECS.items()
+      for name, (shape, dtype) in specs.items()
     }
 
   def append_control(self, batch, record: dict[str, torch.Tensor]) -> None:
@@ -411,16 +442,34 @@ class FootstepReplay(RingReplay):
     *,
     validation: bool = False,
     prefer_stepping: bool = False,
+    burnin_gru_actor: FootstepTwinMirrorGruActor | FootstepTwinMirrorSkipGruActor | None = None,
   ) -> FootstepPolicyStart:
-    mult = 8 if (not validation and prefer_stepping) else (2 if not validation else 1)
+    if self.size < history_length:
+      raise RuntimeError(f"FootstepReplay has {self.size} steps, need at least {history_length}")
+    mult = (8 if prefer_stepping else 6) if not validation else 1
     pool_size = batch_size * mult
-    window = self.sample(pool_size, history_length, validation=validation)
-    if not validation and len(window.env) > batch_size:
-      s = window.state[:, -1]
+
+    min_seq = self.total_steps - self.size
+    valid_end_seqs = torch.arange(min_seq + history_length - 1, self.total_steps, device=self.device)
+    end_rows_all = valid_end_seqs % self.capacity
+    env_slice = self._env_slice(validation)
+    env_offset = int(env_slice.start or 0)
+    valid_mask = self.valid[end_rows_all, env_slice]
+    valid_flat = torch.nonzero(valid_mask.flatten(), as_tuple=False).squeeze(-1)
+    if valid_flat.numel() == 0:
+      raise RuntimeError("No valid start transitions in FootstepReplay")
+    num_e = valid_mask.shape[1]
+    pick = valid_flat[torch.randint(0, valid_flat.numel(), (pool_size,), device=self.device)]
+    cand_seq = valid_end_seqs[pick // num_e]
+    cand_env = env_offset + (pick % num_e)
+    cand_rows = cand_seq % self.capacity
+    cand_state = self.state[cand_rows, cand_env]
+
+    if not validation and pool_size > batch_size:
+      s = cand_state
       upright_cos = 1.0 - 2.0 * (s[:, 4].square() + s[:, 5].square())
       upright = (s[:, 2] > 0.42) & (upright_cos > 0.35)
-      cand_rows = (window.sequence % self.capacity)[:, -1]
-      cand_env = window.env
+      balanced = (s[:, 2] > 0.62) & (upright_cos > 0.75)
       if prefer_stepping:
         cand_mode = self._fields["mode"][cand_rows, cand_env]
         cand_freq = self._fields["frequency"][cand_rows, cand_env]
@@ -447,36 +496,77 @@ class FootstepReplay(RingReplay):
           chosen = torch.cat((chosen, bad_idx[:rem]))
         sel = chosen
       else:
-        good_idx = torch.nonzero(upright, as_tuple=False).squeeze(-1)
-        if len(good_idx) >= batch_size:
-          sel = good_idx[:batch_size]
+        bal_idx = torch.nonzero(balanced, as_tuple=False).squeeze(-1)
+        if len(bal_idx) >= batch_size:
+          sel = bal_idx[:batch_size]
         else:
-          bad_idx = torch.nonzero(~upright, as_tuple=False).squeeze(-1)
-          sel = torch.cat((good_idx, bad_idx[: batch_size - len(good_idx)]))
-      rows = (window.sequence % self.capacity)[sel]
-      env = window.env[sel]
-      state_start = window.state[sel, -1]
-      context_start = window.inputs[sel, -1, 97:]
+          tilted_ok = torch.nonzero(upright & ~balanced, as_tuple=False).squeeze(-1)
+          good_idx = torch.cat((bal_idx, tilted_ok))
+          if len(good_idx) >= batch_size:
+            sel = good_idx[:batch_size]
+          else:
+            bad_idx = torch.nonzero(~upright, as_tuple=False).squeeze(-1)
+            sel = torch.cat((good_idx, bad_idx[: batch_size - len(good_idx)]))
+      sel_seq = cand_seq[sel]
+      env = cand_env[sel]
     else:
-      rows = window.sequence % self.capacity
-      env = window.env
-      state_start = window.state[:, -1]
-      context_start = window.inputs[:, -1, 97:]
+      sel_seq = cand_seq[:batch_size]
+      env = cand_env[:batch_size]
+
+    offsets = torch.arange(history_length - 1, -1, -1, device=self.device)
+    rows = (sel_seq[:, None] - offsets[None, :]) % self.capacity
     last = rows[:, -1]
+    state_start = self.state[last, env].clone()
+    context_start = self.inputs[last, env, 97:].clone()
 
     # Build history padding across episode boundaries (first frame of a new episode repeats its own proprio).
     raw_hist = self._fields["latest"][rows, env[:, None]]
     seg = self.segment[rows, env[:, None]]
-    same_ep = (seg == seg[:, -1:]).unsqueeze(-1)
+    val_hist = self.valid[rows, env[:, None]]
+    same_ep = ((seg == seg[:, -1:]) & val_hist).unsqueeze(-1)
     # Walk backwards from newest frame so cross-reset prefix frames repeat the episode's initial frame.
     clean_hist = raw_hist.clone()
     for h_idx in range(history_length - 2, -1, -1):
       clean_hist[:, h_idx] = torch.where(same_ep[:, h_idx], clean_hist[:, h_idx], clean_hist[:, h_idx + 1])
 
+    gru_h_start: torch.Tensor | None = None
+    raw_proprio_start: torch.Tensor | None = None
+    if self.include_gru_state:
+      raw_proprio_start = self._fields["raw_obs_79"][last, env, :PROPRIO_RAW_DIM].clone()
+      if burnin_gru_actor is not None and history_length > 1:
+        raw79_seq = self._fields["raw_obs_79"][rows, env[:, None]]
+        h0 = self._fields["gru_h"][rows[:, 0], env]
+        with torch.no_grad():
+          h = torch.where(same_ep[:, 0], h0, torch.zeros_like(h0))
+          if isinstance(burnin_gru_actor, FootstepTwinMirrorSkipGruActor):
+            cmd_seq = encode_command(
+              raw79_seq[..., 70],
+              raw79_seq[..., 71],
+              raw79_seq[..., 72:78].unflatten(-1, (2, 3)),
+              raw79_seq[..., 78],
+            )
+            for h_idx in range(history_length - 1):
+              _, h_next = burnin_gru_actor.step(clean_hist[:, h_idx], cmd_seq[:, h_idx], h)
+              h = torch.where(same_ep[:, h_idx], h_next, torch.zeros_like(h_next))
+          else:
+            for h_idx in range(history_length - 1):
+              pa_t = torch.where(
+                same_ep[:, h_idx],
+                raw_hist[:, h_idx, 70:85],
+                torch.zeros_like(raw_hist[:, h_idx, 70:85]),
+              )
+              _, h_next = burnin_gru_actor.step(raw79_seq[:, h_idx], h, pa_t)
+              h = torch.where(same_ep[:, h_idx], h_next, torch.zeros_like(h_next))
+          gru_h_start = h
+      else:
+        gru_h_start = self._fields["gru_h"][last, env].clone()
+
     return FootstepPolicyStart(
       state=state_start,
       history=clean_hist,
       context=context_start,
+      gru_h=gru_h_start,
+      raw_proprio_70=raw_proprio_start,
       **{key: self._fields[key][last, env] for key in _START_TAIL_FIELDS},
     )
 
@@ -598,6 +688,7 @@ class FootstepWmTask(nn.Module):
           s0.swing_power,
           s0.landing_w,
           1.0 if s0.theta_active else 0.0,
+          1.0,
         ],
         dtype=torch.float32,
       ),
@@ -605,6 +696,7 @@ class FootstepWmTask(nn.Module):
 
   def apply_stage(self, stage: CurriculumStage) -> None:
     """Update reward shaping weights in-place so captured CUDA graphs stay valid across stages."""
+    loco_assist = 1.0 if stage.index <= 2 else (0.6 if stage.index == 3 else (0.25 if stage.index == 4 else 0.0))
     updated = torch.tensor(
       [
         stage.swing_pos_w,
@@ -614,6 +706,7 @@ class FootstepWmTask(nn.Module):
         stage.swing_power,
         stage.landing_w,
         1.0 if stage.theta_active else 0.0,
+        loco_assist,
       ],
       device=self.stage_params.device,
       dtype=self.stage_params.dtype,
@@ -721,7 +814,12 @@ class FootstepWmTask(nn.Module):
       ),
       dim=-1,
     )
-    shifted_queue = torch.cat((queue[:, 1:], extrapolated.unsqueeze(1)), dim=1)
+    # Match TensorFootstepManager._sample & StepEpisodeManager._sample: once STOPPING/STANDING/SETTLING is active
+    # (or in step_episode), newly appended queue slots hold terminal_feet[side] rather than extrapolating forward!
+    terminal_for_side = terminal_feet.gather(1, side[:, None, None].expand(-1, 1, 3)).squeeze(1)
+    use_terminal = self.is_step_episode | (mode == 2) | (mode == 3) | (mode == 5)
+    appended = torch.where(use_terminal.unsqueeze(-1), terminal_for_side, extrapolated)
+    shifted_queue = torch.cat((queue[:, 1:], appended.unsqueeze(1)), dim=1)
     next_queue = torch.where(touchdown[:, None, None], shifted_queue, queue)
     next_first_side = torch.where(touchdown, 1 - first_side, first_side)
 
@@ -805,6 +903,7 @@ class FootstepWmTask(nn.Module):
     terminal_feet: torch.Tensor | None = None,
     first_side: torch.Tensor | None = None,
     req_freq: torch.Tensor | None = None,
+    encoder_bias_lower: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, _KinematicFrame, torch.Tensor]:
     """Advance one 20ms imagined footstep tick with differentiable contact and differentiable re-anchoring."""
     frame = self._kinematic_frame(next_state)
@@ -816,6 +915,7 @@ class FootstepWmTask(nn.Module):
     swing_power = self.stage_params[4]
     landing_w = self.stage_params[5]
     theta_active = self.stage_params[6]
+    loco_assist = self.stage_params[7]
 
     moving = frequency > 1e-5
     is_moving = moving.to(dtype)
@@ -839,23 +939,28 @@ class FootstepWmTask(nn.Module):
     next_air_time = p_airborne * (aux[:, 2:4] + CONTROL_DT)
     next_contact_time = p_contact * (aux[:, 4:6] + CONTROL_DT)
 
-    # 2. Differentiable re-anchoring: propagates Step-2 local_footprint gradients back to Step-1 landing pose!
+    # 2. Smooth multi-tick force-grounded differentiable re-anchoring (aligned with tensor_manager fz >= 10N;
+    # holds pending_anchor until pending_p_contact > 0.90 so cur_anchor converges to chosen_foot without mid-air triggers)
     cur_anchor = aux[:, 6:9]
+    p_fz_anchor = torch.sigmoid((fz - 12.0) / 4.0)
     pending_clamped = pending_anchor.clamp_min(0)
-    pending_p_contact = p_contact.gather(1, pending_clamped[:, None]).squeeze(1)
+    pending_p_contact = p_fz_anchor.gather(1, pending_clamped[:, None]).squeeze(1)
     reanchor_cond = (pending_anchor >= 0) & double_support & (pending_p_contact > 0.35)
-    # Use smooth weight when reanchoring so foot pose & contact force both remain differentiable.
     w_reanchor = reanchor_cond.to(dtype) * pending_p_contact
     chosen_foot = frame.feet_pose.gather(1, pending_clamped[:, None, None].expand(-1, 1, 3)).squeeze(1)
     next_anchor_xy = cur_anchor[:, :2] + w_reanchor.unsqueeze(-1) * (chosen_foot[:, :2] - cur_anchor[:, :2])
     next_anchor_yaw = wrap(cur_anchor[:, 2] + w_reanchor * wrap(chosen_foot[:, 2] - cur_anchor[:, 2]))
     next_anchor = torch.cat((next_anchor_xy, next_anchor_yaw.unsqueeze(-1)), dim=-1)
-    next_pending = torch.where(reanchor_cond, torch.full_like(pending_anchor, -1), pending_anchor)
+    clear_pending = (reanchor_cond & (pending_p_contact > 0.90)) | (
+      (pending_anchor >= 0) & (~double_support) & (pending_p_contact > 0.35)
+    )
+    next_pending = torch.where(clear_pending, torch.full_like(pending_anchor, -1), pending_anchor)
 
     # 3. PPO contact_schedule (+1.0), foot_air_time (+3.2), swing_clearance (-0.5), and swing_contact (-0.5)
     p_foot_match = in_stance * p_contact + in_swing * p_airborne
     p_matched = p_foot_match[:, 0] * p_foot_match[:, 1]
-    r_schedule = (1.0 * p_matched - 1.5 * (in_stance * p_airborne).sum(-1)) * is_moving
+    weight_shift = (in_stance * stance_load_share).sum(-1)
+    r_schedule = (1.0 * p_matched + loco_assist * (0.8 * weight_shift - 1.5 * (in_stance * p_airborne).sum(-1))) * is_moving
 
     single_sup = (in_stance.sum(-1) == 1).to(dtype)
     held_time = (in_stance * next_contact_time + in_swing * next_air_time).min(dim=-1).values
@@ -867,6 +972,12 @@ class FootstepWmTask(nn.Module):
     sin_sq = swing_sin.square()
     clearance_target = 0.11 * sin_sq * in_swing * is_moving.unsqueeze(-1)
     r_clearance = -0.5 * (F.smooth_l1_loss(frame.relative_z, clearance_target, reduction="none", beta=0.005) / 0.11).sum(-1)
+    arch_target = 0.09 * swing_sin * in_swing * is_moving.unsqueeze(-1)
+    arch_shortfall = F.smooth_l1_loss(frame.relative_z, arch_target, reduction="none", beta=0.015)
+    r_loco_arch = loco_assist * (
+      ((1.5 - 15.0 * arch_shortfall - 1.0 * stance_load_share * swing_sin) * in_swing).sum(-1) * is_moving
+    )
+    r_clearance = r_clearance + r_loco_arch
     r_swing_contact = -0.5 * (p_contact * in_swing * sin_sq).sum(-1) * is_moving
 
     # 4. PPO footstep_swing_position (+5.0), footstep_swing_yaw (+5.0), footstep_landing (-0.5/event), and step_landing_bonus (+10)
@@ -877,40 +988,62 @@ class FootstepWmTask(nn.Module):
 
     stance_supported = 1.0 - (1.0 - in_stance[:, 0] * p_contact[:, 0]) * (1.0 - in_stance[:, 1] * p_contact[:, 1])
     eff_power = torch.ones_like(swing_power) if self.is_step_episode else swing_power
-    ramp = swing_progress.clamp(0.0, 1.0).pow(eff_power) * in_swing
+    # Gate swing reward by p_lifted only during early scratch bootstrap (loco_assist > 0); in Stages 5..7
+    # lift_gate == 1.0 so descending through z < 2.5cm onto the target keeps full credit without hover-stomp.
+    lift_gate = 1.0 - loco_assist * (1.0 - p_lifted)
+    ramp = swing_progress.clamp(0.0, 1.0).pow(eff_power) * in_swing * lift_gate
     r_swing_pos = swing_pos_w * stance_supported * (torch.exp(-(dist_xy / swing_pos_std).square()) * ramp).sum(-1) * is_moving
     r_swing_yaw = swing_yaw_w * stance_supported * (torch.exp(-(yaw_err / swing_yaw_std).square()) * ramp).sum(-1) * is_moving
 
-    # Phase-normalized late-swing integral (\int 4*s^3*(f/SWING_FRACTION) dt == 1 per step) matches PPO's once-per-landing event weight
-    accuracy_cost = 0.5 * dist_xy / 0.05 + 0.5 * yaw_abs / 0.20
-    landing_density = 4.0 * swing_progress.clamp(0.0, 1.0).pow(3) * in_swing * (frequency.unsqueeze(-1) / SWING_FRACTION)
-    r_landing = landing_w * (accuracy_cost * landing_density).sum(-1) * is_moving
+    # Detached balance gate g_bal in [0, 1]: ~1.0 when upright, -> 0.0 when tilted/pushed to allow capture-point recovery steps.
+    pelvis_tilt_det = torch.atan2(
+      (frame.g_pelvis[:, :2].square().sum(-1) + 1e-8).sqrt(),
+      (-frame.g_pelvis[:, 2]).clamp_min(1e-4),
+    ).detach()
+    omega_xy_det = (frame.omega_b[:, :2].square().sum(-1) + 1e-8).sqrt().detach()
+    g_bal = (
+      torch.sigmoid((math.radians(14.0) - pelvis_tilt_det) / math.radians(3.0))
+      * torch.sigmoid((1.30 - omega_xy_det) / 0.30)
+    )
 
-    # Smooth moving-only BPTT spatial bridge (strictly 0 when standing at f==0)
+    late_swing = swing_progress.clamp(0.0, 1.0).pow(3) * in_swing
+    accuracy_cost = 0.5 * dist_xy / 0.05 + 0.5 * yaw_abs / 0.20
+    landing_density = 4.0 * late_swing * (frequency.unsqueeze(-1) / SWING_FRACTION)
+    r_landing = g_bal * landing_w * (accuracy_cost * landing_density).sum(-1) * is_moving
+
+    # Balance-gated narrow-kernel bullseye + precision Smooth-L1: XY uses swing + stance backprop through WM;
+    # Yaw acts strictly in swing so planted feet never twist on the ground.
+    s_sq_swing = swing_progress.clamp(0.0, 1.0).square() * in_swing
+    xy_pull_gate = 0.65 * s_sq_swing + 0.35 * in_stance
     xy_l1 = F.smooth_l1_loss(frame.foot_pos[:, :, :2], targets[:, :, :2], reduction="none", beta=0.015).sum(-1)
     yaw_l1 = F.smooth_l1_loss(yaw_err, torch.zeros_like(yaw_err), reduction="none", beta=0.04)
-    move_pull_gate = 0.60 * swing_progress.clamp(0.0, 1.0).square() * in_swing + 0.40 * in_stance
-    r_foot_pull = -((2.5 * xy_l1 + 0.8 * yaw_l1) * move_pull_gate).sum(-1) * is_moving
+    bullseye_bonus = (
+      3.0 * torch.exp(-(dist_xy / 0.045).square())
+      + 1.2 * torch.exp(-(yaw_err / 0.055).square())
+    ) * s_sq_swing * lift_gate * stance_supported.unsqueeze(-1)
+    prec_gate = (landing_w.abs() / 0.10).clamp(0.0, 1.0)
+    cadence_comp = (1.35 / frequency.clamp_min(0.75)).clamp(1.0, 1.70).detach().unsqueeze(-1)
+    bullseye_pull = -prec_gate * (cadence_comp * (6.0 * xy_l1 * xy_pull_gate + 2.2 * yaw_l1 * s_sq_swing)).sum(-1)
+    r_bullseye = g_bal * (bullseye_bonus.sum(-1) + bullseye_pull) * is_moving
 
-    if self.is_step_episode and arrived is not None and terminal_feet is not None:
-      arr_delta_xy = frame.foot_pos[:, :, :2] - terminal_feet[:, :, :2]
-      arr_dist_xy = (arr_delta_xy.square().sum(-1) + 1e-8).sqrt() - 1e-4
-      arr_yaw_err = wrap(frame.foot_yaw - terminal_feet[:, :, 2])
-      worst_dist = arr_dist_xy.amax(-1)
-      worst_yaw = arr_yaw_err.abs().amax(-1)
-      both_planted = p_contact[:, 0] * p_contact[:, 1]
-      yaw_gate = torch.exp(-(worst_yaw / 0.20).square())
-      arr_bullseye = both_planted * yaw_gate * (
-        4.0 * torch.exp(-(worst_dist / 0.10).square())
-        + 6.0 * torch.exp(-(worst_dist / 0.042).square())
-      )
-      worst_l1 = F.smooth_l1_loss(worst_dist, torch.zeros_like(worst_dist), reduction="none", beta=0.015)
-      worst_yaw_l1 = F.smooth_l1_loss(worst_yaw, torch.zeros_like(worst_yaw), reduction="none", beta=0.04)
-      r_arrival = (arrived.to(dtype) / CONTROL_DT) * (arr_bullseye - 4.0 * worst_l1 - 1.0 * worst_yaw_l1)
+    # Early-stage spatial bootstrap bridge (decays to strictly 0.0 in Stages 5..7)
+    move_pull_gate = 0.60 * s_sq_swing + 0.40 * in_stance
+    step_disp = targets[:, :, :2] - supports[:, :, :2]
+    v_swing_star = (math.pi * frequency[:, None, None] / (2.0 * SWING_FRACTION)) * swing_sin.unsqueeze(-1) * step_disp
+    swing_vel_err_sq = (frame.foot_vel[:, :, :2] - v_swing_star).square().sum(-1)
+    r_swing_vel = 1.4 * (in_swing * p_lifted * torch.exp(-swing_vel_err_sq / 0.55**2)).sum(-1) * is_moving
+    r_foot_pull = loco_assist * (-((4.5 * xy_l1 + 0.8 * yaw_l1) * move_pull_gate).sum(-1) * is_moving + r_swing_vel)
+
+    onset_prob = (p_contact * (1.0 - prev_contact_prob)).detach()
+    if self.is_step_episode:
+      td_score = torch.exp(-(dist_xy / 0.10).square() - (yaw_err / 0.20).square())
+      other_planted = p_contact.flip(-1).detach()
+      # Pay landing accuracy strictly at touchdown onset; never reward twisting already-planted feet 0.25s later at `arrived`!
+      r_arrival = 10.0 * (td_score * onset_prob * other_planted).sum(-1) / CONTROL_DT * is_moving
     else:
       r_arrival = torch.zeros_like(r_schedule)
 
-    # 5. Moving-only BPTT horizon CoM stabilizer (strictly inactive during normal quiet standing so f==0 equilibrium matches PPO)
+    # 5. CoM capture-point corridor & velocity guide (full weight in scratch bootstrap; g_bal-gated moving stabilizer in Stages 5..7)
     m_sup = 0.5 * (supports[:, 0, :2] + supports[:, 1, :2])
     if first_side is not None:
       anchor_idx = (1 - first_side)[:, None, None].expand(-1, 1, 2)
@@ -938,19 +1071,27 @@ class FootstepWmTask(nn.Module):
     cp_center = is_moving.unsqueeze(-1) * cp_moving + is_standing.unsqueeze(-1) * m_actual_feet
     capture_point = next_state[:, :2] + 0.22 * frame.v_w[:, :2]
     cp_dist = ((capture_point - cp_center).square().sum(-1) + 1e-6).sqrt() - 1e-3
-    # At f==0, 9 cm support-polygon margin leaves the natural straight-leg ankle/hip axis (-4 cm behind foot_site) 100% penalty-free.
-    cp_margin = 0.050 * is_moving + 0.090 * is_standing
+    step_ep_margin = 0.115 if self.is_step_episode else 0.055
+    move_cp_margin = 0.050 * loco_assist + step_ep_margin * (1.0 - loco_assist)
+    cp_margin = move_cp_margin * is_moving + 0.090 * is_standing
     cp_excess = (cp_dist - cp_margin).clamp_min(0.0)
-    r_com_guidance = -1.4 * is_moving * com_vel_l1 - 3.5 * cp_excess
+    vel_cadence_gate = (
+      loco_assist + (1.0 - loco_assist) * ((frequency - 0.95) / 0.35).clamp(0.0, 1.0).detach()
+      if self.is_step_episode
+      else torch.ones_like(loco_assist)
+    )
+    move_com_w = loco_assist + (1.0 - loco_assist) * 0.55 * g_bal
+    r_com_guidance = move_com_w * (-2.4 * vel_cadence_gate * is_moving * com_vel_l1 - 3.5 * is_moving * cp_excess) - loco_assist * 3.5 * is_standing * cp_excess
 
-    # 6. PPO slip, soft_landing, standing velocity/hold, flatness, contact yaw rate, posture, height, knee straightness, and theta
-    foot_vel_xy_sq = frame.foot_vel[:, :, :2].square().sum(-1)
+    # 6. PPO slip (including +-10cm toe/heel sole spin), soft_landing, standing velocity/hold, flatness, posture, height, and theta
+    omega_foot_z = frame.fk.foot_angular_velocity[:, :, 2]
+    omega_foot_z_abs = (omega_foot_z.square() + 1e-6).sqrt() - 1e-3
+    foot_vel_xy_sq = frame.foot_vel[:, :, :2].square().sum(-1) + (0.10 * omega_foot_z).square()
     foot_speed_3d = (frame.foot_vel.square().sum(-1) + 1e-6).sqrt() - 1e-3
     r_slip = -2.0 * (foot_vel_xy_sq * p_slip_contact).sum(-1) * is_moving
-    r_slip_still = -1.0 * foot_speed_3d.sum(-1) * is_standing
+    r_slip_still = -1.5 * (foot_speed_3d + 0.12 * omega_foot_z_abs).sum(-1) * is_standing
     r_stand_feet = -0.5 * p_airborne.sum(-1) * is_standing
 
-    onset_prob = (p_contact * (1.0 - prev_contact_prob)).detach()
     force_mag = (foot_force.square().sum(-1) + 1e-6).sqrt() - 1e-3
     excess_spike = (force_mag - 300.0).clamp_min(0.0)
     near_ground_gate = torch.sigmoid((0.055 - frame.relative_z) / 0.015) * in_swing
@@ -976,9 +1117,9 @@ class FootstepWmTask(nn.Module):
     hold_deadband = 0.0 if self.is_step_episode else 0.03
     r_hold_pos = -0.2 * (((dist_xy - hold_deadband).clamp_min(0.0) / 0.10).square().mean(-1)) * is_standing
 
-    omega_foot_z = frame.fk.foot_angular_velocity[:, :, 2]
-    omega_foot_z_abs = (omega_foot_z.square() + 1e-6).sqrt() - 1e-3
-    r_foot_yaw_rate = -0.005 * (p_contact * omega_foot_z_abs).sum(-1) / math.radians(1.0)
+    r_foot_yaw_rate = (
+      -0.005 * (1.0 + 2.0 * is_standing) * (p_contact * omega_foot_z_abs).sum(-1) / math.radians(1.0)
+    )
 
     gravity_foot = torch.zeros_like(frame.foot_pos)
     gravity_foot[:, :, 2] = -1.0
@@ -998,26 +1139,31 @@ class FootstepWmTask(nn.Module):
       (frame.g_pelvis[:, :2].square().sum(-1) + 1e-8).sqrt(),
       (-frame.g_pelvis[:, 2]).clamp_min(1e-4),
     )
-    r_torso_ori = -2.0 * torso_tilt_rad.square() - 3.0 * is_standing * F.smooth_l1_loss(
-      torso_tilt_rad, torch.zeros_like(torso_tilt_rad), reduction="none", beta=0.04
-    )
-    r_pelvis_ori = (
-      -1.0 * frame.g_pelvis[:, :2].square().sum(-1)
-      - 1.0 * is_standing * pelvis_tilt_rad.square()
-      - 3.0 * is_standing * F.smooth_l1_loss(
-        pelvis_tilt_rad, torch.zeros_like(pelvis_tilt_rad), reduction="none", beta=0.04
-      )
-    )
-    r_torso_ang = -0.05 * frame.fk.body_angular_velocity[:, self.torso_id, :2].square().sum(-1)
+    torso_tilt_l1 = (torso_tilt_rad.square() + 1e-6).sqrt() - 1e-3
+    pelvis_tilt_l1 = (pelvis_tilt_rad.square() + 1e-6).sqrt() - 1e-3
 
-    # PPO head_height (+0.4 capped at straight-leg height, zero crouch-inducing Gaussian target) + head_height_low (-1.0)
+    # Exact PPO FilteredPelvisUpright (-1.0) + standing_torso_upright (-10.0 L1) + standing_pelvis_upright_linear (-10.0 L1)
+    prev_filt_g_xy = aux[:, 9:11] if aux.shape[-1] >= 11 else frame.g_pelvis[:, :2].detach()
+    cutoff_hz = torch.where(moving, frequency * 0.25, torch.full_like(frequency, 0.20))
+    filt_alpha = -torch.expm1(-2.0 * math.pi * cutoff_hz * CONTROL_DT)
+    next_filt_g_xy = prev_filt_g_xy + filt_alpha.unsqueeze(-1) * (frame.g_pelvis[:, :2] - prev_filt_g_xy)
+
+    r_torso_ori = -2.0 * torso_tilt_rad.square() - 10.0 * is_standing * torso_tilt_l1
+    r_pelvis_ori = -1.0 * next_filt_g_xy.square().sum(-1) - 10.0 * is_standing * pelvis_tilt_l1
+    torso_ang_b = rotate(conjugate(frame.torso_q), frame.fk.body_angular_velocity[:, self.torso_id, :])
+    r_torso_ang = -0.05 * torso_ang_b[:, :2].square().sum(-1)
+
+    # PPO head_height (+0.4): cap at 1.185m when moving so bent-knee walking (+40..52deg) gets 100% credit without stilt pull, and 1.254m when standing
     any_supported = 1.0 - p_airborne[:, 0] * p_airborne[:, 1]
-    r_head_height = 0.4 * (frame.head_z / 1.265).clamp(0.0, 1.0) * any_supported
-    r_head_low = -1.0 * (1.161 - frame.head_z).clamp_min(0.0) / 0.20
+    head_cap = torch.where(moving, torch.full_like(frame.head_z, 1.185), torch.full_like(frame.head_z, 1.254))
+    head_min = torch.where(moving, torch.full_like(frame.head_z, 1.08), torch.full_like(frame.head_z, 1.15))
+    r_head_height = 0.4 * (frame.head_z / head_cap).clamp(0.0, 1.0) * any_supported
+    r_head_low = -1.0 * (head_min - frame.head_z).clamp_min(0.0) / 0.20 - 12.0 * loco_assist * (0.62 - frame.height).clamp_min(0.0).square()
 
-    # PPO torso_feet_heading (-12.0 in theta stages, balance-gated under extreme tilt) or waist_yaw_zero (-0.8)
-    sine_f, cosine_f = frame.foot_yaw.sin().sum(-1), frame.foot_yaw.cos().sum(-1)
-    mean_foot_yaw = torch.where(torch.hypot(sine_f, cosine_f) > 1e-6, torch.atan2(sine_f, cosine_f), frame.foot_yaw[:, 0])
+    # PPO torso_feet_heading (-12.0 in theta stages): detach foot_yaw so heading gradients drive waist/hip rotation only.
+    foot_yaw_theta = frame.foot_yaw.detach()
+    sine_f, cosine_f = foot_yaw_theta.sin().sum(-1), foot_yaw_theta.cos().sum(-1)
+    mean_foot_yaw = torch.where(torch.hypot(sine_f, cosine_f) > 1e-6, torch.atan2(sine_f, cosine_f), foot_yaw_theta[:, 0])
     torso_yaw = _quat_yaw(frame.torso_q)
     actual_theta = wrap(torso_yaw - mean_foot_yaw)
     theta_err = wrap(actual_theta - theta)
@@ -1026,40 +1172,52 @@ class FootstepWmTask(nn.Module):
     waist_yaw_q = next_state[:, 7 + 12]
     r_heading = theta_active * r_theta + (1.0 - theta_active) * (-0.8 * waist_yaw_q.square())
 
-    # 7. PPO stance_knee_bend (-0.2), lower_body_copper_proxy (-0.25, standing_scale=2.0, hard limits), hip_yaw_zero (-0.1), waist edges
+    # 7. PPO stance_knee_bend (-0.2) + anti-stilt walking guard (strictly 0 on natural PPO gait), 50x copper limit, self_collisions
     q_lower = next_state[:, 7 : 7 + ACTION_DIM]
     qd_lower = next_state[:, 42 : 42 + ACTION_DIM]
     qd_prev = prev_state[:, 42 : 42 + ACTION_DIM]
     qacc_lower = (qd_lower - qd_prev) / CONTROL_DT
 
     knee_q = torch.stack((q_lower[:, 3], q_lower[:, 9]), dim=-1)
-    walk_knee_excess = ((knee_q - (math.pi / 4.0)).clamp_min(0.0) / (math.pi / 4.0)).square()
-    walk_knee_cost = (walk_knee_excess * in_stance).sum(-1) / in_stance.sum(-1).clamp_min(1.0)
-    stand_knee_pos = knee_q.clamp_min(0.0)
-    r_stand_straight = (
-      0.8 * torch.exp(-stand_knee_pos.square().mean(-1) / 0.16**2)
-      - 3.5 * F.smooth_l1_loss(stand_knee_pos, torch.zeros_like(stand_knee_pos), reduction="none", beta=0.03).mean(-1)
+    knee_lim = torch.where(moving, math.pi / 4.0, math.pi / 6.0).unsqueeze(-1)
+    ppo_knee_bend_cost = (((knee_q - knee_lim).clamp_min(0.0) / (math.pi / 4.0)).square() * in_stance).sum(-1) / in_stance.sum(-1).clamp_min(1.0)
+    min_swing_knee = 0.92 * sin_sq * in_swing
+    swing_stilt_cost = ((min_swing_knee - knee_q).clamp_min(0.0) / 0.35).square() * in_swing
+    stance_stilt_cost = ((0.45 - knee_q).clamp_min(0.0) / 0.25).square() * in_stance
+    # Symmetric standing knee regularizer around +4.7 deg (0.082 rad, beta=0.02) prevents hyperextension without crouch.
+    stand_knee_reg = F.smooth_l1_loss(knee_q, torch.full_like(knee_q, 0.082), reduction="none", beta=0.02).mean(-1)
+    r_stance_knee = (
+      -0.2 * ppo_knee_bend_cost
+      - 0.8 * is_moving * (swing_stilt_cost + stance_stilt_cost).sum(-1)
+      - 0.8 * is_standing * stand_knee_reg
     )
-    r_stance_knee = -0.2 * is_moving * walk_knee_cost + is_standing * r_stand_straight
 
     r_hip_yaw = -0.1 * (q_lower[:, 2].square() + q_lower[:, 8].square())
 
     q_des = self.default_position[:ACTION_DIM] + action * self.action_scale
+    if encoder_bias_lower is not None:
+      q_des = q_des - encoder_bias_lower
     tau = (self.lower_kp * (q_des - q_lower) - self.lower_kd * qd_lower).clamp(
       -self.lower_effort_limit, self.lower_effort_limit
     )
     hard_lower = self.hard_limits[:ACTION_DIM]
-    limit_margin = math.radians(0.1)
-    pushing_lim = (
-      ((q_lower <= hard_lower[:, 0] + limit_margin) & (tau < 0))
-      | ((q_lower >= hard_lower[:, 1] - limit_margin) & (tau > 0))
-    )
-    copper_w = 1.0 + 49.0 * pushing_lim.to(dtype)
+    lim_band = math.radians(1.5)
+    lim_temp = math.radians(0.35)
+    p_low_lim = torch.sigmoid((hard_lower[:, 0] + lim_band - q_lower) / lim_temp) * torch.sigmoid(-tau / 1.5)
+    p_high_lim = torch.sigmoid((q_lower - (hard_lower[:, 1] - lim_band)) / lim_temp) * torch.sigmoid(tau / 1.5)
+    pushing_lim_prob = (p_low_lim + p_high_lim).clamp(0.0, 1.0)
+    copper_w = 1.0 + 49.0 * pushing_lim_prob
     stand_copper_scale = 1.0 + is_standing  # standing_scale = 2.0 when f == 0
     r_copper = -0.25 * stand_copper_scale * ((tau / 100.0).square() * copper_w).sum(-1)
 
+    leg_limits = hard_lower[:12].unsqueeze(0).expand(len(next_state), 12, 2)
     waist_limits = hard_lower[13:15].unsqueeze(0).expand(len(next_state), 2, 2)
-    r_waist_edge = -2.0 * joint_edge_cost(q_lower[:, 13:15], waist_limits, 0.15)
+    r_waist_edge = -2.0 * joint_edge_cost(q_lower[:, 13:15], waist_limits, 0.15) - 1.0 * joint_edge_cost(
+      q_lower[:, :12], leg_limits, 0.025
+    )
+
+    foot_sep_xy = ((frame.foot_pos[:, 0, :2] - frame.foot_pos[:, 1, :2]).square().sum(-1) + 1e-6).sqrt()
+    r_self_col = -2.0 * ((0.115 - foot_sep_xy).clamp_min(0.0) / 0.03).square()
 
     act_diff_sq = (action - prev_action).square().sum(-1)
     if self.is_step_episode:
@@ -1073,7 +1231,7 @@ class FootstepWmTask(nn.Module):
     # 8. Differentiable soft termination (tilt > 70deg, height < 0.35m, or stance foot > 1.0m from target)
     stance_dist = (dist_xy * in_stance).amax(-1)
     termination = self._termination_from_frame(frame.g_pelvis, frame.height, stance_dist)
-    term_weight = -250.0 if self.is_step_episode else -120.0
+    term_weight = -500.0 if self.is_step_episode else -120.0
     r_terminated = term_weight * termination
 
     reward = CONTROL_DT * (
@@ -1084,6 +1242,7 @@ class FootstepWmTask(nn.Module):
       + r_swing_pos
       + r_swing_yaw
       + r_landing
+      + r_bullseye
       + r_foot_pull
       + r_arrival
       + r_com_guidance
@@ -1106,12 +1265,13 @@ class FootstepWmTask(nn.Module):
       + r_hip_yaw
       + r_copper
       + r_waist_edge
+      + r_self_col
       + r_act_rate
       + r_stand_qd
       + r_qacc
       + r_terminated
     )
-    next_aux = pack_footstep_aux(p_contact, next_air_time, next_contact_time, next_anchor)
+    next_aux = pack_footstep_aux(p_contact, next_air_time, next_contact_time, next_anchor, next_filt_g_xy)
     return reward, termination, next_aux, frame, next_pending
 
   def _termination_from_frame(
